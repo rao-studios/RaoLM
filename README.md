@@ -3,7 +3,7 @@
 # RaoLM
 
 RaoLM is a small SmolLM2-shaped language model with citations built in. It pretrains on the
-documents a [Thread](../Thread) node governs, and every token it generates carries a citation
+documents a [Thread](https://github.com/rao-studios/Thread) node governs, and every token it generates carries a citation
 back to the exact Thread source that supports it:
 
 ```
@@ -15,8 +15,8 @@ index** couples the model's logits to corpus positions (kNN-LM style). A **run m
 hashes the weights, the index, the Thread corpus snapshot and the tokenizer together.
 Cited spans can be re-checked, token for token, against the live Thread.
 
-It runs on MLX through [Frigate](../Frigate) and speaks to Thread over
-[Conduit](../Conduit)'s gRPC contract.
+It runs on MLX through [Frigate](https://github.com/rao-studios/Frigate) and speaks to Thread over
+[Conduit](https://github.com/rao-studios/Conduit)'s gRPC contract.
 
 > This is a first draft and a proof of concept. The model is a tiny from-scratch network
 > that memorises a small synthetic corpus, so the citation mechanism can be measured
