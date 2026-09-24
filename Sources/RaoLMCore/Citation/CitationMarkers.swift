@@ -23,15 +23,15 @@ public struct MarkedSource: Codable, Sendable, Equatable {
 
 public enum CitationMarkers {
 
-    /// The generated text with `[[n]]` after each verbatim span, and the sources in
-    /// order of first use. One number per partition.
-    public static func render(_ generation: CitedGeneration) -> (text: String, sources: [MarkedSource]) {
+    /// Where each `[[n]]` goes: the trace index that ends a verbatim span, its number, and
+    /// the numbered sources in order of first use. One number per partition. `render` and the
+    /// studio's token strip both use it, so their numbers always agree.
+    public static func markers(_ generation: CitedGeneration) -> (markers: [(traceIndex: Int, number: Int)], sources: [MarkedSource]) {
         var numbers: [Int: Int] = [:]
         var sources: [MarkedSource] = []
-        var text = ""
+        var markers: [(traceIndex: Int, number: Int)] = []
         for trace in generation.traces where !trace.isPrompt {
-            text += trace.text
-            guard let index = trace.spanIndex else { continue }
+            guard let index = trace.spanIndex, index < generation.spans.count else { continue }
             let span = generation.spans[index]
             guard span.kind == .verbatim, trace.index == span.tokenRange.end - 1 else { continue }
             let number: Int
@@ -46,6 +46,24 @@ public enum CitationMarkers {
                     tokenStart: span.source.tokenOffset, tokenEnd: span.source.tokenOffset + span.tokens.count,
                     partitionURL: span.source.partitionURL, verification: span.verification?.status))
             }
+            markers.append((trace.index, number))
+        }
+        return (markers, sources)
+    }
+
+    /// The numbered sources in order of first use.
+    public static func sources(_ generation: CitedGeneration) -> [MarkedSource] { markers(generation).sources }
+
+    /// The generated text with `[[n]]` after each verbatim span, and the sources in
+    /// order of first use. One number per partition.
+    public static func render(_ generation: CitedGeneration) -> (text: String, sources: [MarkedSource]) {
+        let (markers, sources) = markers(generation)
+        var numberAt: [Int: Int] = [:]
+        for marker in markers { numberAt[marker.traceIndex] = marker.number }
+        var text = ""
+        for trace in generation.traces where !trace.isPrompt {
+            text += trace.text
+            guard let number = numberAt[trace.index] else { continue }
             // A span can end on a whitespace token (SmolLM2 gives the space before a number its
             // own token); the marker goes before that whitespace, where a reader expects it.
             var trailing = ""

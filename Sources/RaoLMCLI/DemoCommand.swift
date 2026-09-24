@@ -11,6 +11,7 @@
 import ArgumentParser
 import Foundation
 import RaoLM
+import RaoLMWorkflows
 
 struct Demo: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Everything end to end: corpus → Thread → snapshot → train → cite → verify.")
@@ -55,6 +56,9 @@ struct Demo: AsyncParsableCommand {
     @Flag(help: "Skip the paraphrase and fabricated-entity controls.")
     var noControls = false
 
+    @Flag(help: "Skip the grounding measurement (SinatraHarness, with vs without each fact's source) in the evaluation.")
+    var noGrounding = false
+
     func run() async throws {
         try await guarded {
             try Preflight.requireMetallib()
@@ -69,8 +73,8 @@ struct Demo: AsyncParsableCommand {
 
             // 1. Preflight.
             Console.section("Preflight")
-            let checks = await Doctor.checks(root: root, threadBinary: threadBinary, httpPort: httpPort, grpcPort: grpcPort)
-            for check in checks { print("\(check.ok ? "✓" : "✗") \(check.name.padding(toLength: 16, withPad: " ", startingAt: 0)) \(check.detail)") }
+            let checks = await DoctorChecks.run(root: root, threadBinary: threadBinary, httpPort: httpPort, grpcPort: grpcPort)
+            for check in checks { print(check.line) }
             let blocking = checks.filter { !$0.ok && !["disk", "embedding model"].contains($0.name) && !(reuseThread && $0.name.hasSuffix("port")) }
             guard blocking.isEmpty else {
                 throw RaoLMFailure("preflight failed: " + blocking.map(\.name).joined(separator: ", "), code: 78)
@@ -162,16 +166,19 @@ struct Demo: AsyncParsableCommand {
 
                 // 6. Train.
                 Console.section("Train")
-                let result = try await TrainingDriver.train(
-                    snapshot: snapshot, snapshotPath: snapshotDirectory.appendingPathComponent(CorpusSnapshot.fileName).path,
-                    factsPath: corpusDirectory.appendingPathComponent("facts.jsonl"), options: training,
-                    runDirectory: runDirectory, runID: runID, thread: threadRef)
+                let settings = training.settings()
+                _ = try settings.modelConfig()
+                let tokenizer = try await RaoTokenizer.load()
+                let result = try TrainingDriver.train(
+                    TrainingDriver.Plan(
+                        snapshot: snapshot, snapshotPath: snapshotDirectory.appendingPathComponent(CorpusSnapshot.fileName).path,
+                        factsPath: corpusDirectory.appendingPathComponent("facts.jsonl"), settings: settings,
+                        runDirectory: runDirectory, runID: runID, thread: threadRef),
+                    tokenizer: tokenizer)
                 if stop.isSet { throw RaoLMFailure("interrupted", code: 130) }
                 let manifest = result.manifest
                 print("eval epochs:")
-                print(Format.table(["epoch", "train loss", "train H", "eval loss", "eval H", "memorised", "checkpoint"], manifest.epochs.filter { $0.evalLoss != nil }.map {
-                    [String($0.epoch), Format.f($0.trainLoss), Format.f($0.trainEntropy), Format.f($0.evalLoss), Format.f($0.evalEntropy), Format.pct($0.evalMemorisedFraction), Format.short($0.checkpointSHA256)]
-                }))
+                print(Format.table(LedgerTables.evalEpochs(manifest)))
 
                 // 7. Cite.
                 Console.section("Cited generation")
@@ -199,9 +206,15 @@ struct Demo: AsyncParsableCommand {
 
                 // 8. Evaluate + verify.
                 Console.section("Evaluation")
+                if !noGrounding {
+                    let grounder = RaoGrounder(context: context, corpus: tokenized, budget: 120)
+                    evaluator.groundingMeasurer = GroundCommandSupport.makeMeasurer(
+                        grounder: grounder, runDirectory: runDirectory, threadID: context.manifestRef.threadID, saveRecords: true)
+                }
                 let report = try await evaluator.run(
                     options: EvalOptions(factsSample: factsSample, lambdas: [0, 0.5], primaryLambda: 0.5, seed: 7,
-                                         includeControls: !noControls, saveGenerations: RunLayout.generations(runDirectory))
+                                         includeControls: !noControls, saveGenerations: RunLayout.generations(runDirectory),
+                                         grounding: noGrounding ? nil : GroundingEvalOptions(includeControls: !noControls, saveRecords: true))
                 ) { print("  \($0)") }
                 EvalPrinter.print(report, sampleRows: min(factsSample, 12))
                 try JSONCoding.write(report, to: runDirectory.appendingPathComponent("eval.json"))

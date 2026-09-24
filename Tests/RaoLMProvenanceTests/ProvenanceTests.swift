@@ -129,6 +129,23 @@ struct EndToEndTests {
         #expect(generation.traces.allSatisfy { $0.neighbours.count == params.k && $0.lmEntropy >= 0 })
         #expect(generation.manifest.checkpointSHA256 == lastEpoch.checkpointSHA256)
 
+        // Throwing from onToken stops generation mid-stream (how the studio cancels).
+        var streamParams = params
+        streamParams.maxTokens = 8
+        var streamed = 0
+        #expect(throws: CancellationError.self) {
+            _ = try context.generator().generate(GenerationRequest(
+                promptTokens: prompt, promptText: tokenizer.decode(prompt), params: streamParams)) { _ in
+                streamed += 1
+                if streamed == 2 { throw CancellationError() }
+            }
+        }
+        #expect(streamed == 2)
+
+        // The synchronous loader (the studio's MLX worker) binds the same checkpoint and index.
+        let synchronous = try RunContext.load(runDirectory: runDirectory, allowWeakIndex: true, tokenizer: tokenizer)
+        #expect(synchronous.manifestRef == context.manifestRef)
+
         let reader = InMemoryCorpusReader(snapshot: snapshot)
         let report = try await CitationVerifier.verify(&generation, reader: reader, tokenizer: tokenizer)
         #expect(report.allVerified)

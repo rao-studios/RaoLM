@@ -47,6 +47,12 @@ public struct ThreadStats: Sendable, Equatable {
     public var documents: Int
     public var groups: Int
     public var owners: Int
+
+    public init(documents: Int, groups: Int, owners: Int) {
+        self.documents = documents
+        self.groups = groups
+        self.owners = owners
+    }
 }
 
 public struct IndexReport: Sendable, Equatable {

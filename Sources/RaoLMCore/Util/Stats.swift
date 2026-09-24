@@ -2,7 +2,8 @@
 //  Stats.swift
 //  RaoLMCore
 //
-//  WHAT: The handful of summary statistics the ledger and the evaluation report use.
+//  WHAT: The handful of summary statistics the ledger, the evaluation report and the
+//        grounding join use.
 //
 
 import Foundation
@@ -58,5 +59,32 @@ public enum Stats {
         for index in labels.indices where labels[index] { positiveRankSum += ranks[index] }
         let u = positiveRankSum - Double(positives) * Double(positives + 1) / 2
         return u / (Double(positives) * Double(negatives))
+    }
+
+    /// Pearson's correlation coefficient of paired samples, in [−1, 1]. Nil with fewer than
+    /// three pairs, unequal lengths, a non-finite value, or either side constant (zero variance).
+    public static func pearson(_ x: [Double], _ y: [Double]) -> Double? {
+        guard x.count == y.count, x.count >= 3 else { return nil }
+        guard x.allSatisfy(\.isFinite), y.allSatisfy(\.isFinite) else { return nil }
+        // A constant side has no variance, whatever rounding the mean picks up.
+        guard let xMin = x.min(), let xMax = x.max(), xMin < xMax,
+              let yMin = y.min(), let yMax = y.max(), yMin < yMax
+        else { return nil }
+        let mx = mean(x)
+        let my = mean(y)
+        var sxy = 0.0
+        var sxx = 0.0
+        var syy = 0.0
+        for i in x.indices {
+            let dx = x[i] - mx
+            let dy = y[i] - my
+            sxy += dx * dy
+            sxx += dx * dx
+            syy += dy * dy
+        }
+        guard sxx > 0, syy > 0 else { return nil }
+        let r = sxy / (sxx * syy).squareRoot()
+        guard r.isFinite else { return nil }
+        return min(max(r, -1), 1)
     }
 }

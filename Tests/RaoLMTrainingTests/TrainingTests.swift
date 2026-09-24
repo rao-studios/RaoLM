@@ -145,4 +145,44 @@ struct PretrainerTests {
         let files = try FileManager.default.contentsOfDirectory(atPath: RunLayout.checkpoint(runDirectory, epoch: 3).path)
         #expect(files.filter { $0.hasSuffix(".safetensors") } == ["model.safetensors"])
     }
+
+    @Test("shouldStop ends training before the next step and leaves a stopped manifest with its completed epochs")
+    func stopsOnRequest() async throws {
+        let tokenizer = try await RaoTokenizer.load()
+        let corpus = try SyntheticCorpus.generate(seed: 6, documentCount: 4)
+        let snapshot = CorpusSnapshot.offline(corpus)
+        let tokenized = TokenizedCorpus(snapshot: snapshot, tokenizer: tokenizer)
+        let runDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("raolm-stop-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: runDirectory) }
+        let hyper = TrainingHyperparameters(batchSize: 2, seqLen: 64, epochs: 5, peakLR: 3e-3, evalEvery: 0, indexEvery: 0, keepCheckpoints: 1, earlyStopMemorised: nil)
+        let provenance = ProvenanceSettings(tapLayer: 1, alpha: 0.5)
+        let model = try RaoTransformer.make(config: tinyConfig, seed: 1, tapLayer: 1)
+        let manifest = RunManifest(
+            runID: "stop", preset: "test", model: tinyConfig, tokenizer: tokenizer.ref,
+            corpus: CorpusRef(slug: "veldmar", corpusHash: snapshot.corpusHash, snapshotPath: "", source: "offline", threadID: nil,
+                              owner: "o", group: "g", documentCount: 4, partitionCount: tokenized.partitions.count, tokenCount: tokenized.tokenCount),
+            hyperparameters: hyper, provenance: provenance)
+        let trainer = Pretrainer(model: model, corpus: tokenized, tokenizer: tokenizer, facts: [], hyper: hyper,
+                                 provenance: provenance, runDirectory: runDirectory, manifest: manifest)
+        var steps: [StepRow] = []
+        var epochs: [Int] = []
+        var messages: [String] = []
+        // Stop once the second epoch has taken its first step.
+        let result = try trainer.run(shouldStop: { steps.contains { $0.epoch == 2 } }) { event in
+            switch event {
+            case .step(let row): steps.append(row)
+            case .epoch(let record): epochs.append(record.epoch)
+            case .message(let text): messages.append(text)
+            default: break
+            }
+        }
+        #expect(result.status == .stopped)
+        #expect(epochs == [1])
+        #expect(steps.filter { $0.epoch == 2 }.count == 1)
+        #expect(result.epochs.map(\.epoch) == [1])
+        #expect(messages.last?.contains("stopped in epoch 2") == true)
+        let saved = try RunManifest.load(runDirectory)
+        #expect(saved.status == .stopped)
+        #expect(saved.stepsLedgerSHA256 != nil)
+    }
 }

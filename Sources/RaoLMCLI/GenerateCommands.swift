@@ -9,6 +9,7 @@
 import ArgumentParser
 import Foundation
 import RaoLM
+import RaoLMWorkflows
 
 struct GenerateOptions: ParsableArguments {
     @Option(help: "Indexed epoch to use (default: the latest).")
@@ -63,30 +64,16 @@ enum GenerationPrinter {
             let rendered = CitationMarkers.render(generation)
             Swift.print(generation.prompt.text + "▸" + rendered.text)
             Swift.print("")
-            for source in rendered.sources {
-                let status = source.verification.map { " · \($0.rawValue)" } ?? ""
-                Swift.print("  [[\(source.number)]] \(source.documentName) — \(source.documentID) p\(source.partitionIndex) tokens \(source.tokenStart)..<\(source.tokenEnd)\(status)")
-            }
-            let s = generation.summary
+            for line in GenerationTables.sourceLines(generation) { Swift.print("  " + line) }
             Swift.print("")
-            Swift.print("  \(s.generated) generated tokens: \(s.verbatimCovered) in verbatim spans, \(s.supportOnly) with support citations, \(s.uncited) uncited; mean confidence \(Format.f(s.meanConfidence, 2))")
-            Swift.print("  bound to run \(generation.manifest.runID) epoch \(generation.manifest.epoch), checkpoint \(Format.short(generation.manifest.checkpointSHA256)), index \(Format.short(generation.manifest.indexSHA256)), corpus \(Format.short(generation.manifest.corpusHash))")
+            Swift.print("  " + GenerationTables.summaryLine(generation))
+            Swift.print("  " + GenerationTables.bindingLine(generation))
         }
     }
 
     static func printTraces(_ generation: CitedGeneration, limit: Int = 64) {
         Swift.print("")
-        Swift.print(Format.table(
-            ["#", "token", "H_lm", "H_mix", "agree", "conf", "top citation"],
-            generation.traces.filter { !$0.isPrompt }.prefix(limit).map { trace in
-                let citation = trace.citations.first.map { c in
-                    "\(generation.partition(row: c.row)?.documentName ?? "?") p\(c.address.partitionIndex)@\(c.address.tokenOffset)"
-                } ?? (trace.uncited ? "(uncited)" : "")
-                return [
-                    String(trace.index), Format.clip(trace.text.debugDescription, 14), Format.f(trace.lmEntropy, 2),
-                    Format.f(trace.mixedEntropy, 2), Format.f(trace.agreement, 2), Format.f(trace.confidence, 2), citation,
-                ]
-            }))
+        Swift.print(Format.table(GenerationTables.traces(generation, limit: limit)))
     }
 }
 
@@ -117,6 +104,12 @@ struct GenerateText: AsyncParsableCommand {
     @Flag(help: "Print the per-token trace table.")
     var trace = false
 
+    @Flag(help: "Measure the generation against its sources with SinatraHarness (with vs without them) and save the record.")
+    var ground = false
+
+    @Option(help: "With --ground: top, spans, all, fact (the prompt's source), or DOC:P[,DOC:P].")
+    var sources = "top"
+
     func run() async throws {
         try await guarded {
             try Preflight.requireMetallib()
@@ -131,6 +124,7 @@ struct GenerateText: AsyncParsableCommand {
             } else {
                 throw ValidationError("pass --prompt or --prompt-from")
             }
+            let policy = ground ? try GroundCommandSupport.policy(sources) : nil
             let generation = try context.generator().generate(request)
             try GenerationPrinter.print(generation, format: format, tokenizer: context.tokenizer)
             if trace { GenerationPrinter.printTraces(generation) }
@@ -138,29 +132,26 @@ struct GenerateText: AsyncParsableCommand {
                 try generation.save(to: URL(fileURLWithPath: json))
                 if format != .json { print("\nsaved \(json)") }
             }
+            if let policy {
+                let url = GroundCommandSupport.recordURL(runDirectory: context.runDirectory, generationID: generation.generationID, besideJSON: json)
+                let record = try await GroundCommandSupport.measure(context: context, generation: generation, policy: policy, save: url)
+                GroundingPrinter.printSummary(record)
+                if record.measured { GroundingPrinter.printAttribution(record) }
+                if trace, record.measured { GroundingPrinter.printTokens(record) }
+                if record.measured { GroundingPrinter.printStats(record) }
+                print("\ngrounding record: \(url.path)")
+            }
         }
     }
 
     static func sliceRequest(_ spec: String, context: RunContext, params: GenerationParameters) throws -> GenerationRequest {
-        let parts = spec.split(separator: ":").map(String.init)
-        guard parts.count == 4, let partitionIndex = Int(parts[1]), let offset = Int(parts[2]), let length = Int(parts[3]), length > 0 else {
-            throw ValidationError("--prompt-from must be DOCUMENT_ID:PARTITION:OFFSET:LENGTH")
+        let slice: CorpusSlice
+        do {
+            slice = try CorpusSlice.parse(spec)
+        } catch let failure as RaoLMFailure where failure.code == 64 {
+            throw ValidationError(failure.message)
         }
-        let corpus = try context.tokenizedCorpus()
-        guard let row = corpus.row(documentID: parts[0], partitionIndex: partitionIndex) else {
-            throw RaoLMFailure("document \(parts[0]) partition \(partitionIndex) is not in the run's corpus", code: 66)
-        }
-        let partition = corpus.partitions[row]
-        guard offset >= 0, offset + length <= partition.tokens.count else {
-            throw RaoLMFailure("offset \(offset)+\(length) exceeds the partition's \(partition.tokens.count) tokens", code: 64)
-        }
-        let tokens = partition.tokens[offset..<(offset + length)].map(Int.init)
-        return GenerationRequest(
-            promptTokens: tokens, promptText: context.tokenizer.decode(tokens),
-            promptSource: SourceAddress(
-                threadID: context.manifestRef.threadID, documentID: partition.documentID, partitionIndex: partitionIndex,
-                tokenOffset: offset, partitionURL: partition.url, threadPartitionID: partition.threadPartitionID),
-            params: params)
+        return try slice.request(context: context, params: params)
     }
 }
 
@@ -192,7 +183,7 @@ struct Verify: AsyncParsableCommand {
             if offline {
                 reader = InMemoryCorpusReader(snapshot: try CorpusSnapshot.load(from: URL(fileURLWithPath: manifest.corpus.snapshotPath)))
             } else {
-                let endpoint = ThreadHostRecord.load(dataDirectory: global.root.threadDB)?.endpoint ?? thread.endpoint()
+                let endpoint = ThreadResolve.endpoint(root: global.root, fallback: thread.endpoint())
                 reader = ThreadCorpusReader(client: ThreadCorpusClient(endpoint: endpoint), owner: owner ?? manifest.corpus.owner)
             }
             let report = try await CitationVerifier.verify(&record, reader: reader, tokenizer: tokenizer)
@@ -231,50 +222,27 @@ struct Ledger: AsyncParsableCommand {
         try await guarded {
             let runDirectory = URL(fileURLWithPath: run)
             let manifest = try RunManifest.load(runDirectory)
-            let ledger = RunLayout.ledger(runDirectory)
             let encoder = JSONCoding.lineEncoder()
+            func emit<Row: Encodable>(_ rows: [Row], _ table: TextTable) throws {
+                if json {
+                    for row in rows { print(String(decoding: try encoder.encode(row), as: UTF8.self)) }
+                } else {
+                    print(Format.table(table))
+                }
+            }
             if let fact {
-                var rows: [FactEpochRow] = []
-                for epoch in manifest.epochs.map(\.epoch) {
-                    let url = LedgerFiles.facts(ledger, epoch: epoch)
-                    guard FileManager.default.fileExists(atPath: url.path) else { continue }
-                    rows += try JSONCoding.readLines(FactEpochRow.self, from: url).filter { $0.factID == fact || $0.factID.hasSuffix(fact) }
-                }
-                if json { for row in rows { print(String(decoding: try encoder.encode(row), as: UTF8.self)) } }
-                else {
-                    print(Format.table(["epoch", "mean loss", "memorised", "answer token losses"], rows.map {
-                        [String($0.epoch), Format.f($0.meanLoss), $0.memorised ? "yes" : "no", $0.answerTokenLosses.map { Format.f($0, 2) }.joined(separator: " ")]
-                    }))
-                }
+                let rows = try LedgerReader.facts(runDirectory: runDirectory, manifest: manifest, factID: fact)
+                try emit(rows, LedgerTables.factLosses(rows))
                 return
             }
             if let document {
-                var rows: [PartitionEpochRow] = []
-                for epoch in manifest.epochs.map(\.epoch) {
-                    let url = LedgerFiles.partitions(ledger, epoch: epoch)
-                    guard FileManager.default.fileExists(atPath: url.path) else { continue }
-                    rows += try JSONCoding.readLines(PartitionEpochRow.self, from: url).filter {
-                        $0.documentID == document && (partition == nil || $0.partitionIndex == partition)
-                    }
-                }
-                if json { for row in rows { print(String(decoding: try encoder.encode(row), as: UTF8.self)) } }
-                else {
-                    print(Format.table(["epoch", "partition", "tokens", "train loss", "train H", "eval loss", "eval H", "memorised", "since"], rows.map {
-                        [String($0.epoch), String($0.partitionIndex), String($0.tokens), Format.f($0.train?.meanLoss), Format.f($0.train?.meanEntropy),
-                         Format.f($0.eval?.meanLoss), Format.f($0.eval?.meanEntropy), Format.pct($0.eval?.memorisedFraction), $0.memorisedAtEpoch.map(String.init) ?? "—"]
-                    }))
-                }
+                let rows = try LedgerReader.partitions(runDirectory: runDirectory, manifest: manifest, documentID: document, partitionIndex: partition)
+                try emit(rows, LedgerTables.partitionTrajectory(rows))
                 return
             }
-            let rows = try JSONCoding.readLines(EpochRow.self, from: LedgerFiles.epochs(ledger))
-            if json { for row in rows { print(String(decoding: try encoder.encode(row), as: UTF8.self)) } }
-            else {
-                print("run \(manifest.runID) (\(manifest.preset), \(Format.count(manifest.parameterCount)) parameters) on corpus \(Format.short(manifest.corpus.corpusHash))")
-                print(Format.table(["epoch", "steps", "train loss", "train H", "eval loss", "eval H", "memorised", "gap", "checkpoint", "index"], rows.map {
-                    [String($0.epoch), String($0.steps), Format.f($0.trainLoss), Format.f($0.trainEntropy), Format.f($0.evalLoss), Format.f($0.evalEntropy),
-                     Format.pct($0.evalMemorisedFraction), Format.f($0.calibrationGap), Format.short($0.checkpointSHA256), $0.indexSHA256 == nil ? "" : Format.short($0.indexSHA256)]
-                }))
-            }
+            let rows = try LedgerReader.epochs(runDirectory: runDirectory)
+            if !json { print(LedgerTables.header(manifest)) }
+            try emit(rows, LedgerTables.epochs(rows))
         }
     }
 }

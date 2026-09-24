@@ -151,6 +151,37 @@ an influence certificate. The evaluation's leave-out control (`raolm train
 --exclude-documents N`) is the only causal evidence in this draft: facts from documents the
 model never saw should neither be answered nor cited.
 
+### What grounding adds
+
+`raolm ground` (and `raolm eval --grounding`) runs the missing counterfactual for a given
+output. `RaoLMGrounding` teacher-forces the generated tokens twice with the run's own weights,
+through SinatraHarness's grounding scorer: once under `[eos] D₁ [eos] D₂ … [eos] prompt`, with
+the chosen source partitions D in front of the prompt in their training tokenization, and
+once under the bare prompt the generation actually came from. Per token it records
+ι = log p_ctx − log p_bare (the nats the source added to what was said), KL(p_ctx ‖ p_bare),
+drift = max(0, KL − ι), a class (grounded, unsupported, contradicted, function) and a
+hallucination risk. Per source it records the attribution A_p, the nats of the output that
+source earned. The grounding record puts these beside the citation columns (confidence,
+agreement, H_lm, H_knn, H_mix, H_source, verbatim spans) token by token and partition by
+partition.
+
+ι is the counterfactual that citation confidence lacks, and it answers a narrower question:
+what the source's presence *in the context* changes, not what the source contributed to the
+weights. For memorised text the bare model already puts p ≈ 1 on the answer, so ι ≈ 0: the
+source's presence adds nothing. That is itself the finding. The answer comes from the weights,
+and the citation names where those weights learned it, not a document the model read. So
+grounding separates two cases that citation confidence alone conflates: a confident citation
+with ι ≈ 0 (recall from memory) and a confident citation with ι > 0 (the output leaned on the
+source it was given). The evaluation tests whether hallucination risk and ι separate wrong
+answers from right ones (`riskAUROCForWrongAnswer`) and whether ι agrees with citation
+confidence (`answerInfluenceConfidencePearson`). Its controls (paraphrases, fabricated
+entities, held-out documents) are all measured against the fact's true source partition.
+
+Because the bare side is exactly the generation's prompt, its log-probabilities and entropies
+reproduce the trace's p_LM and H_lm. The record reports the gap as *bare consistency* (about
+1e-6 nats in the test suite), an end-to-end check that both sides score the same model on the
+same tokens.
+
 ## Evaluation protocol
 
 `raolm eval` samples facts from the synthetic corpus. Each fact is stated in exactly one

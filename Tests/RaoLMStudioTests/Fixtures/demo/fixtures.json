@@ -1,0 +1,38 @@
+{
+  "corpus": {
+    "slug": "veldmar",
+    "seed": 42,
+    "documents": 24,
+    "maxChars": 600
+  },
+  "thread": {
+    "nodeID": "2A4ABE9A-7E85-4B56-B9C5-44D6E4060547",
+    "httpPort": 8095,
+    "grpcPort": 9095,
+    "documents": 24,
+    "groups": 1,
+    "owners": 1
+  },
+  "doctor": [
+    {
+      "name": "fixtures",
+      "ok": true,
+      "detail": "recorded raolm demo run 20260924-124112-tiny (24 documents, tiny, 60 epochs)"
+    },
+    {
+      "name": "raolm metallib",
+      "ok": true,
+      "detail": "not needed: the fixture backend replays, it does not run MLX"
+    },
+    {
+      "name": "tokenizer",
+      "ok": true,
+      "detail": "vocab 49152, eos 0 (bundled SmolLM2)"
+    },
+    {
+      "name": "thread binary",
+      "ok": false,
+      "detail": "fixture mode has no Thread"
+    }
+  ]
+}

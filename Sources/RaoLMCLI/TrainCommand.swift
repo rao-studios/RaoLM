@@ -8,6 +8,7 @@
 import ArgumentParser
 import Foundation
 import RaoLM
+import RaoLMWorkflows
 
 struct TrainOptions: ParsableArguments {
     @Option(help: "Model preset: tiny, small, smollm2-135m.")
@@ -49,100 +50,25 @@ struct TrainOptions: ParsableArguments {
     @Option(help: "Checkpoints to keep besides indexed epochs.")
     var keepCheckpoints = 3
 
-    func hyperparameters() -> TrainingHyperparameters {
-        TrainingHyperparameters(
-            batchSize: batchSize, seqLen: seqLen, epochs: epochs, peakLR: lr, seed: seed, evalEvery: evalEvery,
-            indexEvery: indexEvery, keepCheckpoints: keepCheckpoints, earlyStopMemorised: earlyStop > 0 ? earlyStop : nil)
+    func settings() -> TrainingSettings {
+        var settings = TrainingSettings()
+        settings.preset = preset
+        settings.epochs = epochs
+        settings.batchSize = batchSize
+        settings.seqLen = seqLen
+        settings.lr = lr
+        settings.evalEvery = evalEvery
+        settings.indexEvery = indexEvery
+        settings.tapLayer = tapLayer
+        settings.alpha = alpha
+        settings.seed = seed
+        settings.earlyStop = earlyStop
+        settings.excludeDocuments = excludeDocuments
+        settings.keepCheckpoints = keepCheckpoints
+        return settings
     }
-}
 
-enum TrainingDriver {
-    struct Result {
-        var manifest: RunManifest
-        var runDirectory: URL
-    }
-
-    /// Trains on a snapshot; `factsPath` (facts.jsonl) enables the per-fact ledger.
-    static func train(
-        snapshot: CorpusSnapshot, snapshotPath: String, factsPath: URL?, options: TrainOptions, runDirectory: URL,
-        runID: String, thread: ThreadRef?, quiet: Bool = false
-    ) async throws -> Result {
-        try Preflight.requireMetallib()
-        let config = try RaoLMConfig.preset(options.preset)
-        try config.validate()
-        let tokenizer = try await RaoTokenizer.load()
-        let hyper = options.hyperparameters()
-
-        var excluded: Set<String> = []
-        if options.excludeDocuments > 0 {
-            var rng = SplitMix64.derived(seed: hyper.seed, stream: 0xEC)
-            excluded = Set(rng.shuffled(snapshot.documents.map(\.id)).prefix(options.excludeDocuments))
-        }
-        let corpus = TokenizedCorpus(snapshot: snapshot, tokenizer: tokenizer, excluding: excluded)
-        guard corpus.tokenCount > hyper.seqLen else {
-            throw RaoLMFailure("the corpus has only \(corpus.tokenCount) tokens; --seq-len \(hyper.seqLen) needs more", code: 65)
-        }
-        var facts: [Fact] = []
-        if let factsPath, FileManager.default.fileExists(atPath: factsPath.path) {
-            facts = try JSONCoding.readLines(Fact.self, from: factsPath)
-        }
-        let located = FactLocator.locate(facts, corpus: corpus, tokenizer: tokenizer)
-
-        let provenance = ProvenanceSettings(tapLayer: options.tapLayer ?? config.numHiddenLayers / 2, alpha: options.alpha)
-        let model = try RaoTransformer.make(config: config, seed: hyper.seed, tapLayer: provenance.tapLayer)
-        let manifest = RunManifest(
-            runID: runID, preset: options.preset, model: config, tokenizer: tokenizer.ref,
-            corpus: CorpusRef(
-                slug: snapshot.slug, corpusHash: snapshot.corpusHash, snapshotPath: snapshotPath, source: snapshot.source,
-                threadID: snapshot.threadID, owner: snapshot.owner, group: snapshot.group,
-                documentCount: corpus.documents.count, partitionCount: corpus.partitions.count,
-                tokenCount: corpus.tokenCount, factsPath: factsPath?.path),
-            hyperparameters: hyper, provenance: provenance, thread: thread, excludedDocumentIDs: excluded.sorted())
-        try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
-        try manifest.save(to: runDirectory)
-
-        if !quiet {
-            print("model \(options.preset): \(Format.count(config.parameterCount)) parameters, tap layer \(provenance.tapLayer)")
-            print("corpus: \(corpus.documents.count) documents, \(corpus.partitions.count) partitions, \(Format.count(corpus.tokenCount)) tokens, \(located.located.count) facts located" + (excluded.isEmpty ? "" : ", \(excluded.count) documents held out"))
-            if !located.unaligned.isEmpty { print("  (\(located.unaligned.count) facts did not align to token boundaries)") }
-        }
-
-        let trainer = Pretrainer(
-            model: model, corpus: corpus, tokenizer: tokenizer, facts: located.located, hyper: hyper,
-            provenance: provenance, runDirectory: runDirectory, manifest: manifest)
-        var lastReport = Date()
-        var stepsPerEpoch = 0
-        let result = try trainer.run { event in
-            switch event {
-            case .started(let total, let perEpoch, let tokens):
-                stepsPerEpoch = perEpoch.first ?? 0
-                if !quiet { print("training: \(total) steps (\(stepsPerEpoch)/epoch × \(hyper.epochs) epochs), \(Format.count(tokens)) tokens/step") }
-            case .step(let row):
-                if !quiet, Date().timeIntervalSince(lastReport) > 5 || row.globalStep < 3 {
-                    lastReport = Date()
-                    print(String(
-                        format: "  epoch %d step %d/%d  loss %.3f  entropy %.3f  lr %.2e  grad %.2f  %.0f tok/s",
-                        row.epoch, row.step + 1, stepsPerEpoch, row.loss, row.entropy.mean, row.lr, row.gradNorm, row.tokensPerSecond))
-                }
-            case .epoch(let record):
-                if !quiet {
-                    var line = String(format: "epoch %d  train loss %.3f  entropy %.3f", record.epoch, record.trainLoss, record.trainEntropy)
-                    if let evalLoss = record.evalLoss, let memorised = record.evalMemorisedFraction {
-                        line += String(format: "  eval loss %.3f  memorised %.1f%%", evalLoss, memorised * 100)
-                    }
-                    line += "  (\(Format.duration(record.wallClockSeconds)))"
-                    print(line)
-                }
-            case .indexed(let epoch, let entries, let sha, let seconds):
-                if !quiet { print("provenance index for epoch \(epoch): \(Format.count(entries)) entries, sha \(Format.short(sha)), \(Format.duration(seconds))") }
-            case .earlyStop(let epoch, let memorised):
-                if !quiet { print(String(format: "early stop after epoch %d: %.1f%% of positions memorised", epoch, memorised * 100)) }
-            case .message(let text):
-                if !quiet { print(text) }
-            }
-        }
-        return Result(manifest: result, runDirectory: runDirectory)
-    }
+    func hyperparameters() -> TrainingHyperparameters { settings().hyperparameters() }
 }
 
 struct Train: AsyncParsableCommand {
@@ -172,9 +98,15 @@ struct Train: AsyncParsableCommand {
                 let candidate = global.root.corpus(slug: slug).appendingPathComponent("facts.jsonl")
                 if FileManager.default.fileExists(atPath: candidate.path) { factsURL = candidate }
             }
-            let result = try await TrainingDriver.train(
-                snapshot: snapshot, snapshotPath: snapshotURL.path, factsPath: factsURL, options: options,
-                runDirectory: runDirectory, runID: runID, thread: nil)
+            try Preflight.requireMetallib()
+            let settings = options.settings()
+            _ = try settings.modelConfig()
+            let tokenizer = try await RaoTokenizer.load()
+            let result = try TrainingDriver.train(
+                TrainingDriver.Plan(
+                    snapshot: snapshot, snapshotPath: snapshotURL.path, factsPath: factsURL, settings: settings,
+                    runDirectory: runDirectory, runID: runID, thread: nil),
+                tokenizer: tokenizer)
             print("run \(result.manifest.runID) complete: \(result.runDirectory.path)")
         }
     }

@@ -8,6 +8,7 @@
 import ArgumentParser
 import Foundation
 import RaoLM
+import RaoLMWorkflows
 
 struct ThreadGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(

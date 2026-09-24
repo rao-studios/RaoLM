@@ -8,48 +8,24 @@
 import ArgumentParser
 import Foundation
 import RaoLM
+import RaoLMWorkflows
 
 enum EvalPrinter {
     static func print(_ report: EvalReport, sampleRows: Int) {
         Console.section("Fact evaluation (\(report.sampleSize) facts, epoch \(report.epoch))")
-        Swift.print(Format.table(
-            ["λ", "exact", "citation@1", "on correct", "offset@1", "cited@1", "covered", "confidence"],
-            report.lambdas.map { m in
-                [Format.f(m.lambda, 2), Format.pct(m.exactAnswer), Format.pct(m.citationAt1Partition), Format.pct(m.citationAt1PartitionOnCorrect),
-                 Format.pct(m.citationAt1Offset), Format.pct(m.citedPartitionAt1), Format.pct(m.answerCoveredByVerbatimSpan), Format.f(m.meanAnswerConfidence, 2)]
-            }))
-        if report.spanChecks > 0 {
-            Swift.print("  spans verified against the source: \(report.spansVerified)/\(report.spanChecks) (\(Format.pct(report.spanVerifiedRate)))")
-        }
-        Swift.print("  calibration: ECE \(Format.f(report.ece, 3))" + (report.auroc.map { String(format: ", AUROC %.3f", $0) } ?? ""))
-        let populated = report.calibration.filter { $0.count > 0 }
-        if !populated.isEmpty {
-            Swift.print(Format.table(["confidence bin", "tokens", "mean conf", "citation correct"], populated.map {
-                [String(format: "%.1f–%.1f", $0.lower, $0.upper), String($0.count), Format.f($0.meanConfidence, 2), Format.pct($0.accuracy)]
-            }))
-        }
-        if let c = report.controls {
-            Swift.print("  controls: paraphrased prompts exact \(Format.pct(c.paraphraseExact)) (confidence \(Format.f(c.paraphraseMeanConfidence, 2))); "
-                + "fabricated entities: confidence \(Format.f(c.negativeMeanConfidence, 2)) vs \(Format.f(c.correctAnswerMeanConfidence, 2)) on correct answers, "
-                + "\(c.negativeDistinctiveVerbatimSpans) distinctive verbatim spans")
-            if let n = c.heldOutFacts {
-                Swift.print("  leave-out control: \(n) facts from documents excluded from training — exact \(Format.pct(c.heldOutExact)), "
-                    + "confidence \(Format.f(c.heldOutMeanConfidence, 2)), answer tokens citing the held-out document: \(c.heldOutCitedSource ?? 0)")
-            }
-        }
+        Swift.print(Format.table(EvalTables.lambdas(report)))
+        if let line = EvalTables.spansLine(report) { Swift.print("  " + line) }
+        Swift.print("  " + EvalTables.calibrationLine(report))
+        let calibration = EvalTables.calibration(report)
+        if !calibration.rows.isEmpty { Swift.print(Format.table(calibration)) }
+        for line in EvalTables.controlLines(report) { Swift.print("  " + line) }
+        if let grounding = report.grounding { GroundingPrinter.printEvalSection(grounding) }
         if !report.unalignedFacts.isEmpty {
             Swift.print("  \(report.unalignedFacts.count) facts skipped (answer not on a token boundary)")
         }
         if sampleRows > 0 {
             Swift.print("")
-            Swift.print(Format.table(
-                ["fact", "prompt", "expected", "generated", "top citation", "verbatim", "verified", "conf"],
-                report.outcomes.prefix(sampleRows).map { o in
-                    [Format.clip(o.kind.rawValue, 14), Format.clip(o.prompt, 44), Format.clip(o.expected, 16), Format.clip(o.generated, 16),
-                     Format.clip((o.topCitationName ?? "—") + (o.topCitation.map { " p\($0.partitionIndex)@\($0.tokenOffset)" } ?? ""), 34),
-                     o.answerCoveredByVerbatimSpan ? "yes" : "no",
-                     o.spansChecked.map { "\(o.spansVerified ?? 0)/\($0)" } ?? "—", Format.f(o.meanAnswerConfidence, 2)]
-                }))
+            Swift.print(Format.table(EvalTables.outcomes(report, limit: sampleRows, grounding: report.grounding != nil)))
         }
     }
 }
@@ -97,6 +73,12 @@ struct Eval: AsyncParsableCommand {
     @Flag(help: "Use an index whose epoch memorised under half the corpus.")
     var allowWeakIndex = false
 
+    @Flag(help: "Also measure each answer against its source with SinatraHarness (with vs without the source): hallucination risk, drift and influence beside the citation metrics.")
+    var grounding = false
+
+    @Option(help: "Seconds each grounding measurement may take.")
+    var groundingBudget: Double = 120
+
     func run() async throws {
         try await guarded {
             try Preflight.requireMetallib()
@@ -110,16 +92,25 @@ struct Eval: AsyncParsableCommand {
             if offline {
                 reader = InMemoryCorpusReader(snapshot: try context.snapshot())
             } else {
-                let endpoint = ThreadHostRecord.load(dataDirectory: global.root.threadDB)?.endpoint ?? thread.endpoint()
+                let endpoint = ThreadResolve.endpoint(root: global.root, fallback: thread.endpoint())
                 let client = ThreadCorpusClient(endpoint: endpoint)
                 _ = try await client.health()
                 reader = ThreadCorpusReader(client: client, owner: owner ?? context.manifest.corpus.owner)
             }
             let values = lambdas.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
-            let evaluator = FactEvaluator(context: context, corpus: try context.tokenizedCorpus(), facts: facts, reader: reader)
+            let corpus = try context.tokenizedCorpus()
+            let evaluator = FactEvaluator(context: context, corpus: corpus, facts: facts, reader: reader)
+            var groundingOptions: GroundingEvalOptions?
+            if grounding {
+                let grounder = RaoGrounder(context: context, corpus: corpus, budget: groundingBudget)
+                evaluator.groundingMeasurer = GroundCommandSupport.makeMeasurer(
+                    grounder: grounder, runDirectory: runDirectory, threadID: context.manifestRef.threadID, saveRecords: true)
+                groundingOptions = GroundingEvalOptions(includeControls: !noControls, saveRecords: true)
+            }
             let report = try await evaluator.run(
                 options: EvalOptions(factsSample: factsSample, lambdas: values, primaryLambda: primaryLambda, seed: seed,
-                                     includeControls: !noControls, saveGenerations: RunLayout.generations(runDirectory))
+                                     includeControls: !noControls, saveGenerations: RunLayout.generations(runDirectory),
+                                     grounding: groundingOptions)
             ) { print("  \($0)") }
             EvalPrinter.print(report, sampleRows: rows)
             let output = json.map { URL(fileURLWithPath: $0) } ?? runDirectory.appendingPathComponent("eval.json")

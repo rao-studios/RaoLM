@@ -7,9 +7,12 @@
 //        whether the top neighbour (and the top citation) points at the fact's source
 //        partition and offset, whether the answer is covered by a span verified against the
 //        live source, calibration of citation confidence, the λ ablation, and two controls
-//        (paraphrased prompts; prompts about entities that do not exist).
+//        (paraphrased prompts; prompts about entities that do not exist). With a grounding
+//        measurer injected (RaoLMGrounding), each primary generation — and each control's —
+//        is also scored with and without the fact's source partition in front of its prompt.
 //  PIN:  Prompts are token slices of the source partition, never re-tokenized strings: a
 //        string-initial "The" lacks the corpus's "ĠThe" and would change the context.
+//        Cancellation is checked before every fact, so cancelling the task stops an eval.
 //
 
 import Foundation
@@ -24,10 +27,12 @@ public struct EvalOptions: Sendable {
     public var seed: UInt64
     public var includeControls: Bool
     public var saveGenerations: URL?
+    /// Measure grounding at the primary λ (needs `FactEvaluator.groundingMeasurer`).
+    public var grounding: GroundingEvalOptions?
 
     public init(
         factsSample: Int = 50, lambdas: [Float] = [0, 0.25, 0.5, 0.75], primaryLambda: Float = 0.5, seed: UInt64 = 7,
-        includeControls: Bool = true, saveGenerations: URL? = nil
+        includeControls: Bool = true, saveGenerations: URL? = nil, grounding: GroundingEvalOptions? = nil
     ) {
         self.factsSample = factsSample
         self.lambdas = lambdas
@@ -35,6 +40,7 @@ public struct EvalOptions: Sendable {
         self.seed = seed
         self.includeControls = includeControls
         self.saveGenerations = saveGenerations
+        self.grounding = grounding
     }
 }
 
@@ -62,6 +68,9 @@ public struct FactOutcome: Codable, Sendable {
     public var spansChecked: Int?
     public var meanAnswerConfidence: Float
     public var generationFile: String?
+    /// The grounding measurement against the fact's source partition (primary λ only; nil
+    /// when grounding was off, and in reports written before it existed).
+    public var grounding: GroundingFactSummary?
 }
 
 public struct LambdaMetrics: Codable, Sendable {
@@ -117,6 +126,8 @@ public struct EvalReport: Codable, Sendable {
     public var controls: ControlMetrics?
     public var outcomes: [FactOutcome]
     public var unalignedFacts: [String]
+    /// The two-fold section: nil when grounding was off (and in older reports).
+    public var grounding: GroundingEvalReport?
 
     public func metrics(lambda: Float) -> LambdaMetrics? {
         lambdas.first { abs($0.lambda - lambda) < 1e-6 }
@@ -132,6 +143,9 @@ public final class FactEvaluator {
     /// Facts of documents the run held out, located in a tokenization of the full snapshot.
     public let heldOut: [LocatedFact]
     private let fullCorpus: TokenizedCorpus?
+    /// Scores a generation with and without its source partition; set it (RaoLMGrounding
+    /// builds one) and pass `EvalOptions.grounding` to add the two-fold measurement.
+    public var groundingMeasurer: GroundingMeasurer?
 
     public init(context: RunContext, corpus: TokenizedCorpus, facts: [Fact], reader: CorpusReading?) {
         self.context = context
@@ -171,11 +185,15 @@ public final class FactEvaluator {
         var spanChecks = 0
         var spansVerified = 0
         var correctConfidences: [Float] = []
+        let measurer = options.grounding == nil ? nil : groundingMeasurer
+        let groundControls = measurer != nil && options.includeControls && (options.grounding?.includeControls ?? false)
+        var groundingControls: [GroundingControlOutcome] = []
 
         let lambdas = options.lambdas.contains(options.primaryLambda) ? options.lambdas : options.lambdas + [options.primaryLambda]
         for lambda in lambdas {
             var outcomes: [FactOutcome] = []
             for (n, located) in sampled.enumerated() {
+                try Task.checkCancellation()
                 let isPrimary = abs(lambda - options.primaryLambda) < 1e-6
                 let partition = corpus.partitions[located.row]
                 let promptTokens = partition.tokens[located.contextToken..<located.answerToken].map(Int.init)
@@ -209,6 +227,10 @@ public final class FactEvaluator {
                     try generation.save(to: url)
                     saved.generationFile = url.path
                 }
+                if isPrimary, let measurer {
+                    saved.grounding = try await Self.ground(
+                        generation, Self.groundingSource(.fact, located: located, partition: partition), measurer: measurer)
+                }
                 outcomes.append(saved)
                 if isPrimary {
                     let answerTraces = Array(generation.traces.filter { !$0.isPrompt }.prefix(located.answerLength))
@@ -238,12 +260,19 @@ public final class FactEvaluator {
             var negativeConfidences: [Float] = []
             var negativeDistinctive = 0
             for located in sampled {
+                try Task.checkCancellation()
                 let partition = corpus.partitions[located.row]
                 let expected = partition.tokens[located.answerToken..<located.answerEndToken].map(Int.init)
                 params.maxTokens = located.answerLength + 2
                 for paraphrase in located.fact.paraphrases.prefix(1) {
                     let tokens = tokenizer.encode(paraphrase)
                     let generation = try generator.generate(GenerationRequest(promptTokens: tokens, promptText: paraphrase, params: params))
+                    if groundControls, let measurer {
+                        let summary = try await Self.ground(
+                            generation, Self.groundingSource(.paraphrase, located: located, partition: partition), measurer: measurer)
+                        groundingControls.append(GroundingControlOutcome(
+                            factID: located.fact.id, group: .paraphrase, prompt: paraphrase, generated: generation.text, summary: summary))
+                    }
                     paraphraseCount += 1
                     if Array(generation.tokens.prefix(expected.count)) == expected { paraphraseExact += 1 }
                     for trace in generation.traces.filter({ !$0.isPrompt }).prefix(expected.count) {
@@ -262,6 +291,13 @@ public final class FactEvaluator {
                 if let reader {
                     _ = try await CitationVerifier.verify(&negative, reader: reader, tokenizer: tokenizer)
                 }
+                if groundControls, let measurer {
+                    let summary = try await Self.ground(
+                        negative, Self.groundingSource(.fabricated, located: located, partition: partition), measurer: measurer)
+                    groundingControls.append(GroundingControlOutcome(
+                        factID: located.fact.id, group: .fabricated, prompt: located.fact.negativePrompt,
+                        generated: negative.text, summary: summary))
+                }
                 negativeDistinctive += negative.spans.filter {
                     $0.kind == .verbatim && $0.distinctiveness > 0 && ($0.verification?.status ?? .verified) == .verified
                 }.count
@@ -272,12 +308,20 @@ public final class FactEvaluator {
             let heldOutSample = Array(heldOut.prefix(options.factsSample))
             if let fullCorpus {
                 for located in heldOutSample {
+                    try Task.checkCancellation()
                     let partition = fullCorpus.partitions[located.row]
                     let prompt = partition.tokens[located.contextToken..<located.answerToken].map(Int.init)
                     let expected = partition.tokens[located.answerToken..<located.answerEndToken].map(Int.init)
                     params.maxTokens = located.answerLength + 2
                     let generation = try generator.generate(GenerationRequest(
                         promptTokens: prompt, promptText: tokenizer.decode(prompt), params: params))
+                    if groundControls, let measurer {
+                        let summary = try await Self.ground(
+                            generation, Self.groundingSource(.heldOut, located: located, partition: partition), measurer: measurer)
+                        groundingControls.append(GroundingControlOutcome(
+                            factID: located.fact.id, group: .heldOut, prompt: generation.prompt.text,
+                            generated: generation.text, summary: summary))
+                    }
                     if Array(generation.tokens.prefix(expected.count)) == expected { heldOutExact += 1 }
                     for trace in generation.traces.filter({ !$0.isPrompt }).prefix(expected.count) {
                         heldOutConfidences.append(trace.confidence ?? 0)
@@ -304,6 +348,17 @@ public final class FactEvaluator {
             }
         }
 
+        var grounding: GroundingEvalReport?
+        if measurer != nil {
+            let report = GroundingEvalReport.make(outcomes: primaryOutcomes, controls: groundingControls)
+            grounding = report
+            let measured = primaryOutcomes.filter { $0.grounding?.measured == true }.count
+            progress(
+                "grounding  measured \(measured)/\(primaryOutcomes.count) facts"
+                    + (groundingControls.isEmpty ? "" : " and \(groundingControls.filter(\.summary.measured).count)/\(groundingControls.count) controls")
+                    + (report.riskAUROCForWrongAnswer.map { String(format: "  risk AUROC (wrong answer) %.3f", $0) } ?? ""))
+        }
+
         let (bins, ece) = Self.calibration(calibrationPool.map { ($0.confidence, $0.correct) })
         let auroc = Stats.auroc(scores: calibrationPool.map { Double($0.confidence) }, labels: calibrationPool.map(\.correct))
         return EvalReport(
@@ -311,7 +366,33 @@ public final class FactEvaluator {
             primaryLambda: options.primaryLambda, lambdas: metrics, spanChecks: spanChecks, spansVerified: spansVerified,
             spanVerifiedRate: spanChecks > 0 ? Float(spansVerified) / Float(spanChecks) : nil,
             calibration: bins, ece: ece, auroc: auroc, controls: controls, outcomes: primaryOutcomes,
-            unalignedFacts: unaligned)
+            unalignedFacts: unaligned, grounding: grounding)
+    }
+
+    // MARK: - Grounding
+
+    /// The fact's true source partition, as the measurer places it in front of a prompt.
+    static func groundingSource(_ group: GroundingEvalGroup, located: LocatedFact, partition: TokenizedPartition) -> GroundingEvalSource {
+        GroundingEvalSource(
+            group: group, factID: located.fact.id, row: partition.row, documentID: partition.documentID,
+            documentName: partition.documentName, partitionIndex: partition.partitionIndex,
+            tokens: partition.tokens.map(Int.init), textSHA256: partition.textSHA256, url: partition.url,
+            threadPartitionID: partition.threadPartitionID, answerLength: located.answerLength)
+    }
+
+    /// Runs the injected measurer. Anything but cancellation becomes a skipped summary with the
+    /// error as its reason, counted in the report rather than ending the evaluation.
+    static func ground(
+        _ generation: CitedGeneration, _ source: GroundingEvalSource, measurer: GroundingMeasurer
+    ) async throws -> GroundingFactSummary {
+        try Task.checkCancellation()
+        do {
+            return try await measurer(generation, source) ?? .skipped("no measurement")
+        } catch let cancelled as CancellationError {
+            throw cancelled
+        } catch {
+            return .skipped("\(error)")
+        }
     }
 
     private func score(

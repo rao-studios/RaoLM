@@ -8,6 +8,7 @@
 import ArgumentParser
 import Foundation
 import RaoLM
+import RaoLMWorkflows
 
 struct CorpusGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -165,9 +166,7 @@ struct CorpusGroup: AsyncParsableCommand {
 
         func run() async throws {
             try await guarded {
-                let nodeID = thread.nodeId.flatMap(UUID.init)
-                    ?? ThreadHostRecord.load(dataDirectory: global.root.threadDB)?.endpoint.nodeID
-                    ?? ThreadHost.readNodeID(dataDirectory: global.root.threadDB)
+                let nodeID = ThreadResolve.nodeID(explicit: thread.nodeId, root: global.root)
                 let client = ThreadCorpusClient(endpoint: thread.endpoint(nodeID: nodeID))
                 let snapshot = try await client.exportCorpus(
                     owner: owner, group: group ?? "raolm-\(slug)", prefix: prefix ?? DocumentID.prefix(slug: slug), slug: slug)

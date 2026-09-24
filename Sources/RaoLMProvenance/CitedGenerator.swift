@@ -44,7 +44,9 @@ public final class CitedGenerator {
         self.manifestRef = manifestRef
     }
 
-    public func generate(_ request: GenerationRequest, onToken: ((TokenTrace) -> Void)? = nil) throws -> CitedGeneration {
+    /// `onToken` sees each generated token as it is chosen; throwing from it (for example a
+    /// `CancellationError`) stops the generation and rethrows.
+    public func generate(_ request: GenerationRequest, onToken: ((TokenTrace) throws -> Void)? = nil) throws -> CitedGeneration {
         let params = request.params
         guard !request.promptTokens.isEmpty else { throw ProvenanceError.emptyPrompt }
         let prompt = request.promptTokens
@@ -79,7 +81,7 @@ public final class CitedGenerator {
             }
             traces.append(trace)
             generated.append(trace.token)
-            onToken?(trace)
+            try onToken?(trace)
             guard generated.count < params.maxTokens else { break }
             output = model.forward(MLXArray([Int32(trace.token)], [1, 1]), cache: cache, captureTap: true)
             keys = ProvenanceKey.make(tap: output.tap!, final: output.final, alpha: params.alpha)

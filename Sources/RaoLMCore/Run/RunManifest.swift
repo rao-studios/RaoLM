@@ -80,6 +80,8 @@ public struct ProvenanceSettings: Codable, Sendable, Equatable {
 
 public enum RunStatus: String, Codable, Sendable {
     case starting, ingesting, snapshotting, training, indexing, generating, verifying, complete, failed
+    /// Stopped on request; completed epochs, checkpoints and indexes stay usable.
+    case stopped
 }
 
 public struct TokenizerRef: Codable, Sendable, Equatable {

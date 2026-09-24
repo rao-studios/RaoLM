@@ -14,11 +14,20 @@
 //   RaoLMTraining    tokenized corpus, pretraining loop, ledger, provenance indexer (MLX)
 //   RaoLMProvenance  provenance index, logit mixing, cited generation, verifier, eval (MLX)
 //   RaoLMThread      gRPC client for a Thread node, and a host that runs one   (Conduit / gRPC)
+//   RaoLMGrounding   SinatraHarness's with/without-source scoring joined to RaoLM's traces:
+//                    the two-fold entropy harness for hallucination and drift     (MLX + SinatraHarness)
 //   RaoLM            umbrella that re-exports the above
+//   RaoLMTerminal    ANSI/termios toolkit for the full-screen UI: raw mode, cells, diff
+//                    renderer, widgets, banner, app loop       (Foundation only, no TTY needed to test)
+//   RaoLMWorkflows   drivers shared by the CLI and the studio: training driver, doctor
+//                    checks, tables, failure mapping                    (no ArgumentParser)
+//   RaoLMStudio      `raolm ui`: studio state, MLX worker, screens, fixture backend
 //   RaoLMCLI         the `raolm` executable
 //
 // Frigate is taken by path, as every consumer in the family does. The gRPC packages are
-// the same URLs Conduit uses, so SwiftPM unifies them into one GRPCCore.
+// the same URLs Conduit uses, so SwiftPM unifies them into one GRPCCore. SinatraHarness is
+// taken by path the way Sewn takes it; its own Frigate path resolves to the same checkout,
+// so the graph holds one Frigate.
 
 import PackageDescription
 
@@ -37,11 +46,14 @@ let package = Package(
         .library(name: "RaoLMTraining", targets: ["RaoLMTraining"]),
         .library(name: "RaoLMProvenance", targets: ["RaoLMProvenance"]),
         .library(name: "RaoLMThread", targets: ["RaoLMThread"]),
+        .library(name: "RaoLMGrounding", targets: ["RaoLMGrounding"]),
+        .library(name: "RaoLMTerminal", targets: ["RaoLMTerminal"]),
         .executable(name: "raolm", targets: ["RaoLMCLI"]),
     ],
     dependencies: [
         .package(path: "../Frigate"),
         .package(path: "../Conduit"),
+        .package(path: "../../../repositories/SinatraHarness"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
         .package(url: "https://github.com/grpc/grpc-swift.git", from: "2.0.0"),
         .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "1.0.0"),
@@ -94,16 +106,42 @@ let package = Package(
             ]
         ),
         .target(
+            name: "RaoLMGrounding",
+            dependencies: [
+                "RaoLMCore", "RaoLMModel", "RaoLMTraining", "RaoLMProvenance",
+                .product(name: "SinatraHarness", package: "SinatraHarness"),
+                .product(name: "MLX", package: "Frigate"),
+                .product(name: "MLXLMCommon", package: "Frigate"),
+            ],
+            swiftSettings: v5
+        ),
+        .target(
             name: "RaoLM",
             dependencies: [
-                "RaoLMCore", "RaoLMModel", "RaoLMTraining", "RaoLMProvenance", "RaoLMThread",
+                "RaoLMCore", "RaoLMModel", "RaoLMTraining", "RaoLMProvenance", "RaoLMThread", "RaoLMGrounding",
+            ],
+            swiftSettings: v5
+        ),
+        // Foundation only and Swift 6 strict: the toolkit never touches MLX or RaoLM's types.
+        .target(name: "RaoLMTerminal"),
+        .target(
+            name: "RaoLMWorkflows",
+            dependencies: ["RaoLM", .product(name: "SinatraHarness", package: "SinatraHarness")],
+            swiftSettings: v5
+        ),
+        .target(
+            name: "RaoLMStudio",
+            dependencies: [
+                "RaoLM", "RaoLMWorkflows", "RaoLMTerminal",
+                .product(name: "SinatraHarness", package: "SinatraHarness"),
             ],
             swiftSettings: v5
         ),
         .executableTarget(
             name: "RaoLMCLI",
             dependencies: [
-                "RaoLM",
+                "RaoLM", "RaoLMWorkflows", "RaoLMStudio",
+                .product(name: "SinatraHarness", package: "SinatraHarness"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: v5
@@ -144,6 +182,30 @@ let package = Package(
                 "RaoLMProvenance", "RaoLMTraining", "RaoLMModel", "RaoLMCore",
                 .product(name: "MLX", package: "Frigate"),
             ],
+            swiftSettings: v5
+        ),
+        .testTarget(
+            name: "RaoLMGroundingTests",
+            dependencies: [
+                "RaoLMGrounding", "RaoLMProvenance", "RaoLMTraining", "RaoLMModel", "RaoLMCore",
+                .product(name: "SinatraHarness", package: "SinatraHarness"),
+                .product(name: "MLX", package: "Frigate"),
+            ],
+            swiftSettings: v5
+        ),
+        .testTarget(
+            name: "RaoLMTerminalTests",
+            dependencies: ["RaoLMTerminal"]
+        ),
+        .testTarget(
+            name: "RaoLMWorkflowsTests",
+            dependencies: ["RaoLMWorkflows", "RaoLMCore"],
+            swiftSettings: v5
+        ),
+        .testTarget(
+            name: "RaoLMStudioTests",
+            dependencies: ["RaoLMStudio", "RaoLMWorkflows", "RaoLMTerminal", "RaoLMCore"],
+            resources: [.copy("Fixtures")],
             swiftSettings: v5
         ),
     ]

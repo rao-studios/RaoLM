@@ -40,13 +40,24 @@ public final class RunContext {
     public static func load(
         runDirectory: URL, epoch requested: Int? = nil, allowWeakIndex: Bool = false, tokenizerDirectory: URL? = nil
     ) async throws -> RunContext {
+        // Fail on a missing run or index before paying for the tokenizer.
+        let manifest = try RunManifest.load(runDirectory)
+        guard manifest.latestIndexedEpoch != nil else { throw RunManifestError.noIndex(runDirectory.path) }
+        let tokenizer = try await RaoTokenizer.load(directory: tokenizerDirectory)
+        return try load(runDirectory: runDirectory, epoch: requested, allowWeakIndex: allowWeakIndex, tokenizer: tokenizer)
+    }
+
+    /// Synchronous: for a caller that already holds the tokenizer and must keep every MLX
+    /// operation on its own thread.
+    public static func load(
+        runDirectory: URL, epoch requested: Int? = nil, allowWeakIndex: Bool = false, tokenizer: RaoTokenizer
+    ) throws -> RunContext {
         let manifest = try RunManifest.load(runDirectory)
         guard let latest = manifest.latestIndexedEpoch else { throw RunManifestError.noIndex(runDirectory.path) }
         let epoch = requested ?? latest
         guard manifest.indexedEpochs.contains(epoch) else {
             throw RunManifestError.epochNotIndexed(epoch, available: manifest.indexedEpochs.sorted())
         }
-        let tokenizer = try await RaoTokenizer.load(directory: tokenizerDirectory)
         guard tokenizer.tokenizerSHA256 == manifest.tokenizer.tokenizerSHA256 else {
             throw ProvenanceError.tokenizerMismatch(expected: manifest.tokenizer.tokenizerSHA256, found: tokenizer.tokenizerSHA256)
         }

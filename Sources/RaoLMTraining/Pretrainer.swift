@@ -8,7 +8,9 @@
 //  PIN:  Eager, not `compile`: compile bakes the Swift Float learning rate into the trace,
 //        so a per-step schedule would silently freeze. AdamW with bias correction, as in
 //        PyTorch/nanotron. Optimizer state is not checkpointed (MLXOptimizers keeps it
-//        internal), and run.json says so.
+//        internal), and run.json says so. `shouldStop` is polled before every step and after every
+//        epoch; a stopped run keeps its completed epochs, checkpoints and indexes, and its
+//        manifest says `stopped`.
 //
 
 import Foundation
@@ -18,7 +20,7 @@ import MLXOptimizers
 import RaoLMCore
 import RaoLMModel
 
-public enum TrainingEvent {
+public enum TrainingEvent: Sendable {
     case started(totalSteps: Int, stepsPerEpoch: [Int], tokensPerStep: Int)
     case step(StepRow)
     case epoch(EpochRecord)
@@ -62,7 +64,7 @@ public final class Pretrainer {
     }
 
     @discardableResult
-    public func run(onEvent: (TrainingEvent) -> Void = { _ in }) throws -> RunManifest {
+    public func run(shouldStop: () -> Bool = { false }, onEvent: (TrainingEvent) -> Void = { _ in }) throws -> RunManifest {
         let sampler = BatchSampler(seqLen: hyper.seqLen, batchSize: hyper.batchSize, seed: hyper.seed)
         let plans = (1...hyper.epochs).map { sampler.plan(epoch: $0, streamCount: corpus.stream.count) }
         let totalSteps = plans.reduce(0) { $0 + $1.count }
@@ -80,11 +82,21 @@ public final class Pretrainer {
 
         var globalStep = 0
         let runStart = Date()
+        func stop(epoch: Int, step: Int) throws -> RunManifest {
+            manifest.status = .stopped
+            manifest.stepsLedgerSHA256 = try ledger.stepsSHA256()
+            try manifest.save(to: runDirectory)
+            onEvent(.message(step == 0
+                ? "stopped after epoch \(epoch - 1)"
+                : "stopped in epoch \(epoch) after step \(step); the last complete epoch is \(epoch - 1)"))
+            return manifest
+        }
         for epoch in 1...hyper.epochs {
             let epochStart = Date()
             var epochLoss: [Float] = []
             var epochEntropy: [Float] = []
             for (step, starts) in plans[epoch - 1].enumerated() {
+                if shouldStop() { return try stop(epoch: epoch, step: step) }
                 let stepStart = Date()
                 let lr = schedule(globalStep)
                 optimizer.learningRate = lr
@@ -173,6 +185,7 @@ public final class Pretrainer {
                 onEvent(.earlyStop(epoch: epoch, memorisedFraction: memorised))
                 break
             }
+            if epoch < hyper.epochs, shouldStop() { return try stop(epoch: epoch + 1, step: 0) }
         }
 
         manifest.stepsLedgerSHA256 = try ledger.stepsSHA256()
