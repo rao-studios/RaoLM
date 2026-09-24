@@ -173,6 +173,6 @@ build. The MLX suites are gated by `RAOLM_MLX_TESTS=1` (or the family's
 
 ## License
 
-MIT (see [LICENSE](LICENSE)). The vendored SmolLM2 tokenizer files are Apache-2.0; see
+Apache License 2.0 (see [LICENSE](LICENSE)). The vendored SmolLM2 tokenizer files are also Apache-2.0; see
 `Sources/RaoLMModel/Resources/Tokenizer/NOTICE`. RaoLM links Frigate (MIT) and Conduit
 (Apache-2.0). Thread is only ever run as a separate process, never linked.
