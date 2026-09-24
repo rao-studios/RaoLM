@@ -1,0 +1,17 @@
+SmolLM2 tokenizer files, vendored for RaoLM
+============================================
+
+Source:    https://huggingface.co/HuggingFaceTB/SmolLM2-135M
+Revision:  93efa2f097d58c2a74874c7e644dbc9b0cee75a2
+License:   Apache License 2.0 (as declared by the HuggingFaceTB/SmolLM2-135M model card)
+Retrieved: 2026-09-24
+
+These files are unmodified copies. RaoLM uses the tokenizer (49,152-token byte-level BPE,
+Digits + ByteLevel pre-tokenizer, <|endoftext|> = 0) and ships config.json only as the
+reference for the smollm2-135m preset. No SmolLM2 weights are included.
+
+SHA-256
+9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c  tokenizer.json
+4bb9af56a342753d39374f4016a16574cab299fe088e896f425ce3c433f61424  tokenizer_config.json
+e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3  special_tokens_map.json
+1d556eab73b69c7f11f64c557a2f9c6f440bd4c6b89bb2584a6b498c92603843  config.json

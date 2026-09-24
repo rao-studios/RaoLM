@@ -1,0 +1,17 @@
+# SwiftPM / Xcode
+.build/
+.swiftpm/
+xcuserdata/
+*.xcodeproj
+*.dSYM
+DerivedData/
+# Package.resolved is not committed, as in Thread: Frigate's macOS-only pins differ by host.
+Package.resolved
+
+# Editors and local tooling
+.vscode/
+.claude/
+.DS_Store
+
+# Run outputs never live in the repo (they go to ~/Documents/raolm-db or RAOLM_DATA_DIR)
+/raolm-db/
