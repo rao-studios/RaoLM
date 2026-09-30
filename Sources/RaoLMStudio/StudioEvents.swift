@@ -40,8 +40,13 @@ public enum JobKind: String, Sendable, CaseIterable {
 
 /// What the braid panel asks for.
 public enum BraidJob: Sendable {
-    case start(offline: Bool, fresh: Bool)
+    /// `world`: the nodes and dataset the studio was opened with, or the dataset chosen on the
+    /// panel (d). `switching`: nodes fed from another world start over instead of being refused.
+    case start(offline: Bool, fresh: Bool, world: BraidWorldChoice = BraidWorldChoice(), switching: Bool = false)
     case stop
+    /// Checks that a dataset (a name in the datasets root, or a path) is there before the braid
+    /// is restarted on it.
+    case dataset(String)
     case feed(node: String)
     case withdraw(node: String)
     case cancel(node: String)
@@ -248,4 +253,8 @@ public enum StudioEvent: Sendable {
     case braidVerified(CitedGeneration, [String])
     /// What each Thread answers alone (a braid of one) to the prompt with these tokens.
     case braidAlone(prompt: [Int], answers: [String: String])
+    /// The dataset asked for on the panel (d) is there: the braid restarts on it.
+    case braidDataset(String)
+    /// What the braid that just started feeds its nodes from: a dataset, or nil for a generated mock world.
+    case braidSource(MockDatasetSource?)
 }

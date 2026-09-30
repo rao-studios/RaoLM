@@ -33,13 +33,12 @@ public struct StudioOptions: Sendable {
     public var braidAutoStart = false
     public var braidOffline = false
     public var braidFresh = false
-    /// The braid's nodes and the mock world they are fed from (`raolm braid --nodes …`).
+    /// The nodes the braid panel shows before its first start.
     public var braidNodes: [BraidNodeSpec] = BraidNodeSpec.defaults
     public var braidSeed: UInt64 = 42
-    /// A braid dataset to feed the nodes from instead of a generated world.
-    public var braidDataset: URL?
-    /// Named no nodes: a braid that already has nodes keeps them (BraidOptions.adoptNodes).
-    public var braidAdoptNodes = true
+    /// The nodes and dataset `raolm braid --nodes … --dataset …` named, which the panel starts
+    /// with (d changes the dataset). Naming neither, a braid that already has nodes keeps them.
+    public var braidWorld = BraidWorldChoice()
 
     public init(root: DataRoot, fixtures: URL? = nil, threadBinary: String? = nil, httpPort: Int = ThreadEndpoint.defaultHTTPPort,
                 grpcPort: Int = ThreadEndpoint.defaultGRPCPort, owner: String = "raolm-demo") {
@@ -271,6 +270,7 @@ public final class LiveBackend: StudioBackend, @unchecked Sendable {
         case .braid(let job):
             switch job {
             case .feed(let node): return "feeding \(node)"
+            case .dataset(let name): return "looking for the dataset \(name)"
             case .withdraw(let node): return "withdrawing from \(node)"
             case .stop: return "stopping the braid"
             case .verify: return "verifying against each Thread"
@@ -318,6 +318,12 @@ public final class LiveBackend: StudioBackend, @unchecked Sendable {
 
     func braidJob(_ job: BraidJob) async throws {
         switch job {
+        case .dataset(let name):
+            // Looked for before the braid is stopped, so a mistyped path leaves it running.
+            guard try BraidWorldChoice(dataset: name).datasetDirectory() != nil else {
+                throw RaoLMFailure("name a dataset, or give a path to one", code: 64)
+            }
+            post(.braidDataset(name))
         case .feed(let node):
             guard let session = braid.session else { throw RaoLMFailure("the braid is not running", hint: "S starts it", code: 69) }
             try await session.feed(node)

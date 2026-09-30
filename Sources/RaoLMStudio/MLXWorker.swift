@@ -167,37 +167,38 @@ final class MLXWorker: @unchecked Sendable {
         case .verify(let generation, let run, let live): try verify(generation, run: run, live: live)
         case .eval(let spec): try evaluate(spec)
         case .ground(let spec): try ground(spec)
-        case .braid(.start(let offline, let fresh)): try startBraid(offline: offline, fresh: fresh)
+        case .braid(.start(let offline, let fresh, let world, let switching)):
+            try startBraid(offline: offline, fresh: fresh, world: world, switching: switching)
         case .braid(.generate(let spec)): try braidGenerate(spec)
         default: break
         }
     }
 
     /// Starts the braid's nodes with the shared vocabulary; the umbrella's head stays on this thread.
-    private func startBraid(offline: Bool, fresh: Bool) throws {
+    private func startBraid(offline: Bool, fresh: Bool, world: BraidWorldChoice, switching: Bool) throws {
         if braid.session != nil {
             post(.log("the braid is already running"))
             return
         }
-        try Preflight.requireMetallib()
-        let tokenizer = try tokenizer()
         guard let executable = options.executable ?? Bundle.main.executableURL?.resolvingSymlinksInPath() else {
             throw BraidSessionError.noExecutable
         }
         var braidOptions = BraidOptions(root: options.root, executable: executable)
         braidOptions.offline = offline
         braidOptions.fresh = fresh
+        braidOptions.freshIfOtherWorld = switching
         braidOptions.threadBinary = options.threadBinary
-        braidOptions.nodes = options.braidNodes
         braidOptions.seed = options.braidSeed
-        braidOptions.dataset = options.braidDataset
-        braidOptions.adoptNodes = options.braidAdoptNodes
+        try world.apply(to: &braidOptions)
+        try Preflight.requireMetallib()
+        let tokenizer = try tokenizer()
         let vocabulary = try BraidVocabulary.ensure(layout: braidOptions.layout, config: try braidOptions.settings.modelConfig(), tokenizer: tokenizer)
         session.umbrella = BraidUmbrella(vocabulary: vocabulary, tokenizer: tokenizer)
         let post = self.post
         let started = try BraidSession(options: braidOptions, vocabularySHA256: vocabulary.sha256) { event in post(.braid(event)) }
         started.exampleTokenizer = tokenizer
         braid.session = started
+        post(.braidSource(started.worldRecord.dataset))
         do {
             try blockingAwait { try await started.start() }
         } catch {

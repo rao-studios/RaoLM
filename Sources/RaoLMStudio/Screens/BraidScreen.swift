@@ -111,6 +111,11 @@ enum BraidScreen: StudioScreen {
             state.braid.started = false
             state.braid.events.append("every node and its Thread stopped")
             for name in state.braid.states.keys { state.braid.states[name]?.stage = .stopped }
+            // Stopped to switch dataset (d): start again, on it.
+            if state.braid.restarting {
+                state.braid.restarting = false
+                return [start(&state, switching: true)]
+            }
         case .failure(let name, let message):
             state.braid.events.append(Text("\(name ?? "braid"): \(message)", style: .plain))
             state.status.error = RaoLMFailure(message, code: 69)
@@ -185,8 +190,7 @@ enum BraidScreen: StudioScreen {
                 state.status.message = "the braid is already running"
                 return []
             }
-            state.braid.started = true
-            return [.braid(.start(offline: state.braid.offline, fresh: state.braid.fresh))]
+            return [start(&state)]
         case .char("X"):
             guard state.braid.started else { return [] }
             return [.braid(.stop)]
@@ -204,6 +208,16 @@ enum BraidScreen: StudioScreen {
             }
             state.braid.fresh.toggle()
             state.status.message = state.braid.fresh ? "next start wipes every node's storage and versions" : "next start keeps the nodes' storage"
+        case .char("d"):
+            guard state.braid.running || !state.braid.started, !state.braid.restarting else {
+                state.status.message = "the nodes are still starting"
+                return []
+            }
+            guard !state.braid.generating else {
+                state.status.message = "the umbrella is answering: c cancels it"
+                return []
+            }
+            state.overlay = .braidDataset(datasetPrompt(state))
         case .tab, .backTab:
             guard !nodes.isEmpty else { return [] }
             let delta = key.key == .tab ? 1 : nodes.count - 1
@@ -270,6 +284,38 @@ enum BraidScreen: StudioScreen {
         return []
     }
 
+    // MARK: - The dataset feeds come from (d)
+
+    static func datasetPrompt(_ state: StudioState) -> InputPrompt {
+        InputPrompt(
+            title: "Feed from a dataset", help: [
+                "A path to a braid dataset, or its name in the datasets root (the T9's, or $\(DatasetsRoot.environmentKey)).",
+                "The braid restarts on it with the dataset's own nodes; f and F then feed from it.",
+                "Nodes fed from anything else start over: their storage and versions are wiped.",
+            ], field: TextFieldState(state.braid.source?.path ?? state.braid.world.dataset))
+    }
+
+    /// The dataset is there: the braid stops if it runs, and starts on the dataset.
+    static func restart(on dataset: String, state: inout StudioState) -> [StudioJob] {
+        state.braid.world = BraidWorldChoice(dataset: dataset)
+        guard state.braid.started else { return [start(&state, switching: true)] }
+        state.braid.restarting = true
+        state.status.message = "stopping the braid to restart it on \(dataset)"
+        return [.braid(.stop)]
+    }
+
+    static func start(_ state: inout StudioState, switching: Bool = false) -> StudioJob {
+        state.braid.started = true
+        return .braid(.start(offline: state.braid.offline, fresh: state.braid.fresh, world: state.braid.world, switching: switching))
+    }
+
+    /// What f and F feed from, in a few words.
+    static func sourceLabel(_ state: StudioState) -> String {
+        if let source = state.braid.source { return source.name }
+        let dataset = state.braid.world.dataset
+        return dataset.isEmpty ? "mock world" : (dataset as NSString).lastPathComponent
+    }
+
     static func gateDescription(_ gating: BraidGating) -> String {
         switch gating {
         case .braided: return "token by token: who has been predicting the text, lifted where Threads agree, leaning to a Thread whose documents the text follows"
@@ -305,9 +351,9 @@ enum BraidScreen: StudioScreen {
         if state.braid.editingPrompt { return [KeyHint("⏎", "generate"), KeyHint("esc", "stop editing")] }
         guard state.braid.started else {
             return [KeyHint("S", "start"), KeyHint("o", state.braid.offline ? "mode: offline" : "mode: Threads"),
-                    KeyHint("R", state.braid.fresh ? "fresh: on" : "fresh: off")]
+                    KeyHint("R", state.braid.fresh ? "fresh: on" : "fresh: off"), KeyHint("d", "dataset: \(sourceLabel(state))")]
         }
-        var hints = [KeyHint("f", "feed"), KeyHint("tab", "node"), KeyHint("x", "example"), KeyHint("⏎", "ask"),
+        var hints = [KeyHint("f", "feed"), KeyHint("d", "dataset"), KeyHint("tab", "node"), KeyHint("x", "example"), KeyHint("⏎", "ask"),
                      KeyHint("a", "alone"), KeyHint("←→", "token")]
         if state.braid.generation != nil { hints.append(KeyHint("v", "verify")) }
         hints += [KeyHint("g", "gate"), KeyHint("w", "withdraw"), KeyHint("X", "stop")]
@@ -393,6 +439,9 @@ enum BraidScreen: StudioScreen {
             Text(""),
             Text("Then: f feeds the focused node mock documents (tab switches, F feeds all), x picks a fact from a Thread, ⏎ asks the umbrella,", style: palette.text),
             Text("←→ walks the tokens, the prompt's too: each is coloured by the Thread that supplied it, with every gate and its citation.", style: palette.text),
+            Text(""),
+            Text("d names the dataset f and F feed from (a path, or a name in the datasets root) and starts the braid on it. Now: ", style: palette.text)
+                + Text(state.braid.world.dataset.isEmpty ? "this braid's own, else a generated mock world" : state.braid.world.dataset, style: palette.title),
             Text(""),
             Text("CLI: raolm braid demo [--offline] runs the same thing headless · raolm braid status · raolm braid down", style: palette.muted),
         ]

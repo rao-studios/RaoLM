@@ -4,36 +4,15 @@
 //
 //  WHAT: raolm dataset generate | verify | show — the braid datasets: three Threads' corpora in
 //        three voices, with entities retold across Threads (BraidDataset).
-//  IN:   Datasets live in the datasets root: $RAOLM_DATASETS_DIR, else the T9 work area's
-//        datasets/ (/Volumes/T9/rao/projects/raolm/datasets) when that drive is mounted. With
-//        neither, pass --out or a path.
+//  IN:   Datasets live in the datasets root (`DatasetsRoot`): $RAOLM_DATASETS_DIR, else the T9
+//        work area's datasets/ (/Volumes/T9/rao/projects/raolm/datasets) when that drive is
+//        mounted. With neither, pass --out or a path.
 //
 
 import ArgumentParser
 import Foundation
 import RaoLM
 import RaoLMWorkflows
-
-enum DatasetsRoot {
-    static let workArea = "/Volumes/T9/rao/projects/raolm"
-    static let environmentKey = "RAOLM_DATASETS_DIR"
-
-    static func root() throws -> URL {
-        if let path = ProcessInfo.processInfo.environment[environmentKey], !path.isEmpty {
-            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
-        }
-        guard FileManager.default.fileExists(atPath: workArea) else {
-            throw RaoLMFailure("the T9 work area \(workArea) is not mounted", hint: "plug in the T9, set \(environmentKey), or pass a path", code: 66)
-        }
-        return URL(fileURLWithPath: workArea, isDirectory: true).appendingPathComponent("datasets", isDirectory: true)
-    }
-
-    /// A dataset by name (inside the root) or by path (anything with a slash).
-    static func resolve(_ nameOrPath: String) throws -> URL {
-        if nameOrPath.contains("/") { return URL(fileURLWithPath: (nameOrPath as NSString).expandingTildeInPath, isDirectory: true) }
-        return try root().appendingPathComponent(nameOrPath, isDirectory: true)
-    }
-}
 
 struct DatasetGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(

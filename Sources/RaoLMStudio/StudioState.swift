@@ -53,6 +53,15 @@ public struct Picker: Sendable {
     public var purpose: Purpose
 }
 
+/// One line of text asked for in a dialog: ⏎ takes it, esc leaves things as they were.
+public struct InputPrompt: Sendable {
+    public var title: String
+    public var help: [String]
+    public var field: TextFieldState
+    /// Why the last ⏎ was refused.
+    public var error: String?
+}
+
 public enum Overlay: Sendable {
     case help
     case confirmQuit
@@ -60,6 +69,8 @@ public enum Overlay: Sendable {
     case cancelling(since: Date)
     case picker(Picker)
     case params(FormState)
+    /// The dataset the braid's feeds come from (d on the braid panel).
+    case braidDataset(InputPrompt)
 }
 
 public struct JobStatus: Sendable, Equatable {
@@ -236,6 +247,13 @@ public struct BraidScreenState: Sendable {
     public var offline = false
     public var fresh = false
     public var autoStart = false
+    /// The nodes and dataset a start asks for: what the studio was opened with, until a dataset
+    /// is chosen on the panel (d).
+    public var world = BraidWorldChoice()
+    /// The dataset the running braid feeds its nodes from; nil: a generated mock world.
+    public var source: MockDatasetSource?
+    /// The braid is stopping to start again on the dataset just chosen.
+    public var restarting = false
     public var nodes: [BraidNodeSpec] = []
     public var states: [String: StrandState] = [:]
     public var pids: [String: Int32] = [:]
@@ -330,6 +348,7 @@ public struct StudioState: Sendable {
     /// A text field or form field is taking keystrokes: global keys are off.
     public var editing: Bool {
         if case .params(let form) = overlay { return form.editing }
+        if case .braidDataset = overlay { return true }
         switch screen {
         case .doctor: return doctor.editingFilter
         case .corpus: return corpus.form.editing

@@ -69,8 +69,7 @@ struct BraidGroup: AsyncParsableCommand {
                 try world.apply(to: &braid)
                 options.braidNodes = braid.nodes
                 options.braidSeed = braid.seed
-                options.braidDataset = braid.dataset
-                options.braidAdoptNodes = braid.adoptNodes
+                options.braidWorld = world.choice
                 let code = try await Studio.launch(options)
                 if code != 0 { throw ExitCode(code) }
             }
@@ -119,20 +118,11 @@ struct BraidGroup: AsyncParsableCommand {
         @Option(help: "Seed of the mock world.")
         var seed: UInt64 = 42
 
+        var choice: BraidWorldChoice { BraidWorldChoice(nodes: nodes ?? "", dataset: dataset ?? "") }
+
         func apply(to options: inout BraidOptions) throws {
-            var defaultNodes = BraidNodeSpec.defaults.map(\.name).joined(separator: ",")
-            if let dataset {
-                let directory = try DatasetsRoot.resolve(dataset)
-                guard BraidDataset.exists(at: directory) else {
-                    throw RaoLMFailure("no braid dataset at \(directory.path)", hint: "raolm dataset generate --name \(dataset)", code: 66)
-                }
-                options.dataset = directory
-                defaultNodes = try JSONCoding.read(DatasetManifest.self, from: directory.appendingPathComponent(DatasetManifest.fileName))
-                    .names.joined(separator: ",")
-            }
-            options.nodes = try BraidNodeSpec.parse(nodes ?? defaultNodes)
+            try choice.apply(to: &options)
             options.seed = seed
-            options.adoptNodes = nodes == nil && dataset == nil
         }
     }
 

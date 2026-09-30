@@ -66,6 +66,9 @@ public struct BraidOptions: Sendable {
     public var settings = HypervisorSettings()
     /// Wipe every node's storage, versions and feed before starting.
     public var fresh = false
+    /// Nodes fed from another world start over, as `fresh` would have them, instead of being
+    /// refused: the studio's dataset switch (d).
+    public var freshIfOtherWorld = false
 
     public init(root: DataRoot, executable: URL) {
         self.root = root
@@ -206,8 +209,12 @@ public final class BraidSession: @unchecked Sendable {
     // MARK: - Start and stop
 
     public func start() async throws {
+        var fresh = options.fresh
         do {
             try checkWorld()
+        } catch MockWorldError.different where options.freshIfOtherWorld {
+            fresh = true
+            onEvent(.note("the nodes were fed from another world: they start over, fed from \(worldRecord.summary)"))
         } catch {
             onEvent(.failure(nil, message: "\(error)"))
             throw error
@@ -225,7 +232,7 @@ public final class BraidSession: @unchecked Sendable {
             let node = layout.node(spec.name)
             await ThreadHost.stopRecorded(dataDirectory: node.threadDB)
             Self.stopStale(node)
-            if options.fresh { try? FileManager.default.removeItem(at: node.directory) }
+            if fresh { try? FileManager.default.removeItem(at: node.directory) }
             try FileManager.default.createDirectory(at: node.directory, withIntermediateDirectories: true)
             var ports: (Int, Int)?
             if !options.offline {

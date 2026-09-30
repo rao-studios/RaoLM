@@ -352,6 +352,116 @@ struct StudioStateTests {
         return state
     }
 
+    func snapshot(_ state: StudioState) -> String {
+        var frame = Frame(canvas: Canvas(size: state.size), palette: Palette(for: Capabilities(isTTY: true, colorDepth: .ansi256), environment: [:]),
+                          glyphs: .unicode)
+        StudioApp.render(state, &frame)
+        return frame.canvas.snapshot
+    }
+
+    func type(_ text: String, _ state: inout StudioState) {
+        for character in text { _ = StudioApp.handle(.key(KeyEvent(.char(character))), state: &state) }
+    }
+
+    @Test("9 Braid: d names the dataset feeds come from, and the braid restarts on it")
+    func braidDataset() throws {
+        var s = state()
+        s.screen = .braid
+        #expect(snapshot(s).contains("d names the dataset f and F feed from"))
+        #expect(BraidScreen.hints(s).contains(KeyHint("d", "dataset: mock world")))
+
+        // d opens the dialog. ⏎ on nothing is refused there; digits and q are text, not screens or quit.
+        _ = StudioApp.handle(.key(KeyEvent(.char("d"))), state: &s)
+        guard case .braidDataset(let opened) = s.overlay else {
+            Issue.record("d opens the dataset dialog")
+            return
+        }
+        #expect(opened.field.text.isEmpty)
+        #expect(StudioApp.handle(.key(KeyEvent(.enter)), state: &s).isEmpty)
+        guard case .braidDataset(let refused) = s.overlay else {
+            Issue.record("an empty name keeps the dialog open")
+            return
+        }
+        #expect(refused.error != nil)
+        let path = "/Volumes/T9/q9/braid-cross-v1"
+        type(path, &s)
+        let dialog = snapshot(s)
+        #expect(dialog.contains("Feed from a dataset") && dialog.contains(path) && dialog.contains("wiped"))
+
+        // ⏎ only looks for the dataset: nothing changes until it is found.
+        let look = StudioApp.handle(.key(KeyEvent(.enter)), state: &s)
+        guard look.count == 1, case .braid(.dataset(let asked)) = look[0] else {
+            Issue.record("⏎ looks for the dataset")
+            return
+        }
+        #expect(asked == path && s.overlay == nil && s.screen == .braid && s.quitCode == nil)
+        _ = StudioApp.reduce(.jobFailed(.braid, RaoLMFailure("no braid dataset at \(path)", code: 66)), state: &s)
+        #expect(s.status.error != nil && !s.braid.started && s.braid.world.isEmpty)
+
+        // Found, with the braid stopped: it starts on the dataset, and nodes fed from another world start over.
+        let first = StudioApp.reduce(.braidDataset(path), state: &s)
+        guard first.count == 1, case .braid(.start(let offline, let fresh, let world, let switching)) = first[0] else {
+            Issue.record("a found dataset starts the braid")
+            return
+        }
+        #expect(!offline && !fresh && switching && world == BraidWorldChoice(dataset: path) && s.braid.started)
+        _ = StudioApp.reduce(.braidSource(MockDatasetSource(path: path, name: "braid-cross-v1", hash: "f4bd9ea99d56")), state: &s)
+        _ = StudioApp.reduce(.braid(.starting(BraidNodeSpec.defaults, offline: false)), state: &s)
+
+        // While the nodes start, d waits.
+        _ = StudioApp.handle(.key(KeyEvent(.char("d"))), state: &s)
+        #expect(s.overlay == nil && s.status.message == "the nodes are still starting")
+        _ = StudioApp.reduce(.braid(.started), state: &s)
+        #expect(BraidScreen.hints(s).contains(KeyHint("d", "dataset")))
+
+        // Running: the dialog shows where feeds come from; another dataset stops the braid, then starts it again.
+        _ = StudioApp.handle(.key(KeyEvent(.char("d"))), state: &s)
+        guard case .braidDataset(let running) = s.overlay else {
+            Issue.record("d opens the dialog while the braid runs")
+            return
+        }
+        #expect(running.field.text == path)
+        _ = StudioApp.handle(.key(KeyEvent(.escape)), state: &s)
+        #expect(s.overlay == nil && s.braid.world.dataset == path)
+        let stop = StudioApp.reduce(.braidDataset("/sets/other"), state: &s)
+        guard stop.count == 1, case .braid(.stop) = stop[0] else {
+            Issue.record("a running braid stops first")
+            return
+        }
+        #expect(s.braid.restarting)
+        let again = StudioApp.reduce(.braid(.stopped), state: &s)
+        guard again.count == 1, case .braid(.start(_, _, let next, let switchingAgain)) = again[0] else {
+            Issue.record("and starts again once stopped")
+            return
+        }
+        #expect(next.dataset == "/sets/other" && switchingAgain && s.braid.started && !s.braid.restarting)
+
+        // An ordinary stop stays stopped; S then starts the chosen dataset, refusing another world as before.
+        s.braid.running = true
+        #expect(StudioApp.reduce(.braid(.stopped), state: &s).isEmpty && !s.braid.started)
+        #expect(BraidScreen.hints(s).contains(KeyHint("d", "dataset: braid-cross-v1")))
+        let plain = StudioApp.handle(.key(KeyEvent(.char("S"))), state: &s)
+        guard plain.count == 1, case .braid(.start(_, _, let kept, let switchingPlain)) = plain[0] else {
+            Issue.record("S starts the braid")
+            return
+        }
+        #expect(kept.dataset == "/sets/other" && !switchingPlain)
+    }
+
+    @Test("a braid start refused before any node came up lets S start again, and says why")
+    func braidStartFailedEarly() {
+        var s = state()
+        s.braid.started = true
+        _ = StudioApp.reduce(.jobFailed(.braidUmbrella, RaoLMFailure("no braid dataset at /nowhere/ds", code: 66)), state: &s)
+        #expect(!s.braid.started && s.braid.startFailure == "no braid dataset at /nowhere/ds")
+        // A generation that fails while the braid runs leaves it running.
+        s.braid.started = true
+        s.braid.running = true
+        s.braid.startFailure = nil
+        _ = StudioApp.reduce(.jobFailed(.braidUmbrella, RaoLMFailure("the MLX worker is busy", code: 75)), state: &s)
+        #expect(s.braid.started && s.braid.startFailure == nil)
+    }
+
     @Test("a failed job shows its error until the next key")
     func errors() {
         var s = state()

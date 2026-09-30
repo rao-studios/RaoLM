@@ -74,6 +74,44 @@ struct WorkflowsTests {
         }
     }
 
+    @Test("a braid's nodes and dataset resolve the same from --nodes/--dataset and from the studio's panel")
+    func braidWorld() throws {
+        func options() -> BraidOptions {
+            BraidOptions(root: DataRoot(url: URL(fileURLWithPath: "/tmp/raolm-world-test")), executable: URL(fileURLWithPath: "/usr/bin/true"))
+        }
+        // Nothing named: the defaults, and a braid that already has nodes keeps them.
+        var o = options()
+        try BraidWorldChoice().apply(to: &o)
+        #expect(o.adoptNodes && o.dataset == nil && o.nodes == BraidNodeSpec.defaults)
+        // Nodes named: exactly those.
+        try BraidWorldChoice(nodes: " ambient, craft ,veil,fourth ").apply(to: &o)
+        #expect(!o.adoptNodes && o.dataset == nil && o.nodes.map(\.name) == ["ambient", "craft", "veil", "fourth"])
+        #expect(throws: BraidSessionError.self) { try BraidWorldChoice(nodes: "ambient,Not A Node").apply(to: &o) }
+
+        // A dataset by path brings its own nodes; named nodes narrow it.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("raolm-world-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dataset = try BraidDataset.generate(DatasetSpec(name: "unit", seed: 5, perType: 6, paraphrase: 3, excerpt: 2, summary: 2, variant: 1, homonym: 1))
+        try BraidDataset.write(dataset, to: directory)
+        o = options()
+        try BraidWorldChoice(dataset: directory.path).apply(to: &o)
+        #expect(!o.adoptNodes && o.dataset?.path == directory.path && o.nodes.map(\.name) == dataset.names)
+        try BraidWorldChoice(nodes: "ambient,veil", dataset: directory.path).apply(to: &o)
+        #expect(o.dataset?.path == directory.path && o.nodes.map(\.name) == ["ambient", "veil"])
+
+        // No dataset there: refused as missing input. None named: nothing to find.
+        do {
+            try BraidWorldChoice(dataset: directory.path + "-missing").apply(to: &o)
+            Issue.record("a path with no dataset is refused")
+        } catch let failure as RaoLMFailure {
+            #expect(failure.code == 66 && failure.message.contains("no braid dataset at"))
+        }
+        #expect(try BraidWorldChoice().datasetDirectory() == nil)
+        #expect(try BraidWorldChoice(dataset: directory.path).datasetDirectory()?.path == directory.path)
+        // Anything with a slash is a path; ~ expands.
+        #expect(try DatasetsRoot.resolve("~/sets/one").path == NSHomeDirectory() + "/sets/one")
+    }
+
     @Test("tables render with Format.table's gutters, as the CLI prints them")
     func tables() {
         let record = EpochRecord(epoch: 2, steps: 10, trainLoss: 1.5, trainEntropy: 1.25, evalLoss: nil, evalEntropy: nil,

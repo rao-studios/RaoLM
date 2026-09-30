@@ -70,6 +70,7 @@ public enum Studio {
         state.braid.fresh = options.braidFresh
         state.braid.started = options.braidAutoStart
         state.braid.nodes = options.braidNodes
+        state.braid.world = options.braidWorld
         let box = BackendBox()
         let app = App<StudioState, StudioEvent>(
             display: terminal, initial: state,

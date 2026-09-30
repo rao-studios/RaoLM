@@ -39,7 +39,7 @@ public enum StudioApp {
     /// What the studio asks for as soon as it opens.
     public static func initialJobs(_ state: StudioState) -> [StudioJob] {
         var jobs: [StudioJob] = [.scanRuns, .doctor, .threadStatus(withLog: false), .scanCorpora, .scanSnapshots]
-        if state.braid.autoStart { jobs.append(.braid(.start(offline: state.braid.offline, fresh: state.braid.fresh))) }
+        if state.braid.autoStart { jobs.append(.braid(.start(offline: state.braid.offline, fresh: state.braid.fresh, world: state.braid.world))) }
         return jobs
     }
 
@@ -238,6 +238,25 @@ public enum StudioApp {
             }
             state.overlay = .params(form)
             return []
+        case .braidDataset(var prompt):
+            switch key.key {
+            case .escape:
+                state.overlay = nil
+            case .enter:
+                let dataset = prompt.field.text.trimmingCharacters(in: .whitespaces)
+                guard !dataset.isEmpty else {
+                    prompt.error = "name a dataset, or give a path to one"
+                    state.overlay = .braidDataset(prompt)
+                    return []
+                }
+                state.overlay = nil
+                state.status.error = nil
+                return [.braid(.dataset(dataset))]
+            default:
+                if prompt.field.handle(key) { prompt.error = nil }
+                state.overlay = .braidDataset(prompt)
+            }
+            return []
         }
     }
 
@@ -287,6 +306,11 @@ public enum StudioApp {
             }
             state.doctor.log.append(Text("\(kind.rawValue): \(failure.message)", style: .plain))
             if kind == .threadStatus { state.status.lastThreadPoll = state.now }
+            // A start refused before any node came up (its dataset's drive unplugged, say): S works again.
+            if kind == .braidUmbrella, state.braid.started, !state.braid.running {
+                state.braid.started = false
+                state.braid.startFailure = failure.message
+            }
         case .log(let message):
             state.status.message = message
         case .runsLoaded(let runs, let warnings):
@@ -412,6 +436,12 @@ public enum StudioApp {
         case .braidAlone(let prompt, let answers):
             guard state.braid.generation?.prompt.tokens == prompt else { break }
             state.braid.alone = answers
+        case .braidDataset(let dataset):
+            return BraidScreen.restart(on: dataset, state: &state)
+        case .braidSource(let source):
+            state.braid.source = source
+            state.braid.events.append(Text("feeds come from " + (source.map { "the dataset \($0.name) (\(abbreviate($0.path)))" } ?? "a generated mock world"),
+                                           style: .plain))
         }
         return []
     }
@@ -596,6 +626,19 @@ public enum StudioApp {
             let inner = Box(title: Text("Generation parameters", style: palette.title), footer: Text("esc close", style: palette.dim),
                             style: palette.focusBorder, glyphs: glyphs).render(in: rect, on: &frame.canvas)
             form.render(in: inner.inset(top: 1), focused: true, frame: &frame)
+        case .braidDataset(let prompt):
+            let notes = prompt.help.map { Text($0, style: palette.dim) } + (prompt.error.map { [Text("\(glyphs.cross) \($0)", style: palette.red)] } ?? [])
+            let rect = frame.bounds.centered(width: min(frame.size.width - 4, 100), height: notes.count + 5)
+            frame.canvas.fill(rect, style: palette.base)
+            let inner = Box(title: Text(prompt.title, style: palette.title), footer: Text("⏎ restart on it  esc cancel", style: palette.dim),
+                            style: palette.focusBorder, glyphs: glyphs).render(in: rect, on: &frame.canvas)
+            let field = Rect(x: inner.minX + 2, y: inner.minY + 1, width: max(0, inner.width - 4), height: 1)
+            frame.cursor = nil
+            TextField(state: prompt.field, focused: true, style: palette.title, placeholderStyle: palette.muted,
+                      cursorStyle: palette.cursor).render(in: field, on: &frame.canvas)
+            for (row, note) in notes.enumerated() {
+                frame.canvas.put(note.truncated(to: field.width), x: field.minX, y: inner.minY + 3 + row, clip: inner)
+            }
         }
     }
 
@@ -620,7 +663,8 @@ public enum StudioApp {
             ("forms", [("⏎", "edit a field, again to commit"), ("space ←→", "toggle, choose"), ("⏎ on ▸", "run the action")]),
             ("generate", [("/", "prompt"), ("x", "next fact prompt"), ("m", "text or corpus slice"), ("P", "parameters"), ("⏎", "generate"),
                           ("v V", "verify offline / live"), ("G A", "ground on source / all cited"), ("s o", "save / open")]),
-            ("braid", [("S X", "start / stop the nodes"), ("o", "offline or Threads"), ("f F", "feed the node / all"), ("tab", "next node"),
+            ("braid", [("S X", "start / stop the nodes"), ("o", "offline or Threads"), ("d", "the dataset feeds come from"),
+                       ("f F", "feed the node / all"), ("tab", "next node"),
                        ("w", "withdraw newest"), ("x", "next example"), ("⏎", "ask the umbrella"), ("a", "and each Thread alone"),
                        ("←→", "walk the prompt and answer"), ("g", "gate"), ("t", "likeliest or sampled"), ("v", "verify"), ("- +", "λ")]),
             ("jobs", [("c", "cancel the running job"), ("r", "refresh"), ("Q", "quit now")]),

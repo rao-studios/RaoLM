@@ -198,7 +198,7 @@ public final class FixtureBackend: StudioBackend, @unchecked Sendable {
                 if case .verified(let lines, _) = entry.event { return lines } else { return nil }
             }.first ?? []
             post(.braidVerified(generation, lines + ["(fixture mode replays the recorded verification)"]))
-        case .feed, .withdraw, .cancel:
+        case .feed, .withdraw, .cancel, .dataset:
             post(.log("fixture mode replays a recorded braid; it does not feed nodes"))
         case .stop:
             post(.braid(.stopped))
