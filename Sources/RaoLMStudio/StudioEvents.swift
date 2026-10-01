@@ -66,10 +66,12 @@ public struct BraidGenerateSpec: Sendable, Equatable {
     public var temperature: Float
     /// Also ask each Thread alone (a braid of one), to show its own answer beside the braid's.
     public var alone: Bool
+    /// The text is a question: the umbrella rewrites it into a stem first, and the answer stops at its sentence's end.
+    public var question: Bool
 
     public init(
         promptTokens: [Int]?, promptText: String, source: SourceAddress?, lambda: Float, maxTokens: Int,
-        gating: BraidGating = BraidRequest.defaultGating, temperature: Float = 0, alone: Bool = false
+        gating: BraidGating = BraidRequest.defaultGating, temperature: Float = 0, alone: Bool = false, question: Bool = false
     ) {
         self.promptTokens = promptTokens
         self.promptText = promptText
@@ -79,6 +81,7 @@ public struct BraidGenerateSpec: Sendable, Equatable {
         self.gating = gating
         self.temperature = temperature
         self.alone = alone
+        self.question = question
     }
 }
 

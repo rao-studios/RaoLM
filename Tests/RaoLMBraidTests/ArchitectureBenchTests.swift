@@ -183,3 +183,46 @@ struct ThoughtBenchTests {
     }
 }
 
+
+@Suite("Question bench rules")
+struct QuestionBenchTests {
+    static func arm(_ name: String, rewrite: Int = 100, exact: Int = 90, cited: Int = 85, leads: Int = 17, threadCredit: Float = 0.2,
+                    decided: Int = 20, followed: Int = 19, other: Float = 0.02, ties: Int = 0) -> QuestionArmResult {
+        let rewrites = name == "commons" || name == "rules"
+        return QuestionArmResult(
+            arm: name, questions: 100, rewriteExact: rewrite, rewriteF1: rewrites ? Float(rewrite) / 100 : nil, exact: exact, citedAnswer: cited,
+            citationAt1: 0.9, unknown: 20, unknownCommonsLeads: leads, unknownThreadCredit: threadCredit, shared: 24, sharedDecided: decided,
+            sharedFollowed: followed, sharedDuplicateCredit: other, sharedTies: ties, adapterMs: rewrites ? 40 : nil, seconds: 1)
+    }
+
+    static func arms(commons: QuestionArmResult = arm("commons", rewrite: 70), rules: QuestionArmResult = arm("rules"),
+                     stem: QuestionArmResult = arm("stem")) -> [QuestionArmResult] {
+        [commons, rules, stem, arm("slice", exact: 96), arm("paraphrase", exact: 20)]
+    }
+
+    @Test("every rule holding, the commons wins; a commons under half fidelity or far below the stem hands the win to the rules")
+    func winner() {
+        let good = QuestionBench.evaluate(arms: Self.arms())
+        #expect(good.qualifies && good.winner == "commons", "\(good.rules.filter { !$0.passed })")
+        #expect(good.rules.map(\.rule) == ["Q1 rewrite fidelity", "Q2 exact", "Q2′ context", "Q3 cited", "Q4 unknown", "Q5a retold"])
+        let weak = QuestionBench.evaluate(arms: Self.arms(commons: Self.arm("commons", rewrite: 40)))
+        #expect(weak.winner == "rules" && !weak.qualifies && weak.rules[0].passed == false)
+        let behind = QuestionBench.evaluate(arms: Self.arms(commons: Self.arm("commons", rewrite: 70, exact: 80)))
+        #expect(behind.winner == "rules" && behind.qualifies)
+    }
+
+    @Test("Q2 to Q5 each fail on their own measure, read on the winner")
+    func failures() {
+        func failed(_ arms: [QuestionArmResult]) -> [String] { QuestionBench.evaluate(arms: arms).rules.filter { !$0.passed }.map(\.rule) }
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 40), rules: Self.arm("rules", exact: 80))) == ["Q1 rewrite fidelity", "Q2 exact", "Q2′ context"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, cited: 80))) == ["Q3 cited"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, exact: 85), stem: Self.arm("stem", exact: 85))) == ["Q2′ context"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, leads: 15))) == ["Q4 unknown"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, threadCredit: 0.3))) == ["Q4 unknown"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, followed: 17))) == ["Q5a retold"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, other: 0.11))) == ["Q5a retold"])
+        #expect(failed(Self.arms(commons: Self.arm("commons", rewrite: 70, decided: 10))) == ["Q5a retold"])
+        #expect(QuestionBench.tokenF1("The mayor of Tillyburn is", "the mayor of Tillyburn is.") == 1)
+        #expect(abs(QuestionBench.tokenF1("Tillyburn was founded in", "The town of Tillyburn was founded in") - 8.0 / 11) < 1e-6)
+    }
+}

@@ -90,6 +90,9 @@ public enum FactValidator {
                 for paraphrase in fact.paraphrases where texts[i].contains(paraphrase) {
                     problems.append("\(fact.id): paraphrase occurs in the corpus")
                 }
+                for question in fact.questions ?? [] where texts[i].contains(question.text) {
+                    problems.append("\(fact.id): question occurs in the corpus")
+                }
             }
         }
         return problems

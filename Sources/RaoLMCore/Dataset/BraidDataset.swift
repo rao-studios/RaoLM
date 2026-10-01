@@ -23,7 +23,7 @@ import Foundation
 
 public enum BraidDataset {
     public static let generatorName = "BraidDataset"
-    public static let generatorVersion = 1
+    public static let generatorVersion = 2
     static let maxChars = 600
     static let minChars = 120
     static let minParagraph = 220
@@ -247,12 +247,13 @@ public enum BraidDataset {
 
 private enum Piece {
     case sentence(String)
-    case fact(kind: FactKind, prompt: String, value: String, suffix: String, paraphrases: [String], negative: String)
+    case fact(kind: FactKind, prompt: String, value: String, suffix: String, paraphrases: [String], negative: String,
+              questions: [FactQuestion], negativeQuestions: [FactQuestion])
 
     var text: String {
         switch self {
         case .sentence(let text): return text
-        case .fact(_, let prompt, let value, let suffix, _, _): return prompt + " " + value + suffix
+        case .fact(_, let prompt, let value, let suffix, _, _, _, _): return prompt + " " + value + suffix
         }
     }
 }
@@ -474,8 +475,15 @@ private struct Builder {
         let phrasing = rng.pick(DatasetVoices.phrasings[kind]![voice]!)
         let piece = Piece.fact(
             kind: kind, prompt: entity.refs.fill(phrasing.prefix), value: entity.answers[kind]!, suffix: phrasing.suffix,
-            paraphrases: DatasetVoices.paraphrases[kind]!.map { entity.refs.fill($0) }, negative: entity.negative.fill(phrasing.prefix))
+            paraphrases: DatasetVoices.paraphrases[kind]!.map { entity.refs.fill($0) }, negative: entity.negative.fill(phrasing.prefix),
+            questions: Self.questions(kind, entity.refs), negativeQuestions: Self.questions(kind, entity.negative))
         return (piece, phrasing)
+    }
+
+    /// Every question template of the kind about the subject, with the stem it rewrites to.
+    static func questions(_ kind: FactKind, _ refs: SubjectRefs) -> [FactQuestion] {
+        let stem = refs.fill(DatasetVoices.stems[kind]!)
+        return DatasetVoices.questions[kind]!.map { FactQuestion(text: refs.fill($0), stem: stem) }
     }
 
     mutating func opening(voice: DatasetVoice, kind: DocumentKind, entity: Entity) throws -> [Piece] {
@@ -548,7 +556,8 @@ private struct Builder {
             return text
         }
         return .fact(kind: kind, prompt: lead + hedged(entity.refs), value: entity.answers[kind]!, suffix: phrasing.suffix + "\"",
-                     paraphrases: DatasetVoices.paraphrases[kind]!.map { entity.refs.fill($0) }, negative: lead + hedged(entity.negative))
+                     paraphrases: DatasetVoices.paraphrases[kind]!.map { entity.refs.fill($0) }, negative: lead + hedged(entity.negative),
+                     questions: Self.questions(kind, entity.refs), negativeQuestions: Self.questions(kind, entity.negative))
     }
 
     // MARK: Assembly
@@ -581,7 +590,7 @@ private struct Builder {
         var fillers = rng.shuffled(draft.fillers)
         var texts: [String] = []
         var placedFacts: [[(kind: FactKind, prompt: String, answer: String, sentence: String, start: Int, context: Int,
-                             paraphrases: [String], negative: String)]] = []
+                             paraphrases: [String], negative: String, questions: [FactQuestion], negativeQuestions: [FactQuestion])]] = []
         for pieces in draft.paragraphs {
             var sentences = pieces
             var length = sentences.reduce(-1) { $0 + $1.text.utf8.count + 1 }
@@ -599,10 +608,12 @@ private struct Builder {
                 text += sentence.text
             }
             var facts: [(kind: FactKind, prompt: String, answer: String, sentence: String, start: Int, context: Int,
-                         paraphrases: [String], negative: String)] = []
+                         paraphrases: [String], negative: String, questions: [FactQuestion], negativeQuestions: [FactQuestion])] = []
             for (i, sentence) in sentences.enumerated() {
-                guard case .fact(let kind, let prompt, let value, _, let paraphrases, let negative) = sentence else { continue }
-                facts.append((kind, prompt, " " + value, sentence.text, starts[i], i > 0 ? starts[i - 1] : starts[i], paraphrases, negative))
+                guard case .fact(let kind, let prompt, let value, _, let paraphrases, let negative, let questions, let negativeQuestions) = sentence
+                else { continue }
+                facts.append((kind, prompt, " " + value, sentence.text, starts[i], i > 0 ? starts[i - 1] : starts[i], paraphrases, negative,
+                              questions, negativeQuestions))
             }
             texts.append(text)
             placedFacts.append(facts)
@@ -621,6 +632,9 @@ private struct Builder {
             for paraphrase in fact.paraphrases where documentText.contains(paraphrase) {
                 problems.append("\(draft.name): paraphrase '\(paraphrase)' occurs")
             }
+            for question in fact.questions where documentText.contains(question.text) {
+                problems.append("\(draft.name): question '\(question.text)' occurs")
+            }
         }
         guard problems.isEmpty else { return .failure(Failure(problems: problems)) }
         let canonical = ContentHash.canonical(documentText)
@@ -637,7 +651,7 @@ private struct Builder {
                     id: "\(id)#\(fact.kind.rawValue)", kind: fact.kind, documentID: id, partitionIndex: partition, subject: draft.subject,
                     prompt: fact.prompt, answer: fact.answer, sentence: fact.sentence, sentenceStart: fact.start, contextStart: fact.context,
                     answerStart: answerStart, answerEnd: answerStart + fact.answer.utf8.count, paraphrases: fact.paraphrases,
-                    negativePrompt: fact.negative))
+                    negativePrompt: fact.negative, questions: fact.questions, negativeQuestions: fact.negativeQuestions))
             }
         }
         return .success(CorpusDocument(id: id, name: draft.name, kind: draft.kind, subject: draft.subject, partitions: partitions,

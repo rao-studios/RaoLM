@@ -28,7 +28,7 @@ struct BraidGroup: AsyncParsableCommand {
             asks the open ones for their last hidden state, applies the one shared final norm and tied head, and mixes the \
             Threads' own kNN-LMs. Every token records what each Thread supplied.
             """,
-        subcommands: [Panel.self, Demo.self, Status.self, Down.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self],
+        subcommands: [Panel.self, Demo.self, Ask.self, Status.self, Down.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self, BenchQuestion.self],
         defaultSubcommand: Panel.self
     )
 
@@ -334,6 +334,69 @@ struct BraidGroup: AsyncParsableCommand {
             }
             recorder?.record(.generated(generation))
             return generation
+        }
+    }
+
+    struct Ask: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Ask the braid a question: the commons rewrites it into a stem the Threads complete, and every token says who answered.",
+            discussion: """
+                Runs the braid's live nodes in this process (no node processes). The umbrella's question adapter turns the question into \
+                a corpus-style stem with the commons model, prompted with public examples; --rewriter rules uses the dataset's own \
+                question templates instead, and none asks the question as written. The answer stops at the end of its sentence.
+                """)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Argument(help: "The question.")
+        var question: String
+
+        @Option(help: "commons (default), rules or none.")
+        var rewriter: String = "commons"
+
+        @Option(help: "Most tokens of answer.")
+        var maxTokens: Int = 24
+
+        @Flag(inversion: .prefixedNo, help: "Each Thread completes the stem behind the sentence its own index recognises it in.")
+        var context = true
+
+        @Option(help: "Save the generation record to this JSON file.")
+        var out: String?
+
+        func run() async throws {
+            try await guarded {
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let layout = BraidLayout(dataRoot: global.root)
+                let (pack, strands) = try RoutingBench.packStrands(layout: layout, tokenizer: tokenizer, owner: "raolm-braid")
+                guard !strands.isEmpty else { throw BraidSessionError.noLiveNodes }
+                let (umbrella, links, generator) = try RoutingBench.umbrella(pack: pack, strands: strands, tokenizer: tokenizer)
+                let rewrite: QuestionRewrite
+                switch rewriter {
+                case "commons":
+                    guard let commons = umbrella.commons else {
+                        throw RaoLMFailure("the braid's pack has no commons model to rewrite with", hint: "use --rewriter rules", code: 64)
+                    }
+                    rewrite = QuestionAdapter(model: commons.model, tokenizer: tokenizer).rewrite(question, maxTokens: maxTokens)
+                case "rules":
+                    rewrite = QuestionAdapter.fallback(question)
+                case "none":
+                    rewrite = QuestionRewrite(question: question, stem: question, rewriter: "none")
+                default:
+                    throw ValidationError("unknown rewriter \(rewriter): commons, rules or none")
+                }
+                var params = GenerationParameters(tapLayer: links[0].descriptor.tapLayer, alpha: links[0].descriptor.alpha)
+                params.maxTokens = maxTokens
+                let stemTokens = QuestionAdapter.stemTokens(rewrite.stem, tokenizer: tokenizer)
+                let generation = try generator.generate(BraidRequest(
+                    promptTokens: stemTokens, promptText: rewrite.stem, params: params, stopAtSentenceEnd: true, question: rewrite,
+                    context: context, subject: QuestionAdapter.subjectTokens(stem: rewrite.stem, tokens: stemTokens, question: question, tokenizer: tokenizer)))
+                print(BraidTables.answer(generation, names: generator.names))
+                if let out {
+                    try JSONCoding.write(generation, to: URL(fileURLWithPath: (out as NSString).expandingTildeInPath))
+                    print("record: \(out)")
+                }
+            }
         }
     }
 
@@ -789,6 +852,93 @@ extension BraidTables {
     }
 }
 
+extension BraidGroup {
+    struct BenchQuestion: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-question",
+            abstract: "Whether the braid answers questions: the commons' rewrite against the rules', the stem, and the v1 prompts.",
+            discussion: """
+                The braid is --data-dir; --dataset names a dataset with questions (braid-cross-v2 or later), whose facts are matched \
+                to the braid's by node, kind, subject and answer. Rules Q1 to Q5 were fixed before any numbers (Docs/ARCHITECTURE.md).
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "A dataset with questions: a name in the datasets root, or a path.")
+        var dataset: String?
+
+        @Option(help: "Only these arms, comma-separated (commons, rules, stem, slice, paraphrase).")
+        var arms: String?
+
+        @Flag(inversion: .prefixedNo, help: "Each Thread completes behind its own context.")
+        var context = true
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(help: "Print a saved report, scored again under the rules, instead of running.")
+        var report: String?
+
+        func run() async throws {
+            try await guarded {
+                if let report {
+                    var loaded = try JSONCoding.read(QuestionReport.self, from: URL(fileURLWithPath: (report as NSString).expandingTildeInPath))
+                    loaded.evaluation = QuestionBench.evaluate(arms: loaded.arms)
+                    print(BraidTables.question(loaded))
+                    return
+                }
+                guard let dataset else { throw RaoLMFailure("bench-question needs --dataset, a dataset with questions", code: 64) }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                var sizes = QuestionBench.Sizes()
+                sizes.context = context
+                sizes.arms = arms.map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
+                let result = try QuestionBench.run(
+                    layout: BraidLayout(dataRoot: global.root), dataset: try DatasetsRoot.resolve(dataset), tokenizer: tokenizer, sizes: sizes
+                ) { line in Console.error(line) }
+                print(BraidTables.question(result))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
+extension BraidTables {
+    static func question(_ report: QuestionReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        func num(_ value: Float?) -> String { value.map { String(format: "%.3f", $0) } ?? "—" }
+        var lines: [String] = ["questions from \(report.dataset) on \(report.braid) · \(report.unmatched) facts of the braid unmatched", ""]
+        lines.append(Format.table(
+            ["arm", "questions", "stem reached", "F1", "exact", "cited answer", "cit@1", "unknown: commons leads", "Threads' credit",
+             "shared: decided", "followed", "other's credit", "ties", "adapter ms"],
+            report.arms.map { arm in
+                [arm.arm, "\(arm.questions)", arm.rewriteF1 == nil ? "—" : pct(arm.rewriteRate), num(arm.rewriteF1), "\(arm.exact) (\(pct(arm.exactRate)))",
+                 arm.exact > 0 ? pct(arm.citedRate) : "—", pct(arm.citationAt1), arm.unknown > 0 ? "\(arm.unknownCommonsLeads)/\(arm.unknown)" : "—",
+                 num(arm.unknownThreadCredit), arm.shared > 0 ? "\(arm.sharedDecided)/\(arm.shared)" : "—",
+                 arm.sharedDecided > 0 ? pct(arm.sharedFollowedRate) : "—", num(arm.sharedDuplicateCredit), arm.shared > 0 ? "\(arm.sharedTies)" : "—",
+                 arm.adapterMs.map { String(format: "%.0f", $0) } ?? "—"]
+            }))
+        lines.append("")
+        for arm in report.arms where arm.ownerContext > 0 || arm.noContextExact > 0 {
+            let without = arm.questions - arm.ownerContext
+            lines.append(String(format: "%@: the owner found a context for %d of %d; exact %d of those (%.0f%%), %d of the %d without (%.0f%%)", arm.arm,
+                                arm.ownerContext, arm.questions, arm.ownerContextExact, arm.ownerContext > 0 ? 100 * Double(arm.ownerContextExact) / Double(arm.ownerContext) : 0,
+                                arm.noContextExact, without, without > 0 ? 100 * Double(arm.noContextExact) / Double(without) : 0))
+        }
+        lines.append("")
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append("")
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
+}
+
 extension BraidTables {
     static func architecture(_ report: ArchitectureReport) -> String {
         func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
@@ -1060,6 +1210,45 @@ enum BraidTables {
             Format.clip(example.label, 34), example.expected.map { Format.clip($0.trimmingCharacters(in: .whitespaces), 16) } ?? "—",
             Format.clip(generation.text.trimmingCharacters(in: .whitespaces), 22),
         ] + shares + [gate, citation, spans.isEmpty ? "—" : "\(spans.filter { $0.status == .verified }.count)/\(spans.count) ✓"]
+    }
+
+    /// A question's answer: how it was rewritten, what the braid said, who earned it, and where it is cited.
+    static func answer(_ generation: CitedGeneration, names: [String]) -> String {
+        var lines: [String] = []
+        if let question = generation.prompt.question {
+            lines.append("question  \(question.question)")
+            lines.append(String(format: "stem      %@   (%@, %.0f ms)", question.stem, question.rewriter, question.seconds * 1000))
+        } else {
+            lines.append("prompt    \(generation.prompt.text)")
+        }
+        for strand in generation.braid?.strands ?? [] {
+            if let context = strand.context { lines.append(String(format: "context   %@: “%@” (%.2f)", strand.name, context.text.trimmingCharacters(in: .whitespaces), context.score)) }
+        }
+        lines.append("answer    \(generation.text.trimmingCharacters(in: .whitespaces))")
+        let generated = generation.traces.filter { !$0.isPrompt }
+        // Credit over the answer's tokens, weighted by bits, as the blend weighs it.
+        var credit: [String: Double] = [:]
+        var bits = 0.0
+        for trace in generated {
+            guard let b = trace.bits, let strands = trace.strands else { continue }
+            bits += Double(b)
+            for strand in strands { credit[strand.strand, default: 0] += Double(b) * Double(strand.credit ?? 0) }
+        }
+        if bits > 0 {
+            let order = names.filter { credit[$0] != nil } + credit.keys.filter { !names.contains($0) }.sorted()
+            lines.append("credit    " + order.map { String(format: "%@ %.0f%%", $0, 100 * credit[$0]! / bits) }.joined(separator: " · "))
+        }
+        if let followed = generated.compactMap(\.followed).first { lines.append("followed  \(followed)'s document") }
+        var cited: [String] = []
+        for trace in generated {
+            guard let citation = trace.citations.first else { continue }
+            let strand = generation.braid?.strand(row: citation.row)?.label ?? "?"
+            let document = generation.partition(row: citation.row)?.documentName ?? "?"
+            let line = "\(strand) · \(document) · partition \(citation.address.partitionIndex)"
+            if !cited.contains(line) { cited.append(line) }
+        }
+        lines.append(cited.isEmpty ? "cited     nothing" : "cited     " + cited.joined(separator: "\n          "))
+        return lines.joined(separator: "\n")
     }
 
     static func gateBench(_ report: GateBenchReport) -> String {

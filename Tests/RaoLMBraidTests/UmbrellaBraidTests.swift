@@ -178,3 +178,72 @@ extension BraidMLXSuites {
         }
     }
 }
+
+extension BraidMLXSuites {
+    @Suite("The question adapter", .serialized)
+    struct QuestionAdapterTests {
+        @Test("a random commons rewrites nothing useful, so the rules take over; the question keeps its subject; a known template rewrites exactly")
+        func fallback() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 2, seed: 3)
+            defer { rig.cleanUp() }
+            let pack = try rig.pack()
+            let adapter = QuestionAdapter(model: try pack.baseModel(), tokenizer: rig.tokenizer)
+            let rewrite = adapter.rewrite("When was Tillyburn founded?")
+            // A random model writes noise: refused, and the dataset's template answers instead.
+            #expect(rewrite.rewriter == "rules" && rewrite.stem == "The article says Tillyburn was founded in")
+            #expect(rewrite.question == "When was Tillyburn founded?" && rewrite.seconds >= 0)
+            // A question outside the templates, with noise from the model, is asked as written.
+            let unknown = adapter.rewrite("Tell me everything about Tillyburn?")
+            #expect(unknown.rewriter == "none" && unknown.stem == "Tell me everything about Tillyburn?")
+            // The acceptance rule itself.
+            #expect(QuestionAdapter.acceptable("Tillyburn was founded in", for: "When was Tillyburn founded?"))
+            #expect(!QuestionAdapter.acceptable("Who founded Tillyburn", for: "When was Tillyburn founded?"))
+            #expect(!QuestionAdapter.acceptable("The town was founded in", for: "When was Tillyburn founded?"))
+            #expect(!QuestionAdapter.acceptable("", for: "When was Tillyburn founded?"))
+            #expect(QuestionAdapter.clean(" The mayor of Paris is ___\n") == "The mayor of Paris is")
+            #expect(adapter.prompt(for: "Who?").hasSuffix("Question: Who?\nStem:"))
+        }
+    }
+}
+
+extension BraidMLXSuites {
+    @Suite("A Thread's own context for a stem", .serialized)
+    struct StrandContextTests {
+        @Test("the context is the sentence before the fact's, from the Thread's index, only for a subject the Thread holds; the braid completes behind it")
+        func context() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 3, seed: 11)
+            defer { rig.cleanUp() }
+            rig.settings.scratchSteps = 48
+            rig.settings.memorisedFloor = 0
+            _ = try await rig.feed("solo", 3)
+            let node = try rig.hypervisor("solo")
+            #expect(try node.sync() == [1])
+            let live = try #require(node.live)
+            let example = try #require(rig.examples([node]).first { $0.node == "solo" && $0.resolvedKind == .fact })
+            // The fact's own prompt, as the corpus wrote it: the Thread recognises it, and the context is
+            // the sentence before it, which the slice prompt already carries.
+            let source = try #require(example.source)
+            let document = try #require(rig.world.document(id: source.documentID))
+            let partition = try #require(document.partitions.first { $0.index == source.partitionIndex })
+            let fact = try #require(document.facts.first { $0.partitionIndex == source.partitionIndex && example.expected == $0.answer })
+            let stem = rig.tokenizer.encode(fact.prompt)
+            let found = try live.context(for: stem, k: 16, floor: 0.5)
+            let context = try #require(found)
+            #expect(context.documentID == source.documentID && context.score >= 0.5)
+            let text = rig.tokenizer.decode(context.tokens).trimmingCharacters(in: .whitespacesAndNewlines)
+            let before = String(decoding: Array(partition.text.utf8).prefix(fact.sentenceStart), as: UTF8.self)
+            #expect(!text.isEmpty && before.contains(text), "context “\(text)” is not before the fact in “\(before.suffix(120))”")
+            #expect(!text.contains(fact.answer.trimmingCharacters(in: .whitespaces)), "the context must not carry the answer")
+            // A subject the Thread never saw: nothing.
+            let foreign = rig.tokenizer.encode("Zorblax Quendrim was founded in")
+            #expect(try live.context(for: foreign, subject: 0..<4, k: 16, floor: 0.5) == nil)
+            // Through the braid with context on, the strand's ref records what it put before the prompt.
+            var params = live.context.defaultParameters()
+            params.maxTokens = 4
+            let generation = try rig.generator([node]).generate(BraidRequest(
+                promptTokens: stem, promptText: fact.prompt, params: params, context: true, contextFloor: 0.5))
+            #expect(generation.braid?.strands.first?.context?.documentID == source.documentID)
+            #expect(generation.prompt.tokens == stem, "the recorded prompt stays the stem")
+        }
+    }
+}

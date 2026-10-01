@@ -221,17 +221,24 @@ final class MLXWorker: @unchecked Sendable {
             throw RaoLMFailure("the braid is not running", hint: "S starts it", code: 69)
         }
         let links = try running.links()
-        let tokens = spec.promptTokens ?? umbrella.tokenizer.encode(spec.promptText)
+        // A question becomes a stem at the umbrella: the commons rewrites it, the rules stand in without one.
+        var rewrite: QuestionRewrite?
+        if spec.question {
+            rewrite = umbrella.commons.map { QuestionAdapter(model: $0.model, tokenizer: umbrella.tokenizer).rewrite(spec.promptText) }
+                ?? QuestionAdapter.fallback(spec.promptText)
+        }
+        let promptText = rewrite?.stem ?? spec.promptText
+        let tokens = spec.promptTokens ?? umbrella.tokenizer.encode(promptText)
         var params = GenerationParameters(tapLayer: links[0].descriptor.tapLayer, alpha: links[0].descriptor.alpha)
         params.lambda = spec.lambda
         params.maxTokens = spec.maxTokens
         params.temperature = spec.temperature
         running.probe(tokens: tokens)
-        post(.braid(.generating(prompt: spec.promptText, nodes: links.map(\.descriptor.name))))
+        post(.braid(.generating(prompt: promptText, nodes: links.map(\.descriptor.name))))
         let post = self.post
         let flag = self.flag
-        let request = BraidRequest(promptTokens: tokens, promptText: spec.promptText, promptSource: spec.source, params: params,
-                                   gating: spec.gating)
+        let request = BraidRequest(promptTokens: tokens, promptText: promptText, promptSource: spec.source, params: params,
+                                   gating: spec.gating, stopAtSentenceEnd: rewrite != nil, question: rewrite)
         let generation = try umbrella.generate(
             links: links, request: request,
             onPrompt: { [first = umbrella.tokenizer.tokenText(tokens[0])] traces in

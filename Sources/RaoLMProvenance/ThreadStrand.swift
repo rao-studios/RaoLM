@@ -152,6 +152,71 @@ public final class ThreadStrand {
 
     public var openSessions: Int { sessions.count }
 
+    /// The Thread's own context for a stem: it scores the stem in a scratch session and looks for
+    /// the fact's own sentence, the place where the stem's template (its positions after the
+    /// subject) is recognised inside a document that holds the subject. When the best such hit
+    /// scores at least `floor`, it returns the sentence before that one, read from its index's
+    /// own values: what the corpus had before the fact, which is what the Thread memorised it
+    /// with. Nil when no document of the Thread's both names the subject and writes the
+    /// template: a template the Thread writes about other entities is not recognition, and
+    /// neither is a document that merely names the subject. Nothing leaves the Thread that a
+    /// citation does not already name.
+    public func context(for stem: [Int], subject: Range<Int>? = nil, k: Int, floor: Float, maxTokens: Int = 48) throws -> StrandContext? {
+        guard !stem.isEmpty else { return nil }
+        let id = "ctx-" + UUID().uuidString.prefix(8).lowercased()
+        let steps = try open(session: id, tokens: stem, k: k)
+        close(session: id)
+        let subjectRange = subject.map { $0.clamped(to: 0..<stem.count) } ?? 0..<stem.count
+        // The subject as text: a sentence-initial name tokenises without the leading space the
+        // corpus writes it with, so tokens are not compared, words are.
+        let subjectText = context.tokenizer.decode(Array(stem[subjectRange])).trimmingCharacters(in: .whitespaces)
+        // The template: the stem after the subject (the whole stem when the subject is not placed).
+        let template = subject == nil ? 0..<stem.count : subjectRange.upperBound..<stem.count
+        let positions = template.isEmpty ? subjectRange : template
+        var best: (hit: StrandHit, position: Int)?
+        var checked: [String: Bool] = [:]
+        for j in positions {
+            for hit in steps[j].hits where hit.score >= floor && (best.map { hit.score > $0.hit.score } ?? true) {
+                guard let partition = index.partitionsByRow[Int(index.keyRow[hit.entry])], let range = index.entriesByDocument[partition.documentID]
+                else { continue }
+                if checked[partition.documentID] == nil { checked[partition.documentID] = holds(subjectText, in: range) }
+                guard checked[partition.documentID] == true else { continue }
+                best = (hit, j)
+            }
+        }
+        guard let best else { return nil }
+        // The hit's key sits in the fact's sentence. The context is the whole sentence before it, read
+        // from the index's values (entry e's value is the document's token after its key).
+        let entry = best.hit.entry
+        let row = Int(index.keyRow[entry])
+        guard let partition = index.partitionsByRow[row], let range = index.entriesByDocument[partition.documentID] else { return nil }
+        func endsSentence(_ e: Int) -> Bool {
+            let text = context.tokenizer.tokenText(Int(index.values[e]))
+            return text.contains("\n") || text.last.map { ".?!".contains($0) } == true
+        }
+        // Back to the end of the sentence before the subject's.
+        var e = entry - 1
+        while e >= range.lowerBound, !endsSentence(e) { e -= 1 }
+        guard e >= range.lowerBound else { return nil }
+        let end = e
+        // Then to the end of the sentence before that: the previous sentence is (start, end].
+        e -= 1
+        var count = 0
+        while e >= range.lowerBound, !endsSentence(e), count < maxTokens { e -= 1; count += 1 }
+        let start = e + 1
+        guard start <= end else { return nil }
+        let tokens = index.values[start...end].map(Int.init)
+        guard !tokens.isEmpty, !context.tokenizer.tokenText(tokens[0]).contains("\n") || tokens.count > 1 else { return nil }
+        return StrandContext(tokens: tokens, score: best.hit.score, position: TokenPosition(row: row, offset: Int(index.keyOffset[entry])),
+                             documentID: partition.documentID, stemPosition: best.position)
+    }
+
+    /// Whether the document whose entries are `range` writes `text` (its values decoded, in corpus order).
+    func holds(_ text: String, in range: Range<Int>) -> Bool {
+        guard !text.isEmpty, !range.isEmpty else { return false }
+        return context.tokenizer.decode(index.values[range].map(Int.init)).contains(text)
+    }
+
     private func step(_ session: Session, tokens: [Int], k: Int) throws -> [StrandStep] {
         let input = MLXArray(tokens.map { Int32($0) }, [1, tokens.count])
         let body = model.body(input, cache: session.cache, captureTap: true, captureCut: true)
@@ -269,9 +334,29 @@ public struct StrandStates: Sendable {
 }
 
 /// How the umbrella reaches one Thread node's live version.
+/// What a Thread adds before a stem: the sentence before its best hit, from its own index.
+public struct StrandContext: Codable, Sendable, Equatable {
+    public var tokens: [Int]
+    public var score: Float
+    public var position: TokenPosition
+    public var documentID: String
+    /// Which stem position the hit scored at.
+    public var stemPosition: Int
+
+    public init(tokens: [Int], score: Float, position: TokenPosition, documentID: String, stemPosition: Int) {
+        self.tokens = tokens
+        self.score = score
+        self.position = position
+        self.documentID = documentID
+        self.stemPosition = stemPosition
+    }
+}
+
 public protocol StrandLink: AnyObject {
     var descriptor: StrandDescriptor { get }
     func open(session: String, tokens: [Int], k: Int) -> StrandCall<[StrandStep]>
+    /// The Thread's own context for a stem, if its index recognises its subject (nil: none, or not offered).
+    func context(stem: [Int], subject: Range<Int>?, k: Int, floor: Float) -> StrandCall<StrandContext?>
     func advance(session: String, token: Int, k: Int) -> StrandCall<StrandStep>
     func hidden(session: String, positions: [Int]) -> StrandCall<[[Float]]>
     /// `hidden`, with the cut state beside each: one request for both.
@@ -283,6 +368,8 @@ extension StrandLink {
     public func states(session: String, positions: [Int]) -> StrandCall<StrandStates> {
         hidden(session: session, positions: positions).map { StrandStates(last: $0, cut: []) }
     }
+
+    public func context(stem: [Int], subject: Range<Int>?, k: Int, floor: Float) -> StrandCall<StrandContext?> { .done { nil } }
 }
 
 /// A strand in this process: every call runs at once, on the caller's thread.
@@ -294,6 +381,10 @@ public final class LocalStrandLink: StrandLink {
     public init(strand: ThreadStrand, vocabularySHA256: String, packSHA256: String? = nil) {
         self.strand = strand
         self.descriptor = strand.descriptor(vocabularySHA256: vocabularySHA256, packSHA256: packSHA256)
+    }
+
+    public func context(stem: [Int], subject: Range<Int>?, k: Int, floor: Float) -> StrandCall<StrandContext?> {
+        .done { try strand.context(for: stem, subject: subject, k: k, floor: floor) }
     }
 
     public func states(session: String, positions: [Int]) -> StrandCall<StrandStates> {

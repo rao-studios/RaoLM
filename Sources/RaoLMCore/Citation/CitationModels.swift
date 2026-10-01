@@ -210,6 +210,9 @@ public struct TokenTrace: Codable, Sendable, Equatable {
     /// counts with.
     public var role: TokenRole? = nil
     public var bits: Float? = nil
+    /// The Thread whose document the token's sentence followed, when its credit was moved there
+    /// from the other Threads holding the same fact (`FollowedCredit`).
+    public var followed: String? = nil
 
     public init(
         index: Int, token: Int, text: String, isPrompt: Bool, lmEntropy: Float, knnEntropy: Float,
@@ -354,6 +357,25 @@ public struct GenerationParameters: Codable, Sendable, Equatable {
     }
 }
 
+/// How a question became the stem a braid was asked to complete.
+public struct QuestionRewrite: Codable, Sendable, Equatable {
+    public var question: String
+    public var stem: String
+    /// "commons" (the commons model, prompted), "rules" (the dataset's templates) or "none" (the question itself).
+    public var rewriter: String
+    public var seconds: Double
+    /// In-context examples the commons was shown (0 for the other rewriters).
+    public var exampleCount: Int
+
+    public init(question: String, stem: String, rewriter: String, seconds: Double = 0, exampleCount: Int = 0) {
+        self.question = question
+        self.stem = stem
+        self.rewriter = rewriter
+        self.seconds = seconds
+        self.exampleCount = exampleCount
+    }
+}
+
 public struct GenerationPrompt: Codable, Sendable, Equatable {
     public var text: String
     public var tokens: [Int]
@@ -361,12 +383,15 @@ public struct GenerationPrompt: Codable, Sendable, Equatable {
     public var source: SourceAddress?
     /// Each prompt token's own text, when recorded (the first token has no trace to carry it).
     public var tokenTexts: [String]?
+    /// The question this prompt was rewritten from, when the umbrella's adapter made the prompt.
+    public var question: QuestionRewrite? = nil
 
-    public init(text: String, tokens: [Int], source: SourceAddress?, tokenTexts: [String]? = nil) {
+    public init(text: String, tokens: [Int], source: SourceAddress?, tokenTexts: [String]? = nil, question: QuestionRewrite? = nil) {
         self.text = text
         self.tokens = tokens
         self.source = source
         self.tokenTexts = tokenTexts
+        self.question = question
     }
 }
 

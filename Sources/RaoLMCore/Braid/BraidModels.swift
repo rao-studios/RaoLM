@@ -273,6 +273,8 @@ public struct BraidStrandRef: Codable, Sendable, Equatable {
     public var entryOffset: Int
     /// The umbrella's commons strand (the pack's base model): it holds no Thread and earns nothing.
     public var commons: Bool?
+    /// What this Thread put before the prompt from its own index, when the request asked for context.
+    public var context: StrandContextRef? = nil
 
     public init(
         name: String, label: String, threadID: String?, version: Int, manifest: ManifestRef, rowOffset: Int, rowCount: Int,
@@ -298,6 +300,21 @@ public struct BraidStrandRef: Codable, Sendable, Equatable {
 }
 
 /// The Threads and the umbrella a braided generation is bound to.
+/// A Thread's own context before a prompt: the sentence before its best hit, and where it came from.
+public struct StrandContextRef: Codable, Sendable, Equatable {
+    public var tokens: [Int]
+    public var text: String
+    public var score: Float
+    public var documentID: String
+
+    public init(tokens: [Int], text: String, score: Float, documentID: String) {
+        self.tokens = tokens
+        self.text = text
+        self.score = score
+        self.documentID = documentID
+    }
+}
+
 public struct BraidRef: Codable, Sendable, Equatable {
     public var vocabularySHA256: String
     public var gateFloor: Float

@@ -340,11 +340,13 @@ enum BraidScreen: StudioScreen {
             return []
         }
         let answerTokens = state.braid.exampleExpected.map { max(2, $0.count / 3) } ?? 12
+        // A typed question goes through the umbrella's adapter: no key, the "?" says so.
+        let question = state.braid.exampleTokens == nil && text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
         state.braid.generating = true
         return [.braid(.generate(BraidGenerateSpec(
             promptTokens: state.braid.exampleTokens, promptText: text, source: state.braid.exampleSource,
-            lambda: state.braid.lambda, maxTokens: min(32, answerTokens + 10), gating: state.braid.gating,
-            temperature: state.braid.temperature, alone: alone)))]
+            lambda: state.braid.lambda, maxTokens: question ? 24 : min(32, answerTokens + 10), gating: state.braid.gating,
+            temperature: state.braid.temperature, alone: alone, question: question)))]
     }
 
     static func hints(_ state: StudioState) -> [KeyHint] {
@@ -465,6 +467,10 @@ enum BraidScreen: StudioScreen {
         footer.append(state.braid.temperature > 0 ? " · sampling" : " · likeliest", palette.dim)
         footer.append(String(format: " · λ %.2f", state.braid.lambda), palette.dim)
         footer.append(" · \(live)/\(names.count) Threads live", palette.muted)
+        if let generation = state.braid.generation {
+            if let rewrite = generation.prompt.question { footer.append(" · rewrite \(rewrite.rewriter)", palette.dim) }
+            if let followed = generation.traces.compactMap(\.followed).first { footer.append(" · followed \(followed)", palette.gold) }
+        }
         let title = compact ? "Umbrella · norm → tied head → softmax → Σ g·(λ mix)"
             : "Umbrella · RMSNorm (final) → tied head → softmax → p = Σ g·(λ·p_knn + (1−λ)·p_lm)"
         let inner = Theme.panel(title, focused: true, footer: footer, &frame, rect)
@@ -690,7 +696,13 @@ enum BraidScreen: StudioScreen {
         } else {
             let promptText = (state.braid.generation?.prompt.text ?? (state.braid.generating || !generated.isEmpty ? state.braid.prompt.text : ""))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !promptText.isEmpty { pieces.append((promptText + " ", palette.dim)) }
+            if let rewrite = state.braid.generation?.prompt.question {
+                // The question, then the stem the umbrella rewrote it to.
+                pieces.append(("Q " + rewrite.question + " ▸ ", palette.dim.italic()))
+                pieces.append((rewrite.stem + " ", palette.dim))
+            } else if !promptText.isEmpty {
+                pieces.append((promptText + " ", palette.dim))
+            }
         }
         if !generated.isEmpty || state.braid.generating { pieces.append((glyphs.prompt, palette.gold)) }
         for (i, trace) in generated.enumerated() {

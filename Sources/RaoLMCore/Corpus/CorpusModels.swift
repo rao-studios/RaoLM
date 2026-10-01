@@ -74,11 +74,17 @@ public struct Fact: Codable, Sendable, Equatable, Identifiable {
     public var paraphrases: [String]
     /// The same template about an entity that exists nowhere in the corpus.
     public var negativePrompt: String
+    /// Natural questions about the fact, each with the corpus-style stem it should rewrite to;
+    /// none occurs anywhere in the corpus. Nil in datasets generated before questions (v1).
+    public var questions: [FactQuestion]? = nil
+    /// The same questions about the entity that exists nowhere.
+    public var negativeQuestions: [FactQuestion]? = nil
 
     public init(
         id: String, kind: FactKind, documentID: String, partitionIndex: Int, subject: String,
         prompt: String, answer: String, sentence: String, sentenceStart: Int, contextStart: Int,
-        answerStart: Int, answerEnd: Int, paraphrases: [String], negativePrompt: String
+        answerStart: Int, answerEnd: Int, paraphrases: [String], negativePrompt: String, questions: [FactQuestion]? = nil,
+        negativeQuestions: [FactQuestion]? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -94,6 +100,19 @@ public struct Fact: Codable, Sendable, Equatable, Identifiable {
         self.answerEnd = answerEnd
         self.paraphrases = paraphrases
         self.negativePrompt = negativePrompt
+        self.questions = questions
+        self.negativeQuestions = negativeQuestions
+    }
+}
+
+/// A question about a fact and the stem the umbrella's adapter should rewrite it to.
+public struct FactQuestion: Codable, Sendable, Equatable {
+    public var text: String
+    public var stem: String
+
+    public init(text: String, stem: String) {
+        self.text = text
+        self.stem = stem
     }
 }
 

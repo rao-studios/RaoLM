@@ -225,6 +225,54 @@ enum DatasetVoices {
         .collectionCurator: ["The person who curates {s} is", "Responsibility for the works in {s} rests with"],
     ]
 
+    /// Natural questions about each fact kind, three or more and worded differently, for the
+    /// umbrella's question adapter to rewrite. A question never appears in any corpus text.
+    static let questions: [FactKind: [String]] = [
+        .townFounded: ["When was {s} founded?", "In what year was {s} founded?", "What year does {s} date back to?"],
+        .townPopulation: ["What is the population of {s}?", "How many people live in {s}?", "How many residents does {s} have?"],
+        .townMayor: ["Who is the mayor of {s}?", "Who governs {s} as mayor?", "Which person serves as the mayor of {s}?"],
+        .researcherBorn: ["When was {s} born?", "In what year was {s} born?", "What is the birth year of {s}?"],
+        .researcherMentor: ["Who trained {s}?", "Who was the mentor of {s}?", "Under whom did {s} train?"],
+        .researcherBook: ["What book did {s} write?", "Which book is {s} best known for?", "What is the title of the book by {s}?"],
+        .festivalFirst: ["When was {s} first held?", "In what year was {s} first held?", "What year did {s} begin?"],
+        .festivalVisitors: ["How many visitors does {s} draw?", "How many people visit {s} each year?", "What is the attendance of {s}?"],
+        .festivalFounder: ["Who founded {s}?", "Who started {s}?", "Which person is the founder of {s}?"],
+        .libraryAuthor: ["Who wrote {s}?", "Who is the author of {s}?", "Which person created {s}?"],
+        .libraryVersion: ["What version of {s} is pinned?", "Which version of {s} is in use?", "What is the version number of {s}?"],
+        .libraryPort: ["What port does {s} listen on?", "Which port does {s} use by default?", "What is the default port of {s}?"],
+        .serviceOwner: ["Who owns {s}?", "Who is the owner of {s}?", "Which person is responsible for {s}?"],
+        .serviceLatency: ["What is the p99 latency of {s}?", "How many milliseconds does {s} take at the p99?", "How slow is {s} at the tail?"],
+        .serviceLaunched: ["When did {s} go live?", "When was {s} launched?", "In what year did {s} launch?"],
+        .incidentMinutes: ["How long did {s} last?", "How many minutes did {s} last?", "What was the duration of {s}?"],
+        .incidentResponder: ["Who responded to {s}?", "Who was the first responder on {s}?", "Which engineer handled {s}?"],
+        .incidentFixVersion: ["What version fixed {s}?", "In which version was {s} fixed?", "Which release fixed {s}?"],
+        .artworkArtist: ["Who painted {s}?", "Who is the artist of {s}?", "Who made {s}?"],
+        .artworkYear: ["When was {s} made?", "What year is {s} dated to?", "In what year was {s} painted?"],
+        .artworkWidth: ["How wide is {s}?", "What is the width of {s}?", "How many centimetres across is {s}?"],
+        .artistBorn: ["When was {s} born?", "In what year was {s} born?", "What is the birth year of {s}?"],
+        .artistStudio: ["Where did {s} keep a studio?", "In which town was the studio of {s}?", "Where was the studio of {s}?"],
+        .artistTeacher: ["Who taught {s}?", "Who was the teacher of {s}?", "Under whom did {s} train as a painter?"],
+        .collectionOpened: ["When did {s} open?", "In what year did {s} open to the public?", "What year was {s} established?"],
+        .collectionWorks: ["How many works does {s} hold?", "How many objects are in {s}?", "What is the size of {s}?"],
+        .collectionCurator: ["Who is the curator of {s}?", "Who curates {s}?", "Which person looks after {s}?"],
+    ]
+
+    /// The corpus-style stem each kind's questions rewrite to: the shortest phrase the home
+    /// voice's phrasings share, which a Thread completes with the answer. A stem may occur in
+    /// the corpus; the adapter is judged on reaching it.
+    static let stems: [FactKind: String] = [
+        .townFounded: "The article says {s} was founded in", .townPopulation: "{S} has a population of about", .townMayor: "The current mayor of {s} is",
+        .researcherBorn: "The profile says {s} was born in", .researcherMentor: "The piece mentions that {s} trained under",
+        .researcherBook: "The best known book by {s} is",
+        .festivalFirst: "The article says {s} was first held in", .festivalVisitors: "Last year {s} drew about", .festivalFounder: "{S} was founded by",
+        .libraryAuthor: "{S} was written by", .libraryVersion: "We pinned {s} at version", .libraryPort: "By default {s} listens on port",
+        .serviceOwner: "The on-call owner of {s} is", .serviceLatency: "The p99 latency of {s} sits at", .serviceLaunched: "{S} went live in",
+        .incidentMinutes: "{S} lasted", .incidentResponder: "The first responder on {s} was", .incidentFixVersion: "{S} was fixed in version",
+        .artworkArtist: "{S} is attributed to", .artworkYear: "{S} is dated", .artworkWidth: "The width of {s} is",
+        .artistBorn: "{S} was born in", .artistStudio: "{S} kept a studio in", .artistTeacher: "{S} trained under",
+        .collectionOpened: "{S} opened to the public in", .collectionWorks: "{S} holds", .collectionCurator: "The curator of {s} is",
+    ]
+
     /// The document kinds a voice writes about an entity of each type.
     static func kinds(_ voice: DatasetVoice, _ type: DatasetEntityType) -> [DocumentKind] {
         switch (voice, type) {
@@ -354,20 +402,20 @@ enum DatasetVoices {
 
     /// Craft's work on a record of another world's entity: importers, fixtures, pages.
     static let craftRecordFillers = [
-        "The importer now validates every field of the {s} record.",
+        "The importer now validates every field of the record for {s}.",
         "Ran the fixture tests for {s}; everything passed.",
-        "Left a TODO in the {s} record about a missing source link.",
+        "Left a TODO in the record for {s} about a missing source link.",
         "The API response for {s} is now cached for an hour.",
-        "Craft wrote the migration that backfills the {s} record.",
+        "Craft wrote the migration that backfills the record for {s}.",
         "The search index picks up {s} after the nightly sync.",
         "Added a snapshot test for the page that shows {s}.",
         "The record for {s} had a stray trailing space; trimmed it.",
-        "Localised the labels on the {s} page.",
-        "Reviewed the permissions on the {s} record with the data team.",
+        "Localised the labels on the page for {s}.",
+        "Reviewed the permissions on the record for {s} with the data team.",
         "The sync job for {s} retries three times before alerting.",
-        "Documented where the {s} data comes from in the wiki.",
+        "Documented where the data for {s} comes from in the wiki.",
         "Benchmarked the query that loads {s}; it stays under ten milliseconds.",
-        "Paired on the parser that reads the {s} record.",
+        "Paired on the parser that reads the record for {s}.",
     ]
 
     static let artistFillers = [

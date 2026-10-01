@@ -68,6 +68,42 @@ struct BraidDatasetTests {
         #expect(dataset.manifest.crosslinks["paraphrase"] == 24 && dataset.manifest.crosslinks["homonym"] == 8)
     }
 
+    @Test("v2: every fact carries three questions with one stem and three negative questions, and no question occurs in any text")
+    func questions() throws {
+        #expect(BraidDataset.generatorVersion == 2)
+        for kind in FactKind.allCases where DatasetVoices.phrasings[kind] != nil {
+            #expect((DatasetVoices.questions[kind]?.count ?? 0) >= 3 && DatasetVoices.stems[kind] != nil, "\(kind)")
+            for question in DatasetVoices.questions[kind] ?? [] { #expect(question.hasSuffix("?") && question.contains("{s}"), "\(question)") }
+        }
+        let dataset = try BraidDataset.generate(Self.small)
+        let texts = dataset.names.flatMap { dataset.corpora[$0]!.documents.map { $0.partitions.map(\.text).joined(separator: "\n\n") } }
+        var facts = 0
+        for name in dataset.names {
+            for fact in dataset.corpora[name]!.documents.flatMap(\.facts) {
+                facts += 1
+                let questions = try #require(fact.questions)
+                #expect(questions.count >= 3 && Set(questions.map(\.stem)).count == 1)
+                #expect(questions.allSatisfy { $0.text.contains(fact.subject) && $0.stem.contains(fact.subject) }, "\(fact.id)")
+                // The rules rewriter reaches the stored stem from every stored question, unless the
+                // question's template is shared with another kind (born: a researcher or a painter).
+                let ambiguous = (DatasetVoices.questions[fact.kind] ?? []).contains { template in
+                    DatasetVoices.questions.filter { $0.value.contains(template) }.count > 1
+                }
+                if !ambiguous { for question in questions { #expect(RuleRewriter.rewrite(question.text)?.stem == question.stem, "\(question.text)") } }
+                #expect(fact.negativeQuestions?.count == questions.count && fact.negativeQuestions?.first?.text.contains(fact.subject) == false)
+                for text in texts { #expect(questions.allSatisfy { !text.contains($0.text) }) }
+            }
+        }
+        #expect(facts > 0)
+        // A v1 fact, without questions, still decodes.
+        let v1 = """
+            {"id":"d#townFounded","kind":"townFounded","documentID":"d","partitionIndex":0,"subject":"Tillyburn","prompt":"p","answer":" 1128",
+             "sentence":"p 1128.","sentenceStart":0,"contextStart":0,"answerStart":1,"answerEnd":6,"paraphrases":[],"negativePrompt":"n"}
+            """
+        let decoded = try JSONDecoder().decode(Fact.self, from: Data(v1.utf8))
+        #expect(decoded.questions == nil && decoded.negativeQuestions == nil && decoded.subject == "Tillyburn")
+    }
+
     @Test("links: shared facts agree except one in a variant; an excerpt quotes with an edit; a homonym shares only a name")
     func links() throws {
         let dataset = try BraidDataset.generate(Self.small)

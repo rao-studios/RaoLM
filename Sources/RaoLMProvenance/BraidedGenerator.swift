@@ -36,10 +36,23 @@ public struct BraidRequest: Sendable {
     public var gating: BraidGating
     /// The braided gate's settings.
     public var gate: BraidGate
+    /// Stop before the token that would open a second sentence: an answer is one sentence.
+    public var stopAtSentenceEnd: Bool
+    /// The question the prompt was rewritten from, kept on the generation's record.
+    public var question: QuestionRewrite?
+    /// Each Thread completes the prompt behind its own context: the sentence before its best hit
+    /// for the prompt, from its own index, when that hit scores at least `contextFloor`. The
+    /// mixture runs over the shared prompt; the Threads' chains run through their contexts.
+    public var context: Bool
+    public var contextFloor: Float
+    /// The prompt positions that name the subject (the question's capitalised words); the whole prompt when nil.
+    public var subject: Range<Int>?
 
     public init(
         promptTokens: [Int], promptText: String, promptSource: SourceAddress? = nil, params: GenerationParameters,
-        gateFloor: Float = BraidMixer.defaultGateFloor, gating: BraidGating = BraidRequest.defaultGating, gate: BraidGate = BraidRequest.defaultGate
+        gateFloor: Float = BraidMixer.defaultGateFloor, gating: BraidGating = BraidRequest.defaultGating, gate: BraidGate = BraidRequest.defaultGate,
+        stopAtSentenceEnd: Bool = false, question: QuestionRewrite? = nil, context: Bool = false, contextFloor: Float = 0.6,
+        subject: Range<Int>? = nil
     ) {
         self.promptTokens = promptTokens
         self.promptText = promptText
@@ -48,6 +61,11 @@ public struct BraidRequest: Sendable {
         self.gateFloor = gateFloor
         self.gating = gating
         self.gate = gate
+        self.stopAtSentenceEnd = stopAtSentenceEnd
+        self.question = question
+        self.context = context
+        self.contextFloor = contextFloor
+        self.subject = subject
     }
 
     /// How Threads are weighed when a request does not say. The gate bench's rule kept the
@@ -239,14 +257,24 @@ public final class BraidedGenerator {
         var rng = SplitMix64(seed: params.seed)
         defer { for link in links { link.close(session: session) } }
 
-        let opened = links.map { $0.open(session: session, tokens: prompt, k: params.k) }
+        // With context, each Thread's session opens on its own sentence before the prompt; its
+        // steps for prompt position j sit at base[t] + j.
+        var contexts: [StrandContext?] = links.map { _ in nil }
+        if request.context {
+            let asked = links.indices.map { t in
+                braid.strands[t].commons == true ? nil : links[t].context(stem: prompt, subject: request.subject, k: params.k, floor: request.contextFloor)
+            }
+            contexts = try asked.map { try $0?.wait(timeout: timeout) }
+        }
+        let base = contexts.map { $0?.tokens.count ?? 0 }
+        let opened = links.indices.map { t in links[t].open(session: session, tokens: (contexts[t]?.tokens ?? []) + prompt, k: params.k) }
         let promptSteps = try opened.map { try $0.wait(timeout: timeout) }
         let everyPosition = Array(0..<prompt.count)
         // Every Thread scores the prompt, unless the gate asks by manner: then the Threads whose
         // retrieval moves through their documents the way the prompt runs (all, when none does).
         // The commons is always asked.
         let asked = askedAtPrompt(manner: promptSteps.map { $0.last?.trajectory?.manner }, gate: gate)
-        let stateCalls = links.indices.map { t in asked[t] ? fetch(t, session: session, positions: everyPosition, gate: gate) : nil }
+        let stateCalls = links.indices.map { t in asked[t] ? fetch(t, session: session, positions: everyPosition.map { base[t] + $0 }, gate: gate) : nil }
         let promptStates = try stateCalls.map { try $0?.wait(timeout: timeout) }
         let promptArrays = promptStates.map { $0.map { head.logitsArray(hiddens: $0.last) } }
         let promptLogits = promptArrays.map { $0.map { head.rows($0) } }
@@ -256,8 +284,8 @@ public final class BraidedGenerator {
         var traces: [TokenTrace] = []
         var mixtures: [MixtureStats.Position] = []
         for j in 1..<prompt.count {
-            let experts = links.indices.map { t in expert(t, hits: promptSteps[t][j - 1].hits, logits: promptLogits[t]?[j - 1], params: params) }
-            let trajectories = promptSteps.map { $0[j - 1].trajectory }
+            let experts = links.indices.map { t in expert(t, hits: promptSteps[t][base[t] + j - 1].hits, logits: promptLogits[t]?[j - 1], params: params) }
+            let trajectories = links.indices.map { t in promptSteps[t][base[t] + j - 1].trajectory }
             var backs = BraidMixer.agreement(experts: experts, leader: state.leader)
             let thinking = thought(promptThoughts.map { $0?[j - 1] }, leader: state.leader)
             if let thinking { backs = zip(backs, thinking).map { max($0, $1) } }
@@ -277,9 +305,9 @@ public final class BraidedGenerator {
         try onPrompt?(traces)
 
         var experts = links.indices.map { t in
-            expert(t, hits: promptSteps[t][prompt.count - 1].hits, logits: promptLogits[t]?[prompt.count - 1], params: params)
+            expert(t, hits: promptSteps[t][base[t] + prompt.count - 1].hits, logits: promptLogits[t]?[prompt.count - 1], params: params)
         }
-        var trajectories = promptSteps.map { $0[prompt.count - 1].trajectory }
+        var trajectories = links.indices.map { t in promptSteps[t][base[t] + prompt.count - 1].trajectory }
         var logits: [Int: [Float]] = [:]
         var arrays: [Int: MLXArray] = [:]
         var descriptions: [[Float]?] = promptThoughts.map { $0?[prompt.count - 1] }
@@ -294,7 +322,7 @@ public final class BraidedGenerator {
         var open = openStrands(gates, floor: floor)
         // A Thread the prompt did not ask that the gate opens now is asked for its last position.
         for t in links.indices where open[t] && logits[t] == nil {
-            let states = try fetch(t, session: session, positions: [prompt.count - 1], gate: gate).wait(timeout: timeout)
+            let states = try fetch(t, session: session, positions: [base[t] + prompt.count - 1], gate: gate).wait(timeout: timeout)
             if let hidden = states.last.first {
                 let array = head.logitsArray(hiddens: [hidden])
                 arrays[t] = array
@@ -315,6 +343,7 @@ public final class BraidedGenerator {
                 stoppedOnEOS = true
                 break
             }
+            if sentenceEnds(request, generated: generated, next: token) { break }
             var step = [trace(mix: mix, experts: experts, token: token, index: prompt.count + generated.count, forced: false,
                               names: names, threadIDs: threadIDs, memory: state.memory, backs: backs, trajectories: trajectories,
                               thought: thinking)]
@@ -338,7 +367,7 @@ public final class BraidedGenerator {
             backs = BraidMixer.agreement(experts: retrieved, leader: state.leader)
             gates = BraidMixer.weights(state: state, agreement: backs, trace: BraidMixer.traces(trajectories), gate: gate)
             open = openStrands(gates, floor: floor)
-            let calls = links.indices.map { t in open[t] ? fetch(t, session: session, positions: [position + 1], gate: gate) : nil }
+            let calls = links.indices.map { t in open[t] ? fetch(t, session: session, positions: [base[t] + position + 1], gate: gate) : nil }
             logits = [:]
             arrays = [:]
             descriptions = links.map { _ in nil }
@@ -360,7 +389,7 @@ public final class BraidedGenerator {
             }
             experts = links.indices.map { t in expert(t, hits: hits[t], logits: logits[t], params: params) }
         }
-        return finish(traces: traces, prompt: prompt, generated: generated, stoppedOnEOS: stoppedOnEOS, request: request)
+        return finish(traces: traces, prompt: prompt, generated: generated, stoppedOnEOS: stoppedOnEOS, request: request, contexts: contexts)
     }
 
     /// The entropies MixtureStats computed for `traces[start...]`, one position each: the trace's
@@ -447,6 +476,7 @@ public final class BraidedGenerator {
                 stoppedOnEOS = true
                 break
             }
+            if sentenceEnds(request, generated: generated, next: token) { break }
             var step = [trace(mix: mix, experts: experts, token: token, index: prompt.count + generated.count, forced: false,
                               names: names, threadIDs: threadIDs, trajectories: trajectories)]
             Self.fill(&step, from: 0, with: MixtureStats.entropies(
@@ -593,6 +623,7 @@ public final class BraidedGenerator {
                 stoppedOnEOS = true
                 break
             }
+            if sentenceEnds(request, generated: generated, next: trace.token) { break }
             traces.append(trace)
             generated.append(trace.token)
             try onStep?(BraidStep(trace: trace, open: pool.openIndices.map { names[$0] }))
@@ -613,13 +644,17 @@ public final class BraidedGenerator {
     }
 
     private func finish(
-        traces: [TokenTrace], prompt: [Int], generated: [Int], stoppedOnEOS: Bool, request: BraidRequest
+        traces: [TokenTrace], prompt: [Int], generated: [Int], stoppedOnEOS: Bool, request: BraidRequest, contexts: [StrandContext?] = []
     ) -> CitedGeneration {
         var traces = traces
         let params = request.params
         if let commons {
             // The owner's blend: form is the commons', content each strand's as it supplied it.
             TokenRoles.assignCredit(&traces, commons: names[commons], texts: (prompt + generated).map { tokenizer.tokenText($0) })
+            // Then the trajectory decides a fact several Threads hold: the one the completion followed takes it.
+            FollowedCredit.apply(
+                &traces, rowOffsets: Dictionary(uniqueKeysWithValues: braid.strands.map { ($0.name, $0.rowOffset) }),
+                partitions: partitionsByRow, commons: names[commons])
         }
         let spans = CitationSpans.annotate(
             traces: &traces, partitions: partitionsByRow, sharedNgrams: sharedNgrams, threadID: nil,
@@ -634,14 +669,26 @@ public final class BraidedGenerator {
         var braid = self.braid
         braid.gating = request.gating
         braid.gate = request.gating == .braided ? request.gate : nil
+        // What each Thread put before the prompt, by its own index, kept on its strand's ref.
+        for (t, context) in contexts.enumerated() where t < braid.strands.count {
+            braid.strands[t].context = context.map {
+                StrandContextRef(tokens: $0.tokens, text: tokenizer.decode($0.tokens), score: $0.score, documentID: $0.documentID)
+            }
+        }
         let manifest = braid.combinedManifest(tokenizerSHA256: tokenizer.tokenizerSHA256)
         return CitedGeneration(
             generationID: CitedGenerator.generationID(manifest: manifest, prompt: prompt, params: params), manifest: manifest,
             prompt: GenerationPrompt(text: request.promptText, tokens: prompt, source: request.promptSource,
-                                     tokenTexts: prompt.map { tokenizer.tokenText($0) }),
+                                     tokenTexts: prompt.map { tokenizer.tokenText($0) }, question: request.question),
             params: params, tokens: generated, text: tokenizer.decode(generated), stoppedOnEOS: stoppedOnEOS,
             partitions: rows.sorted().compactMap { partitionsByRow[$0] }, traces: traces, spans: spans,
             summary: CitationSpans.summary(traces: traces, spans: spans), braid: braid)
+    }
+
+    /// Whether `next` would open a second sentence of an answer the request wants kept to one.
+    private func sentenceEnds(_ request: BraidRequest, generated: [Int], next: Int) -> Bool {
+        guard request.stopAtSentenceEnd, !generated.isEmpty else { return false }
+        return AnswerStop.sentenceEnded(previous: tokenizer.decode(generated), next: tokenizer.tokenText(next))
     }
 
     /// One position: mix, choose (or take the forced prompt token), trace.
