@@ -5,10 +5,13 @@
 //  WHAT: A corpus snapshot turned into tokens, with every token's source address.
 //  OUT:  A partition table (row → document, partition index, tokens), and the packed
 //        training stream `eos d0 eos d1 … eos` with a parallel row/offset for every token.
-//  PIN:  Each partition is tokenized on its own and the id arrays are concatenated — no
-//        joining whitespace, no BOS. Tokenizing a concatenation would let the BPE regex merge
-//        across a partition boundary, and offsets would stop being reproducible from a single
-//        partition's text, which is what the verifier re-tokenizes.
+//  PIN:  Each partition is tokenized on its own and the id arrays are concatenated, with no BOS.
+//        Tokenizing a concatenation would let the BPE regex merge across a partition boundary,
+//        and offsets would stop being reproducible from a single partition's text, which is what
+//        the verifier re-tokenizes. Given a `paragraphBreak` (the tokenizer's, `[198, 198]`), it
+//        joins a document's partitions, so a document's stream is the tokenization of its text;
+//        each break token is addressed past the end of the partition it follows, which no
+//        citation ever names. Without one (runs made before it) partitions join with nothing.
 //
 
 import Foundation
@@ -50,13 +53,16 @@ public final class TokenizedCorpus: @unchecked Sendable {
     public let stream: [Int32]
     /// Partition row of each stream token (−1 for eos).
     public let streamRows: [Int32]
-    /// Token offset inside its partition (−1 for eos).
+    /// Token offset inside its partition (−1 for eos); a break's are the partition's token count onward.
     public let streamOffsets: [Int32]
+    /// What joins a document's partitions; empty in runs made before the break.
+    public let paragraphBreak: [Int32]
 
     private let rowByAddress: [String: Int]
 
-    public init(snapshot: CorpusSnapshot, tokenizer: RaoTokenizer, excluding: Set<String> = []) {
+    public init(snapshot: CorpusSnapshot, tokenizer: RaoTokenizer, excluding: Set<String> = [], paragraphBreak: [Int] = []) {
         let eos = Int32(tokenizer.eosTokenID)
+        let joint = paragraphBreak.map { Int32($0) }
         var partitions: [TokenizedPartition] = []
         var documents: [TokenizedDocument] = []
         var rowByAddress: [String: Int] = [:]
@@ -67,8 +73,15 @@ public final class TokenizedCorpus: @unchecked Sendable {
         for document in snapshot.documents where !excluding.contains(document.id) {
             let documentIndex = documents.count
             let firstRow = partitions.count
-            for partition in document.partitions.sorted(by: { $0.index < $1.index }) {
+            for (n, partition) in document.partitions.sorted(by: { $0.index < $1.index }).enumerated() {
                 let row = partitions.count
+                if n > 0, let previous = partitions.last {
+                    for (j, token) in joint.enumerated() {
+                        stream.append(token)
+                        streamRows.append(Int32(previous.row))
+                        streamOffsets.append(Int32(previous.tokens.count + j))
+                    }
+                }
                 let tokens = tokenizer.encode(partition.text).map { Int32($0) }
                 partitions.append(TokenizedPartition(
                     row: row, documentIndex: documentIndex, documentID: document.id, documentName: document.name,
@@ -97,6 +110,7 @@ public final class TokenizedCorpus: @unchecked Sendable {
         self.stream = stream
         self.streamRows = streamRows
         self.streamOffsets = streamOffsets
+        self.paragraphBreak = joint
         self.rowByAddress = rowByAddress
     }
 
@@ -112,6 +126,14 @@ public final class TokenizedCorpus: @unchecked Sendable {
         var rows: [Int32] = [-1]
         var offsets: [Int32] = [-1]
         for row in document.rows {
+            if row > document.rows.lowerBound {
+                let previous = partitions[row - 1]
+                for (j, token) in paragraphBreak.enumerated() {
+                    tokens.append(token)
+                    rows.append(Int32(previous.row))
+                    offsets.append(Int32(previous.tokens.count + j))
+                }
+            }
             for (offset, token) in partitions[row].tokens.enumerated() {
                 tokens.append(token)
                 rows.append(Int32(row))
@@ -138,7 +160,10 @@ public final class TokenizedCorpus: @unchecked Sendable {
         var documentCount: [UInt64: Int] = [:]
         for document in documents {
             var tokens: [Int32] = []
-            for row in document.rows { tokens.append(contentsOf: partitions[row].tokens) }
+            for row in document.rows {
+                if row > document.rows.lowerBound { tokens.append(contentsOf: paragraphBreak) }
+                tokens.append(contentsOf: partitions[row].tokens)
+            }
             guard tokens.count >= 3 else { continue }
             var seen = Set<UInt64>()
             for i in 0...(tokens.count - 3) {

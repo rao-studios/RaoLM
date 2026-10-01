@@ -64,15 +64,17 @@ public enum Checkpoint {
         return model
     }
 
-    /// Loads every *.safetensors directly inside `directory` (RaoLM or HF SmolLM2 layout).
+    /// Loads every *.safetensors directly inside `directory` (RaoLM or HF SmolLM2 layout). Weights
+    /// stored in another float type (SmolLM2's are bfloat16) are widened to float32, exactly.
     public static func loadWeights(into model: RaoTransformer, from directory: URL) throws {
+        // Not "._" files: the sidecars macOS writes beside every file on an exFAT drive.
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "safetensors" }
+            .filter { $0.pathExtension == "safetensors" && !$0.lastPathComponent.hasPrefix("._") }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard !files.isEmpty else { throw CheckpointError.missing("no .safetensors in \(directory.path)") }
         var weights: [String: MLXArray] = [:]
         for file in files {
-            for (key, value) in try loadArrays(url: file) { weights[key] = value }
+            for (key, value) in try loadArrays(url: file) { weights[key] = value.dtype == .float32 ? value : value.asType(.float32) }
         }
         weights = model.sanitize(weights: weights)
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])

@@ -40,6 +40,9 @@ public final class RaoTokenizer: @unchecked Sendable {
     public let tokenizerSHA256: String
     public let eosTokenID: Int
     public let vocabularySize: Int
+    /// A paragraph break as this tokenizer writes one between two passages of text. For SmolLM2's that
+    /// is two newline tokens, `[198, 198]`; `"\n\n"` alone would be the single token 1116.
+    public let paragraphBreak: [Int]
 
     private var textCache: [Int: String] = [:]
     private let lock = NSLock()
@@ -50,6 +53,14 @@ public final class RaoTokenizer: @unchecked Sendable {
         self.tokenizerSHA256 = sha256
         self.eosTokenID = eos
         self.vocabularySize = vocabularySize
+        let a = tokenizer.encode(text: "a", addSpecialTokens: false)
+        let b = tokenizer.encode(text: "b", addSpecialTokens: false)
+        let joined = tokenizer.encode(text: "a\n\nb", addSpecialTokens: false)
+        if joined.count > a.count + b.count, Array(joined.prefix(a.count)) == a, Array(joined.suffix(b.count)) == b {
+            self.paragraphBreak = Array(joined[a.count..<(joined.count - b.count)])
+        } else {
+            self.paragraphBreak = tokenizer.encode(text: "\n\n", addSpecialTokens: false)
+        }
     }
 
     /// The vendored SmolLM2 tokenizer folder inside this target's resource bundle.

@@ -28,7 +28,7 @@ struct BraidGroup: AsyncParsableCommand {
             asks the open ones for their last hidden state, applies the one shared final norm and tied head, and mixes the \
             Threads' own kNN-LMs. Every token records what each Thread supplied.
             """,
-        subcommands: [Panel.self, Demo.self, Status.self, Down.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self],
+        subcommands: [Panel.self, Demo.self, Status.self, Down.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self],
         defaultSubcommand: Panel.self
     )
 
@@ -51,6 +51,9 @@ struct BraidGroup: AsyncParsableCommand {
         @Option(help: "Replay a recorded braid instead of running nodes (a fixtures directory with braid/braid-events.jsonl).")
         var fixtures: String?
 
+        @Option(help: "Model preset each node trains: tiny, small, or base (SmolLM2-135M cut after block 20, its upper blocks the umbrella's; the braid keeps it).")
+        var preset: String?
+
         @OptionGroup var world: BraidWorldOptions
 
         func run() async throws {
@@ -70,6 +73,7 @@ struct BraidGroup: AsyncParsableCommand {
                 options.braidNodes = braid.nodes
                 options.braidSeed = braid.seed
                 options.braidWorld = world.choice
+                options.braidPreset = preset
                 let code = try await Studio.launch(options)
                 if code != 0 { throw ExitCode(code) }
             }
@@ -83,8 +87,11 @@ struct BraidGroup: AsyncParsableCommand {
         @Option(help: "Path to the thread binary (default: $RAOLM_THREAD_BINARY, else ../Thread/.build/release/thread).")
         var threadBinary: String?
 
-        @Option(help: "Model preset each node trains: tiny, small.")
-        var preset = "tiny"
+        @Option(help: "Model preset each node trains: tiny, small, or base (SmolLM2-135M cut after block 20; default: the braid's own, else tiny).")
+        var preset: String?
+
+        @Option(help: "A training arm: passage-break (paragraph breaks in the stream, attention kept inside a document); canon, gated-attention, muon or wsd (the same, plus Canon layers, a gate on each attention head, the Muon optimizer, or a warmup-stable-decay schedule). Default: the braid's own, and passage-break for a new base braid.")
+        var arm: String?
 
         @Option(help: "Documents a feed deposits.")
         var batch = 8
@@ -101,8 +108,19 @@ struct BraidGroup: AsyncParsableCommand {
             options.threadBinary = threadBinary
             options.batch = batch
             options.fresh = fresh
-            options.settings.preset = preset
+            if let preset {
+                options.settings.preset = preset
+                options.presetRequested = true
+            }
+            if let arm {
+                guard HypervisorSettings.arms.contains(arm) else {
+                    throw ValidationError("unknown arm \(arm); the arms are \(HypervisorSettings.arms.joined(separator: ", "))")
+                }
+                options.settings.arm = arm
+                options.armRequested = true
+            }
             try world.apply(to: &options)
+            options.restorePreset()
             return options
         }
     }
@@ -150,20 +168,28 @@ struct BraidGroup: AsyncParsableCommand {
                 try Preflight.requireMetallib()
                 let options = try braid.options(root: global.root)
                 let tokenizer = try await RaoTokenizer.load()
-                let vocabulary = try BraidVocabulary.ensure(layout: options.layout, config: try options.settings.modelConfig(), tokenizer: tokenizer)
+                let pack = try UmbrellaPacks.ensure(layout: options.layout, config: try options.settings.modelConfig(), tokenizer: tokenizer) {
+                    print("umbrella pack: \($0)")
+                }
                 let recorder = try record.map { try BraidRecorder(directory: URL(fileURLWithPath: $0)) }
                 defer { recorder?.close() }
                 let printer = BraidPrinter()
-                let session = try BraidSession(options: options, vocabularySHA256: vocabulary.sha256) { event in
+                let session = try BraidSession(
+                    options: options, vocabularySHA256: pack.vocabulary.sha256, packSHA256: pack.hasBase ? pack.sha256 : nil
+                ) { event in
                     recorder?.record(event)
                     printer.handle(event)
                 }
                 session.exampleTokenizer = tokenizer
-                let umbrella = BraidUmbrella(vocabulary: vocabulary, tokenizer: tokenizer)
+                let umbrella = try BraidUmbrella(pack: pack, tokenizer: tokenizer)
                 let stop = StopSignal()
 
                 Console.section("Nodes")
-                print("vocabulary \(Format.short(vocabulary.sha256)) (seeded, head scale \(BraidVocabulary.headScale)) · \(options.offline ? "offline" : "Thread") mode")
+                if let cut = pack.cut {
+                    print("umbrella pack \(Format.short(pack.sha256)) (\(pack.name): blocks \(cut)+ the umbrella's frozen trunk, the commons strand asked every token) · \(options.offline ? "offline" : "Thread") mode")
+                } else {
+                    print("vocabulary \(Format.short(pack.vocabulary.sha256)) (seeded, head scale \(BraidVocabulary.headScale)) · \(options.offline ? "offline" : "Thread") mode")
+                }
                 do {
                     try await steps(session: session, umbrella: umbrella, tokenizer: tokenizer, recorder: recorder, stop: stop)
                 } catch {
@@ -179,6 +205,8 @@ struct BraidGroup: AsyncParsableCommand {
             try await session.start()
             print(Format.table(BraidTables.nodes(session.states, session: session)))
             let names = session.names
+            // Share columns: every Thread, and the commons when the pack has one.
+            let columns = names + (umbrella.commons == nil ? [] : [BraidStrandRef.commonsName])
 
             Console.section("Feed")
             let before = Dictionary(uniqueKeysWithValues: names.map { ($0, session.state($0)?.versions ?? 0) })
@@ -200,10 +228,10 @@ struct BraidGroup: AsyncParsableCommand {
                 var verified = generation
                 let report = try await CitationVerifier.verify(&verified, reader: session.reader(), tokenizer: tokenizer)
                 recorder?.record(.verified(lines: report.checks.map { "\($0.status.rawValue) \($0.documentID)" }, allVerified: report.allVerified))
-                rows.append(BraidTables.route(example, verified, report: report, names: names))
+                rows.append(BraidTables.route(example, verified, report: report, names: columns))
             }
-            print(Format.table(BraidTables.routeHeaders(names), rows))
-            print("  share = the fraction of p(token) each Thread supplied, averaged over the answer's tokens; gate = each Thread's weight at the first answer token (● asked, ○ not)")
+            print(Format.table(BraidTables.routeHeaders(columns), rows))
+            print("  share = the fraction of p(token) each Thread supplied, averaged over the answer's tokens\(umbrella.commons == nil ? "" : " (the commons' share is nobody's)"); gate = each Thread's weight at the first answer token (● asked, ○ not)")
 
             if let first = names.first, !stop.isSet {
                 Console.section("Update: feed \(first) again")
@@ -223,9 +251,9 @@ struct BraidGroup: AsyncParsableCommand {
                     let generation = try generate(example, umbrella: umbrella, session: session, recorder: recorder)
                     var verified = generation
                     let report = try await CitationVerifier.verify(&verified, reader: session.reader(), tokenizer: tokenizer)
-                    rows.append(BraidTables.route(example, verified, report: report, names: names))
+                    rows.append(BraidTables.route(example, verified, report: report, names: columns))
                 }
-                if !rows.isEmpty { print(Format.table(BraidTables.routeHeaders(names), rows)) }
+                if !rows.isEmpty { print(Format.table(BraidTables.routeHeaders(columns), rows)) }
             }
 
             if names.count > 1, !stop.isSet {
@@ -255,12 +283,12 @@ struct BraidGroup: AsyncParsableCommand {
                     let generation = try generate(example, umbrella: umbrella, session: session, recorder: recorder)
                     var verified = generation
                     let report = try await CitationVerifier.verify(&verified, reader: session.reader(), tokenizer: tokenizer)
-                    rows.append(BraidTables.route(example, verified, report: report, names: names))
+                    rows.append(BraidTables.route(example, verified, report: report, names: columns))
                 }
                 if rows.isEmpty {
                     print("no example opens with \(opener)'s fact and asks \(owner)'s yet")
                 } else {
-                    print(Format.table(BraidTables.routeHeaders(names), rows))
+                    print(Format.table(BraidTables.routeHeaders(columns), rows))
                 }
             }
 
@@ -272,9 +300,9 @@ struct BraidGroup: AsyncParsableCommand {
                     let generation = try generate(example, umbrella: umbrella, session: session, recorder: recorder)
                     var verified = generation
                     let report = try await CitationVerifier.verify(&verified, reader: session.reader(), tokenizer: tokenizer)
-                    rows.append(BraidTables.route(example, verified, report: report, names: names))
+                    rows.append(BraidTables.route(example, verified, report: report, names: columns))
                 }
-                print(Format.table(BraidTables.routeHeaders(names), rows))
+                print(Format.table(BraidTables.routeHeaders(columns), rows))
                 print("  each prompt is asked in the words of the Thread named first; the Thread after ≈ holds the same facts in its own words")
             }
 
@@ -591,7 +619,260 @@ extension BraidGroup {
     }
 }
 
+extension BraidGroup {
+    struct BenchUmbrella: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-umbrella",
+            abstract: "Whether the umbrella's layers earn their place: the pack, the commons strand, each Thread's own λ and τ, thought agreement.",
+            discussion: """
+                The base braid is --data-dir: nodes of the base preset fed from a dataset (raolm braid demo --offline --fresh \
+                --dataset braid-cross-v1 --batch 80 --preset base). --reference is the same braid on the tiny preset, fed the same way; \
+                --ceiling, the base braid fed twice the documents. Five arms, each adding to the one before (v1, pack, commons, \
+                calibrated, anchors), answer the same prompts; the rules were fixed before any numbers (Docs/ARCHITECTURE.md).
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Data root of the reference braid (the tiny preset, fed the same way).")
+        var reference: String?
+
+        @Option(help: "Data root of the base braid fed twice the documents.")
+        var ceiling: String?
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(help: "Print a saved report, scored again under the rule, instead of running.")
+        var report: String?
+
+        func run() async throws {
+            try await guarded {
+                if let report {
+                    var loaded = try JSONCoding.read(UmbrellaReport.self, from: URL(fileURLWithPath: (report as NSString).expandingTildeInPath))
+                    loaded.evaluation = UmbrellaBench.evaluate(arms: loaded.arms, ceiling: loaded.ceiling, nodes: loaded.nodes, trajectory: loaded.trajectory)
+                    loaded.allFactsEvaluation = UmbrellaBench.evaluateEveryFact(loaded)
+                    print(BraidTables.umbrella(loaded))
+                    return
+                }
+                guard let reference else { throw RaoLMFailure("bench-umbrella needs --reference, the tiny braid fed the same way", code: 64) }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                let result = try UmbrellaBench.run(
+                    base: BraidLayout(dataRoot: global.root), reference: BraidLayout(dataRoot: DataRoot.resolve(argument: reference)),
+                    ceiling: ceiling.map { BraidLayout(dataRoot: DataRoot.resolve(argument: $0)) }, tokenizer: tokenizer
+                ) { line in Console.error(line) }
+                print(BraidTables.umbrella(result))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
+extension BraidGroup {
+    struct BenchArchitecture: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-architecture",
+            abstract: "Whether a phase-2 training arm earns its place in base: the arm's braid against today's base braid.",
+            discussion: """
+                The arm's braid is --data-dir: base nodes fed from a dataset and trained on an arm (raolm braid demo --offline --fresh \
+                --dataset braid-cross-v1 --batch 80 --preset base --arm passage-break). --reference is today's base braid, fed the same \
+                way. Rules A1 to A5 were fixed before any numbers (Docs/ARCHITECTURE.md).
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Data root of the reference braid (the base preset on today's recipe, fed the same way).")
+        var reference: String?
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(help: "Print a saved report, scored again under the rules, instead of running.")
+        var report: String?
+
+        func run() async throws {
+            try await guarded {
+                if let report {
+                    var loaded = try JSONCoding.read(ArchitectureReport.self, from: URL(fileURLWithPath: (report as NSString).expandingTildeInPath))
+                    loaded.evaluation = ArchitectureBench.evaluate(braids: loaded.braids, nodes: loaded.nodes, trajectory: loaded.trajectory, arm: loaded.arm)
+                    print(BraidTables.architecture(loaded))
+                    return
+                }
+                guard let reference else { throw RaoLMFailure("bench-architecture needs --reference, today's base braid fed the same way", code: 64) }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                let result = try ArchitectureBench.run(
+                    arm: BraidLayout(dataRoot: global.root), reference: BraidLayout(dataRoot: DataRoot.resolve(argument: reference)), tokenizer: tokenizer
+                ) { line in Console.error(line) }
+                print(BraidTables.architecture(result))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
+extension BraidGroup {
+    struct BenchThought: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-thought",
+            abstract: "Whether the Jacobian lens reads what a node plans: faithful to its output, ahead of it, and on the Thread that knows a retold fact.",
+            discussion: """
+                The braid is --data-dir: base nodes fed from a dataset (raolm braid demo --offline --fresh --dataset braid-cross-v1 \
+                --batch 80 --preset base). J is taken once through the pack's trunk and saved beside the pack. Rules L1 to L3 were fixed \
+                before any numbers (Docs/ARCHITECTURE.md).
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(help: "Print a saved report, scored again under the rules, instead of running.")
+        var report: String?
+
+        func run() async throws {
+            try await guarded {
+                if let report {
+                    var loaded = try JSONCoding.read(ThoughtReport.self, from: URL(fileURLWithPath: (report as NSString).expandingTildeInPath))
+                    loaded.evaluation = ThoughtBench.evaluate(nodes: loaded.nodes, told: loaded.told, lens: loaded.lens)
+                    print(BraidTables.thought(loaded))
+                    return
+                }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                let result = try ThoughtBench.run(layout: BraidLayout(dataRoot: global.root), tokenizer: tokenizer) { line in Console.error(line) }
+                print(BraidTables.thought(result))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
 extension BraidTables {
+    static func thought(_ report: ThoughtReport) -> String {
+        func pct(_ value: Float) -> String { String(format: "%.0f%%", value * 100) }
+        var lines: [String] = [String(format: "lens: J over %d snippets of %d tokens, split-half agreement %.3f", report.lens.prompts,
+                                      report.lens.promptTokens, report.lens.splitHalfAgreement), ""]
+        lines.append(Format.table(
+            ["node", "top token = output's: lens", "identity", "2–8 ahead in top 25: lens", "output", "identity"],
+            report.nodes.map { [$0.node, pct($0.lensAgreement), pct($0.identityAgreement), pct($0.lensAheadRate), pct($0.outputAheadRate),
+                                pct($0.identityAheadRate)] }))
+        lines.append("")
+        for told in report.told.prefix(6) {
+            lines.append("\(told.text) · «\(told.token)»: source lens \(told.sourceLens ? "holds" : "misses"), control "
+                         + (told.controlLens.map { $0 ? "holds" : "misses" } ?? "—") + "; the source's workspace: " + told.workspace.joined(separator: " | "))
+        }
+        lines.append("")
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        for (key, value) in report.evaluation.reported.sorted(by: { $0.key < $1.key }) { lines.append("  \(key): \(String(format: "%.3f", value))") }
+        lines.append("")
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
+}
+
+extension BraidTables {
+    static func architecture(_ report: ArchitectureReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        func num(_ value: Float?) -> String { value.map { String(format: "%.3f", $0) } ?? "—" }
+        func rate(_ count: Int, _ total: Int) -> String { total > 0 ? "\(count)/\(total)" : "—" }
+        var lines: [String] = ["arm \(report.arm) against the reference braid (\(report.referenceArm ?? "eos-first windows"))", ""]
+        lines.append(Format.table(
+            ["braid", "facts exact", "led+cited", "cit@1", "break written", "ran together", "citations on a break"],
+            report.braids.map { braid in
+                [braid.braid, "\(braid.facts.factsExact)/\(braid.facts.facts)", pct(braid.facts.factsOwnedRate), pct(braid.facts.citation),
+                 rate(braid.breaksWritten, braid.continuations), rate(braid.ranTogether, braid.continuations),
+                 "\(braid.citationsOnBreaks) of \(braid.citations)"]
+            }))
+        lines.append("")
+        lines.append(Format.table(
+            ["braid", "node", "steps to 97%", "memorised", "held-out own", "held-out commons", "greedy facts", "break likeliest"],
+            report.nodes.map { node in
+                [node.braid, node.node, node.stepsTo97.map(String.init) ?? "never", pct(node.memorised), num(node.heldOutLoss), num(node.commonsLoss),
+                 "\(node.greedyCorrect)/\(node.greedyFacts)", node.boundaries > 0 ? "\(pct(node.breakRate)) of \(node.boundaries)" : "—"]
+            }))
+        lines.append("")
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append("")
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
+}
+
+extension BraidTables {
+    static func umbrella(_ report: UmbrellaReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        func num(_ value: Float?) -> String { value.map { String(format: "%.3f", $0) } ?? "—" }
+        var lines: [String] = ["pack \(report.pack.map { String($0.prefix(12)) } ?? "none")", ""]
+        // A set an arm did not run (the ceiling runs facts only) shows "—", not a zero.
+        let rows = (report.arms + (report.ceiling.map { [$0] } ?? [])).map { arm -> [String] in
+            [arm.arm, "\(arm.factsExact)/\(arm.facts)", arm.facts > 0 ? pct(arm.factsOwnedRate) : "—", pct(arm.citation),
+             num(arm.ownerShare), pct(arm.liftPositive), arm.pairs > 0 ? pct(arm.pairsMovedRate) : "—", pct(arm.commonsLeads),
+             num(arm.commonsThreadShare), arm.heldOutTokens > 0 ? String(format: "%.4f", arm.heldOutNLL) : "—",
+             arm.toldTokens > 0 ? num(arm.toldSourceShare) : "—"]
+        }
+        lines.append(Format.table(
+            ["arm", "facts exact", "led+cited", "cit@1", "owner", "lift>0", "pairs moved", "commons leads", "Threads take", "held-out NLL", "told source"],
+            rows))
+        lines.append("")
+        for node in report.nodes {
+            lines.append("\(node.braid) \(node.node) v\(node.version): \(node.documents) documents, memorised \(pct(node.memorised)), 97% after "
+                         + (node.stepsTo97.map { "\($0) steps" } ?? "never") + ", held-out loss own \(num(node.heldOutLoss)) commons \(num(node.commonsLoss))"
+                         + (node.calibration.map { String(format: ", false chains %.3f, τ %.3f, λ ×%.2f", $0.falseChainRate, $0.tau, $0.lambdaScale) } ?? ""))
+        }
+        lines.append("")
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append("")
+        lines.append(report.evaluation.summary)
+        let credited = report.arms.filter { $0.ownerCredit != nil }
+        if !credited.isEmpty {
+            // The owner's blend: form is the commons', content each strand's as it supplied it.
+            lines.append("")
+            lines.append("credit, weighted by bits: form tokens are the commons', content tokens are each strand's as it supplied them")
+            lines.append(Format.table(
+                ["arm", "owner, its answers", "form share of answer bits", "commons, general text", "Threads, own unfed text", "source, told answers"],
+                credited.map { arm in
+                    [arm.arm, num(arm.ownerCredit), pct(arm.formBits), num(arm.commonsCreditGeneral), num(arm.threadsCreditOwnVoice),
+                     num(arm.toldSourceCredit)]
+                }))
+        }
+        if let every = report.allFacts, let evaluation = report.allFactsEvaluation {
+            // The second reading: the fact rules on every fact prompt.
+            let all = every + (report.allFactsCeiling.map { [$0] } ?? [])
+            lines.append("")
+            lines.append("every fact (\(every.first?.facts ?? 0) prompts): the fact rules read on all of them, one prompt in 30 as a rate")
+            lines.append(Format.table(
+                ["arm", "facts exact", "led+cited", "cit@1", "owner", "lift>0", "owner credit"],
+                all.map { arm in
+                    [arm.arm, "\(arm.factsExact)/\(arm.facts)", pct(arm.factsOwnedRate), pct(arm.citation), num(arm.ownerShare), pct(arm.liftPositive),
+                     num(arm.ownerCredit)]
+                }))
+            lines.append("")
+            for rule in evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+            lines.append("")
+            lines.append("every fact: " + evaluation.summary)
+        }
+        return lines.joined(separator: "\n")
+    }
+
     static func trajectory(_ report: TrajectoryReport) -> String {
         var lines: [String] = []
         let nodes = report.nodes.sorted { $0.key < $1.key }.map { name, version in
@@ -648,10 +929,13 @@ extension BraidTables {
 
 /// Waits for nodes to finish the update a feed started.
 enum BraidWait {
-    static func settled(_ session: BraidSession, after versions: [String: Int], stop: StopSignal, timeout: TimeInterval = 900) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
+    /// Waits until every node in `versions` has a new version, is held or has failed. It gives up
+    /// only when no node has reported progress for `stall` seconds: a node of a larger preset takes
+    /// longer, and keeps saying so.
+    static func settled(_ session: BraidSession, after versions: [String: Int], stop: StopSignal, stall: TimeInterval = 600) async throws {
         var reported: [String: String] = [:]
-        while Date() < deadline {
+        var progressed = Date()
+        while true {
             if stop.isSet { throw CancellationError() }
             var done = true
             for (name, before) in versions {
@@ -662,13 +946,16 @@ enum BraidWait {
                 let line = BraidPrinter.progress(state)
                 if reported[name] != line {
                     reported[name] = line
+                    progressed = Date()
                     print("  \(line)")
                 }
             }
             if done { return }
+            if Date().timeIntervalSince(progressed) > stall {
+                throw RaoLMFailure("the nodes made no progress for \(Int(stall)) s", hint: "raolm braid status; see <data root>/braid/nodes/*/logs", code: 75)
+            }
             try await Task.sleep(nanoseconds: 500_000_000)
         }
-        throw RaoLMFailure("the nodes did not settle within \(Int(timeout)) s", hint: "raolm braid status; see <data root>/braid/nodes/*/logs", code: 75)
     }
 }
 
@@ -760,7 +1047,10 @@ enum BraidTables {
             shares.append(values.isEmpty ? "—" : Format.pct(Stats.mean(values)))
         }
         let first = generated.first
-        let gate = first?.strands?.map { "\($0.strand.prefix(1))\($0.open ? "●" : "○")\(Format.f($0.gate, 2))" }.joined(separator: " ") ?? "—"
+        let gate = first?.strands?.map { strand in
+            let label = strand.strand == BraidStrandRef.commonsName ? strand.strand : String(strand.strand.prefix(1))
+            return "\(label)\(strand.open ? "●" : "○")\(Format.f(strand.gate, 2))"
+        }.joined(separator: " ") ?? "—"
         let citation = first?.citations.first.map { c -> String in
             let strand = generation.braid?.strand(row: c.row)?.label ?? "?"
             return "\(strand) · \(Format.clip(generation.partition(row: c.row)?.documentName ?? "?", 22))"

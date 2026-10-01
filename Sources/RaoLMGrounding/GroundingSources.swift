@@ -260,13 +260,17 @@ public enum GroundingSources {
         return order.map { groups[$0, default: []].sorted { $0.ref.partitionIndex < $1.ref.partitionIndex } }
     }
 
-    /// `[eos] + D₁ + [eos] + D₂ + … + [eos] + prompt`.
-    public static func contextTokens(sources: [GroundingSource], prompt: [Int], eos: Int) -> [Int] {
+    /// `[eos] + D₁ + [eos] + D₂ + … + [eos] + prompt`; a document's partitions joined by the run's
+    /// paragraph break, as its training stream joined them (nothing in runs made before the break).
+    public static func contextTokens(sources: [GroundingSource], prompt: [Int], eos: Int, paragraphBreak: [Int] = []) -> [Int] {
         var tokens: [Int] = []
-        tokens.reserveCapacity(contextLength(sources: sources, promptCount: prompt.count))
+        tokens.reserveCapacity(contextLength(sources: sources, promptCount: prompt.count, paragraphBreak: paragraphBreak))
         for document in documents(sources) {
             tokens.append(eos)
-            for source in document { tokens.append(contentsOf: source.tokens) }
+            for (n, source) in document.enumerated() {
+                if n > 0 { tokens.append(contentsOf: paragraphBreak) }
+                tokens.append(contentsOf: source.tokens)
+            }
         }
         tokens.append(eos)
         tokens.append(contentsOf: prompt)
@@ -274,9 +278,10 @@ public enum GroundingSources {
     }
 
     /// `contextTokens(…).count` without building it.
-    public static func contextLength(sources: [GroundingSource], promptCount: Int) -> Int {
+    public static func contextLength(sources: [GroundingSource], promptCount: Int, paragraphBreak: [Int] = []) -> Int {
         let documents = documents(sources)
-        return documents.reduce(0) { $0 + 1 + $1.reduce(0) { $0 + $1.tokens.count } } + 1 + promptCount
+        return documents.reduce(0) { $0 + 1 + $1.reduce(0) { $0 + $1.tokens.count } + max(0, $1.count - 1) * paragraphBreak.count }
+            + 1 + promptCount
     }
 
     /// The generated tokens, plus EOS when generation stopped on it and `includeEOS` is set:
@@ -287,9 +292,9 @@ public enum GroundingSources {
 
     /// Drop the least-cited sources (the last listed among equals) until the context fits
     /// `budget` tokens. Always keeps one: the caller refuses a context that still does not fit.
-    public static func fit(_ sources: [GroundingSource], promptCount: Int, budget: Int) -> [GroundingSource] {
+    public static func fit(_ sources: [GroundingSource], promptCount: Int, budget: Int, paragraphBreak: [Int] = []) -> [GroundingSource] {
         var kept = sources
-        while kept.count > 1, contextLength(sources: kept, promptCount: promptCount) > budget {
+        while kept.count > 1, contextLength(sources: kept, promptCount: promptCount, paragraphBreak: paragraphBreak) > budget {
             var victim = kept.count - 1
             for i in kept.indices.reversed() where kept[i].citationWeight < kept[victim].citationWeight { victim = i }
             kept.remove(at: victim)

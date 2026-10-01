@@ -26,7 +26,7 @@ struct RaoLMCommand: AsyncParsableCommand {
         version: RaoLMVersion.string,
         subcommands: [
             Doctor.self, CorpusGroup.self, DatasetGroup.self, ThreadGroup.self, Train.self, GenerateText.self, Verify.self,
-            Ground.self, Ledger.self, Eval.self, Demo.self, BraidGroup.self, NodeGroup.self, StudioCommand.self,
+            Ground.self, Ledger.self, Eval.self, Demo.self, BraidGroup.self, UmbrellaGroup.self, NodeGroup.self, StudioCommand.self,
         ]
     )
 

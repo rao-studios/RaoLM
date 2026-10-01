@@ -69,6 +69,10 @@ public struct BraidOptions: Sendable {
     /// Nodes fed from another world start over, as `fresh` would have them, instead of being
     /// refused: the studio's dataset switch (d).
     public var freshIfOtherWorld = false
+    /// Whether the caller named the model preset; if not, a braid keeps the one world.json records.
+    public var presetRequested = false
+    /// Whether the caller named the training arm; if not, a braid keeps the one world.json records.
+    public var armRequested = false
 
     public init(root: DataRoot, executable: URL) {
         self.root = root
@@ -76,6 +80,18 @@ public struct BraidOptions: Sendable {
     }
 
     public var layout: BraidLayout { BraidLayout(dataRoot: root) }
+
+    /// The preset and the training arm world.json records, unless the caller named them; a
+    /// recorded braid keeps its arm, none included. A new braid (no world.json, or fresh) of the
+    /// base preset trains `HypervisorSettings.baseArm` unless the caller named an arm.
+    public mutating func restorePreset() {
+        if !fresh, let record = MockWorld.Record.load(layout) {
+            if !presetRequested, let preset = record.preset { settings.preset = preset }
+            if !armRequested { settings.arm = record.arm }
+        } else if !armRequested, settings.preset == "base" {
+            settings.arm = HypervisorSettings.baseArm
+        }
+    }
 }
 
 /// One streamed token of a braided generation.
@@ -118,6 +134,8 @@ public final class BraidSession: @unchecked Sendable {
     public let layout: BraidLayout
     public let world: MockWorld
     public let vocabularySHA256: String
+    /// The umbrella pack every node mirrors when it has a base model.
+    public let packSHA256: String?
     private let lock = NSLock()
     private var handles: [String: Handle] = [:]
     public let onEvent: @Sendable (BraidEvent) -> Void
@@ -130,7 +148,9 @@ public final class BraidSession: @unchecked Sendable {
         var source: CorpusSource?
     }
 
-    public init(options requested: BraidOptions, vocabularySHA256: String, onEvent: @escaping @Sendable (BraidEvent) -> Void) throws {
+    public init(
+        options requested: BraidOptions, vocabularySHA256: String, packSHA256: String? = nil, onEvent: @escaping @Sendable (BraidEvent) -> Void
+    ) throws {
         var options = requested
         adopted = Self.adopt(&options) ? requested.nodes.map(\.name) : nil
         for spec in options.nodes where !BraidLayout.isValidName(spec.name) {
@@ -139,6 +159,7 @@ public final class BraidSession: @unchecked Sendable {
         self.options = options
         self.layout = options.layout
         self.vocabularySHA256 = vocabularySHA256
+        self.packSHA256 = packSHA256
         self.onEvent = onEvent
         if let dataset = options.dataset {
             self.world = try MockWorld(dataset: dataset, names: options.nodes.map(\.name))
@@ -177,7 +198,12 @@ public final class BraidSession: @unchecked Sendable {
     }
 
     /// What world.json records for this session's world.
-    public var worldRecord: MockWorld.Record { world.record }
+    public var worldRecord: MockWorld.Record {
+        var record = world.record
+        record.preset = options.settings.preset == "tiny" ? nil : options.settings.preset
+        record.arm = options.settings.arm
+        return record
+    }
 
     /// Refuses to start on nodes fed from another mock world: their feeds would name documents
     /// this world does not have, or deal them to other Threads. `--fresh` starts over.
@@ -242,7 +268,8 @@ public final class BraidSession: @unchecked Sendable {
                 ports = (h, g)
             }
             let serve = NodeServerOptions(
-                name: spec.name, label: spec.label, root: layout.root.path, vocabularySHA256: vocabularySHA256, offline: options.offline,
+                name: spec.name, label: spec.label, root: layout.root.path, vocabularySHA256: vocabularySHA256, packSHA256: packSHA256,
+                offline: options.offline,
                 threadBinary: options.threadBinary, httpPort: ports?.0, grpcPort: ports?.1, owner: options.owner, settings: options.settings)
             let serveFile = node.directory.appendingPathComponent(NodeServerOptions.fileName)
             try JSONCoding.write(serve, to: serveFile)
@@ -456,22 +483,39 @@ public enum BraidVocabulary {
 }
 
 public final class BraidUmbrella {
-    public let vocabulary: VocabularyPack
+    public let pack: UmbrellaPack
+    public var vocabulary: VocabularyPack { pack.vocabulary }
     public let head: UmbrellaHead
     public let tokenizer: RaoTokenizer
+    /// The pack's base model as the commons strand, when the pack has one: every generation asks it.
+    public let commons: CommonsLink?
 
-    public init(vocabulary: VocabularyPack, tokenizer: RaoTokenizer) {
-        self.vocabulary = vocabulary
-        self.head = UmbrellaHead(vocabulary: vocabulary)
+    public convenience init(vocabulary: VocabularyPack, tokenizer: RaoTokenizer) {
+        // A vocabulary alone has no base model, so this cannot throw.
+        try! self.init(pack: UmbrellaPack(vocabulary: vocabulary), tokenizer: tokenizer)
+    }
+
+    public init(pack: UmbrellaPack, tokenizer: RaoTokenizer) throws {
+        self.pack = pack
+        self.head = UmbrellaHead(vocabulary: pack.vocabulary)
         self.tokenizer = tokenizer
+        self.commons = pack.hasBase ? try CommonsLink(pack: pack, tokenizerSHA256: tokenizer.tokenizerSHA256) : nil
+    }
+
+    /// What the umbrella requires a Thread to run beside the vocabulary: the pack, when it has a trunk.
+    public var packSHA256: String? { pack.hasTrunk ? pack.sha256 : nil }
+
+    /// A generator over `links` and, when there is one, the commons strand.
+    public func generator(links: [StrandLink], gateFloor: Float = BraidMixer.defaultGateFloor) throws -> BraidedGenerator {
+        try BraidedGenerator(links: links + (commons.map { [$0] } ?? []), head: head, tokenizer: tokenizer, gateFloor: gateFloor,
+                             packSHA256: packSHA256)
     }
 
     public func generate(
         links: [StrandLink], request: BraidRequest, onPrompt: (([TokenTrace]) throws -> Void)? = nil,
         onStep: ((BraidStep) throws -> Void)? = nil
     ) throws -> CitedGeneration {
-        let generator = try BraidedGenerator(links: links, head: head, tokenizer: tokenizer, gateFloor: request.gateFloor)
-        return try generator.generate(request, onPrompt: onPrompt, onStep: onStep)
+        try generator(links: links, gateFloor: request.gateFloor).generate(request, onPrompt: onPrompt, onStep: onStep)
     }
 }
 

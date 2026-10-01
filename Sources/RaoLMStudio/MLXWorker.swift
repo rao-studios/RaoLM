@@ -189,13 +189,22 @@ final class MLXWorker: @unchecked Sendable {
         braidOptions.freshIfOtherWorld = switching
         braidOptions.threadBinary = options.threadBinary
         braidOptions.seed = options.braidSeed
+        if let preset = options.braidPreset {
+            braidOptions.settings.preset = preset
+            braidOptions.presetRequested = true
+        }
         try world.apply(to: &braidOptions)
+        braidOptions.restorePreset()
         try Preflight.requireMetallib()
         let tokenizer = try tokenizer()
-        let vocabulary = try BraidVocabulary.ensure(layout: braidOptions.layout, config: try braidOptions.settings.modelConfig(), tokenizer: tokenizer)
-        session.umbrella = BraidUmbrella(vocabulary: vocabulary, tokenizer: tokenizer)
         let post = self.post
-        let started = try BraidSession(options: braidOptions, vocabularySHA256: vocabulary.sha256) { event in post(.braid(event)) }
+        let pack = try UmbrellaPacks.ensure(layout: braidOptions.layout, config: try braidOptions.settings.modelConfig(), tokenizer: tokenizer) {
+            post(.log("umbrella pack: \($0)"))
+        }
+        session.umbrella = try BraidUmbrella(pack: pack, tokenizer: tokenizer)
+        let started = try BraidSession(
+            options: braidOptions, vocabularySHA256: pack.vocabulary.sha256, packSHA256: pack.hasBase ? pack.sha256 : nil
+        ) { event in post(.braid(event)) }
         started.exampleTokenizer = tokenizer
         braid.session = started
         post(.braidSource(started.worldRecord.dataset))

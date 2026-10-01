@@ -87,6 +87,55 @@ public final class ProvenanceIndex {
         return Array(ranked.prefix(k))
     }
 
+    /// The `k` nearest entries to each row of `queries` ([T, D], unit norm), by cosine, never an
+    /// entry in `excluding` (a document's own entries: they sit together, in corpus order).
+    public func query(batch queries: MLXArray, k: Int, excluding: Range<Int>? = nil) -> [[(entry: Int, score: Float)]] {
+        let n = count
+        let rows = queries.dim(0)
+        guard n > 0, k > 0, rows > 0 else { return Array(repeating: [], count: rows) }
+        var scores = matmul(queries, keys.T)
+        if let excluding {
+            let range = excluding.clamped(to: 0..<n)
+            if !range.isEmpty {
+                var mask = [Float](repeating: 0, count: n)
+                for i in range { mask[i] = -Float.infinity }
+                scores = scores + MLXArray(mask, [1, n])
+            }
+        }
+        let m = min(k + 8, n)
+        let candidates = m >= n ? argSort(-scores, axis: -1) : argPartition(-scores, kth: m - 1, axis: -1)[0..., 0..<m]
+        let candidateScores = takeAlong(scores, candidates, axis: -1)
+        eval(candidates, candidateScores)
+        let width = candidates.dim(1)
+        let entries = candidates.asType(.int32).asArray(Int32.self)
+        let values = candidateScores.asArray(Float.self)
+        var result: [[(entry: Int, score: Float)]] = []
+        result.reserveCapacity(rows)
+        for r in 0..<rows {
+            var row: [(entry: Int, score: Float)] = []
+            for c in 0..<width where values[r * width + c].isFinite {
+                row.append((entry: Int(entries[r * width + c]), score: values[r * width + c]))
+            }
+            row.sort { $0.score != $1.score ? $0.score > $1.score : $0.entry < $1.entry }
+            result.append(Array(row.prefix(k)))
+        }
+        return result
+    }
+
+    /// Each document's entries, which sit together in corpus order.
+    public lazy var entriesByDocument: [String: Range<Int>] = {
+        var ranges: [String: Range<Int>] = [:]
+        for entry in 0..<count {
+            guard let documentID = partitionsByRow[Int(keyRow[entry])]?.documentID else { continue }
+            if let range = ranges[documentID] {
+                ranges[documentID] = min(range.lowerBound, entry)..<max(range.upperBound, entry + 1)
+            } else {
+                ranges[documentID] = entry..<(entry + 1)
+            }
+        }
+        return ranges
+    }()
+
     public func keyPosition(_ entry: Int) -> TokenPosition {
         TokenPosition(row: Int(keyRow[entry]), offset: Int(keyOffset[entry]))
     }

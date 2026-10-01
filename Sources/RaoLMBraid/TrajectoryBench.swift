@@ -207,11 +207,12 @@ public enum TrajectoryBench {
     ) throws -> TrajectoryReport {
         let record = MockWorld.Record.load(layout)
         let world = try RoutingBench.world(layout: layout, seed: record?.seed ?? 42)
-        let (vocabulary, strands) = try RoutingBench.strands(layout: layout, tokenizer: tokenizer, owner: owner, names: world.names)
+        let (pack, strands) = try RoutingBench.packStrands(layout: layout, tokenizer: tokenizer, owner: owner, names: world.names)
         guard !strands.isEmpty else { throw BraidSessionError.noLiveNodes }
-        let links = strands.map { LocalStrandLink(strand: $0, vocabularySHA256: vocabulary.sha256) }
-        let generator = try BraidedGenerator(links: links, head: UmbrellaHead(vocabulary: vocabulary), tokenizer: tokenizer)
-        let texts = TrajectoryTexts.build(world: world, layout: layout, names: strands.map(\.name), tokenizer: tokenizer, sizes: sizes)
+        let (_, links, generator) = try RoutingBench.umbrella(pack: pack, strands: strands, tokenizer: tokenizer)
+        // Texts are read the way the braid's indexes read documents: with the paragraph break, if any.
+        let texts = TrajectoryTexts.build(world: world, layout: layout, names: strands.map(\.name), tokenizer: tokenizer, sizes: sizes,
+                                          paragraphBreak: strands.first?.index.info.paragraphBreak ?? [])
         progress?("texts: " + TrajectoryTextKind.allCases.map { kind in "\(kind.rawValue) \(texts.filter { $0.kind == kind }.count)" }
             .joined(separator: " · "))
 
@@ -542,13 +543,18 @@ public enum TrajectoryTexts {
         return units.filter { !$0.isEmpty }
     }
 
-    /// A document's tokens as its Thread tokenized it (each partition on its own, nothing between),
-    /// and its sentences' tokens; no sentences when re-joining them would not give those tokens.
-    static func split(_ document: CorpusDocument, tokenizer: RaoTokenizer) -> (tokens: [Int], units: [[Int]]?) {
+    /// A document's tokens as its Thread tokenized it (each partition on its own, joined by the
+    /// stream's paragraph break or with nothing), and its sentences' tokens, a break riding on the
+    /// sentence before it; no sentences when re-joining them would not give those tokens.
+    static func split(_ document: CorpusDocument, tokenizer: RaoTokenizer, paragraphBreak: [Int] = []) -> (tokens: [Int], units: [[Int]]?) {
         var tokens: [Int] = []
         var units: [[Int]] = []
         var exact = true
-        for partition in document.partitions.sorted(by: { $0.index < $1.index }) {
+        for (n, partition) in document.partitions.sorted(by: { $0.index < $1.index }).enumerated() {
+            if n > 0 {
+                tokens += paragraphBreak
+                if exact, !units.isEmpty { units[units.count - 1] += paragraphBreak }
+            }
             let own = tokenizer.encode(partition.text)
             tokens += own
             let pieces = sentences(partition.text).enumerated().map { i, piece in tokenizer.encode(i == 0 ? piece : " " + piece) }
@@ -568,7 +574,7 @@ public enum TrajectoryTexts {
     }
 
     /// Where each located fact's answer sits in the document's tokens.
-    static func answers(_ document: CorpusDocument, facts ids: Set<String>, tokenizer: RaoTokenizer) -> [TrajectoryAnswer] {
+    static func answers(_ document: CorpusDocument, facts ids: Set<String>, tokenizer: RaoTokenizer, paragraphBreak: [Int] = []) -> [TrajectoryAnswer] {
         let corpus = GeneratedCorpus(
             manifest: CorpusManifest(slug: "bench", generator: SyntheticCorpus.generatorName, generatorVersion: 1, seed: 0, documentCount: 1,
                                      partitionCount: 0, factCount: 0, chunkMaxChars: 600, chunkMinChars: 120, documentIDs: [document.id],
@@ -578,6 +584,7 @@ public enum TrajectoryTexts {
         var starts: [Int] = []
         var total = 0
         for partition in tokenized.partitions {
+            if !starts.isEmpty { total += paragraphBreak.count }
             starts.append(total)
             total += partition.tokens.count
         }
@@ -587,13 +594,14 @@ public enum TrajectoryTexts {
     }
 
     public static func build(
-        world: MockWorld, layout: BraidLayout, names: [String], tokenizer: RaoTokenizer, sizes: TrajectoryBench.Sizes
+        world: MockWorld, layout: BraidLayout, names: [String], tokenizer: RaoTokenizer, sizes: TrajectoryBench.Sizes,
+        paragraphBreak: [Int] = []
     ) -> [TrajectoryText] {
         var rng = SplitMix64(seed: sizes.seed)
         var cache: [String: (tokens: [Int], units: [[Int]]?)] = [:]
         func pieces(_ document: CorpusDocument) -> (tokens: [Int], units: [[Int]]?) {
             if let cached = cache[document.id] { return cached }
-            let made = split(document, tokenizer: tokenizer)
+            let made = split(document, tokenizer: tokenizer, paragraphBreak: paragraphBreak)
             cache[document.id] = made
             return made
         }
@@ -654,14 +662,14 @@ public enum TrajectoryTexts {
                 texts.append(TrajectoryText(
                     kind: .told, label: "\(link.target.node) ≈ \(link.source.node) · \(link.subject) (\(link.kind.rawValue))",
                     tokens: pieces(target).tokens, owner: link.target.node, near: link.source.node, document: target.id,
-                    answers: answers(target, facts: Set(agreeing.map(\.targetFact)), tokenizer: tokenizer)))
+                    answers: answers(target, facts: Set(agreeing.map(\.targetFact)), tokenizer: tokenizer, paragraphBreak: paragraphBreak)))
             }
             if !sources.contains(source.id), retold.contains(pieces(source).tokens.count) {
                 sources.insert(source.id)
                 texts.append(TrajectoryText(
                     kind: .source, label: "\(link.source.node) → \(link.target.node) · \(link.subject)", tokens: pieces(source).tokens,
                     owner: link.source.node, near: link.target.node, document: source.id,
-                    answers: answers(source, facts: Set(agreeing.map(\.sourceFact)), tokenizer: tokenizer)))
+                    answers: answers(source, facts: Set(agreeing.map(\.sourceFact)), tokenizer: tokenizer, paragraphBreak: paragraphBreak)))
             }
         }
         for (i, passage) in generic.enumerated() {

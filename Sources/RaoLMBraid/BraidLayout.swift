@@ -9,6 +9,8 @@
 //    <data root>/braid/
 //      world.json                    the mock world the nodes were fed from (names, seed, shape)
 //      vocabulary/<hash12>/          vocabulary.safetensors, vocabulary.json
+//      umbrella/<hash12>/            a pack with a base model: the vocabulary's files, base.safetensors,
+//                                    anchors, heldout.jsonl, pack.json
 //      nodes/<name>/
 //        node.json                   who the node is (ports, node id, processes)
 //        thread-db/                  the node's Thread storage (a Thread in open mode)
@@ -17,6 +19,7 @@
 //        versions/v0001/             run.json, checkpoints/, provenance/, ledger/, version.json
 //        live.json                   the version the umbrella uses
 //        facts.jsonl, feed.json      what the mock feeder deposited (demo data only)
+//        heldout.jsonl               documents of the node's world it was not fed, for its held-out loss
 //        logs/                       node.log, thread.log
 //
 //  PIN:  Never the studio's own thread-db: a braid's Threads are exclusive to it.
@@ -39,6 +42,11 @@ public struct BraidLayout: Sendable, Equatable {
     public var vocabularies: URL { root.appendingPathComponent("vocabulary", isDirectory: true) }
     public func vocabulary(sha256: String) -> URL {
         vocabularies.appendingPathComponent(String(sha256.prefix(12)), isDirectory: true)
+    }
+    /// Umbrella packs with a base model; a pack that is a vocabulary alone lives under `vocabularies`.
+    public var packs: URL { root.appendingPathComponent("umbrella", isDirectory: true) }
+    public func pack(sha256: String) -> URL {
+        packs.appendingPathComponent(String(sha256.prefix(12)), isDirectory: true)
     }
     public var nodes: URL { root.appendingPathComponent("nodes", isDirectory: true) }
     public func node(_ name: String) -> NodeLayout { NodeLayout(directory: nodes.appendingPathComponent(name, isDirectory: true)) }
@@ -68,6 +76,7 @@ public struct NodeLayout: Sendable, Equatable {
     }
     public var live: URL { directory.appendingPathComponent("live.json") }
     public var facts: URL { directory.appendingPathComponent("facts.jsonl") }
+    public var heldOut: URL { directory.appendingPathComponent("heldout.jsonl") }
     public var feed: URL { directory.appendingPathComponent("feed.json") }
     public var offlineID: URL { directory.appendingPathComponent("offline-node-id") }
     public var logs: URL { directory.appendingPathComponent("logs", isDirectory: true) }
@@ -127,6 +136,13 @@ public struct NodeVersion: Codable, Sendable, Equatable {
     public var promoted: Bool
     public var seconds: Double
     public var createdAt: Date
+    /// The umbrella pack when it has a trunk.
+    public var packSHA256: String?
+    /// Mean loss on unfed documents in the Thread's own voice, and on the pack's commons sample.
+    public var heldOutLoss: Float?
+    public var commonsLoss: Float?
+    /// λ and τ the version set from its corpus's self-trajectory, when it did.
+    public var calibration: StrandCalibration?
 
     public static let fileName = "version.json"
 

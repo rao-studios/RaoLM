@@ -119,6 +119,71 @@ struct MockWorldTests {
         #expect(throws: MockWorldError.self) { try session("ambient,craft,veil").checkWorld() }
     }
 
+    @Test("the training arm is part of the world: a braid keeps its own unless one is named, and refuses another")
+    func armGuard() throws {
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        func options(arm: String?, fresh: Bool = false) throws -> BraidOptions {
+            var options = BraidOptions(root: DataRoot(url: root), executable: URL(fileURLWithPath: "/usr/bin/true"))
+            options.nodes = try BraidNodeSpec.parse("ambient,craft")
+            options.documentsPerNode = 2
+            options.fresh = fresh
+            if let arm {
+                options.settings.arm = arm
+                options.armRequested = true
+            }
+            options.restorePreset()
+            return options
+        }
+        func session(arm: String?) throws -> BraidSession { try BraidSession(options: try options(arm: arm), vocabularySHA256: "v") { _ in } }
+        let armed = try session(arm: "passage-break")
+        try armed.checkWorld()
+        try armed.worldRecord.save(armed.layout)
+        #expect(MockWorld.Record.load(armed.layout)?.arm == "passage-break")
+        #expect(MockWorld.Record.load(armed.layout)?.summary.hasSuffix(" · arm passage-break") == true)
+        // Named no arm, the braid keeps its own; fresh, it starts from what was asked.
+        #expect(try options(arm: nil).settings.arm == "passage-break")
+        try session(arm: nil).checkWorld()
+        #expect(try options(arm: nil, fresh: true).settings.arm == nil)
+        // Nodes trained without the arm are another world.
+        var plain = armed.worldRecord
+        plain.arm = nil
+        #expect(!plain.sameWorld(as: armed.worldRecord))
+        try plain.save(armed.layout)
+        #expect(throws: MockWorldError.self) { try session(arm: "passage-break").checkWorld() }
+        try session(arm: nil).checkWorld()
+    }
+
+    @Test("a new base braid trains the adopted arm; a recorded braid keeps its own, none included")
+    func baseArm() throws {
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        func options(preset: String?, arm: String? = nil, fresh: Bool = false) -> BraidOptions {
+            var options = BraidOptions(root: DataRoot(url: root), executable: URL(fileURLWithPath: "/usr/bin/true"))
+            if let preset {
+                options.settings.preset = preset
+                options.presetRequested = true
+            }
+            if let arm {
+                options.settings.arm = arm
+                options.armRequested = true
+            }
+            options.fresh = fresh
+            options.restorePreset()
+            return options
+        }
+        #expect(options(preset: "base").settings.arm == HypervisorSettings.baseArm)
+        #expect(options(preset: nil).settings.arm == nil, "tiny trains no arm")
+        // A base braid recorded before the arm was adopted keeps its eos-first windows.
+        let layout = BraidLayout(dataRoot: DataRoot(url: root))
+        try FileManager.default.createDirectory(at: layout.world.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try MockWorld.Record(names: ["ambient"], seed: 42, shape: MockShape(documentsPerNode: 2), preset: "base").save(layout)
+        #expect(options(preset: nil).settings.preset == "base" && options(preset: nil).settings.arm == nil)
+        #expect(options(preset: "base").settings.arm == nil)
+        // Started over, it trains the adopted arm.
+        #expect(options(preset: "base", fresh: true).settings.arm == HypervisorSettings.baseArm)
+    }
+
     @Test("a world read from a dataset: its shards in feeding order, both sides of a link kept out of the exclusive sets, retold facts as examples")
     func datasetWorld() async throws {
         let root = temporary()

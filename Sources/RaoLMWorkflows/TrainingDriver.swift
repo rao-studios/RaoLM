@@ -123,7 +123,7 @@ public enum TrainingDriver {
         }
         let located = FactLocator.locate(facts, corpus: corpus, tokenizer: tokenizer)
 
-        let provenance = ProvenanceSettings(tapLayer: settings.tapLayer ?? config.numHiddenLayers / 2, alpha: settings.alpha)
+        let provenance = ProvenanceSettings(tapLayer: settings.tapLayer ?? config.defaultTapLayer, alpha: settings.alpha)
         let model = try RaoTransformer.make(config: config, seed: hyper.seed, tapLayer: provenance.tapLayer)
         let manifest = RunManifest(
             runID: plan.runID, preset: settings.preset, model: config, tokenizer: tokenizer.ref,

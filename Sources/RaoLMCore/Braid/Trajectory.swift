@@ -87,12 +87,13 @@ public struct TrajectoryCorpus: Sendable {
     public let keyOffset: [Int32]
     public let documents: [Int32]
     public let positions: [Int32]
-    /// Per document ordinal: its tokens, the sum of its partitions' token counts.
+    /// Per document ordinal: its tokens, the sum of its partitions' token counts and the breaks between.
     public let lengths: [Int32]
 
     /// `partitions` is the index's partition table: a document's rows in any order, each with its
-    /// partition index and token count.
-    public init(values: [Int32], keyRow: [Int32], keyOffset: [Int32], partitions: [PartitionRef]) {
+    /// partition index and token count. `breakLength` is how many tokens join two partitions in the
+    /// index's documents (the paragraph break's), so positions run on across a break.
+    public init(values: [Int32], keyRow: [Int32], keyOffset: [Int32], partitions: [PartitionRef], breakLength: Int = 0) {
         precondition(values.count == keyRow.count && values.count == keyOffset.count)
         var ordinal: [String: Int32] = [:]
         var byDocument: [String: [PartitionRef]] = [:]
@@ -106,10 +107,12 @@ public struct TrajectoryCorpus: Sendable {
         for (documentID, rows) in byDocument {
             let document = ordinal[documentID]!
             var start: Int32 = 0
-            for partition in rows.sorted(by: { $0.partitionIndex < $1.partitionIndex }) {
+            let ordered = rows.sorted(by: { $0.partitionIndex < $1.partitionIndex })
+            for (n, partition) in ordered.enumerated() {
                 rowDocument[partition.row] = document
                 rowStart[partition.row] = start
                 start += Int32(partition.tokenCount)
+                if n < ordered.count - 1 { start += Int32(breakLength) }
             }
             lengths[Int(document)] = start
         }

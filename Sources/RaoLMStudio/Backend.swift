@@ -36,6 +36,8 @@ public struct StudioOptions: Sendable {
     /// The nodes the braid panel shows before its first start.
     public var braidNodes: [BraidNodeSpec] = BraidNodeSpec.defaults
     public var braidSeed: UInt64 = 42
+    /// The model preset the braid's nodes train; nil keeps the braid's own (world.json), else tiny.
+    public var braidPreset: String?
     /// The nodes and dataset `raolm braid --nodes … --dataset …` named, which the panel starts
     /// with (d changes the dataset). Naming neither, a braid that already has nodes keeps them.
     public var braidWorld = BraidWorldChoice()

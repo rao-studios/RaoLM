@@ -73,6 +73,27 @@ struct TrajectoryTests {
         #expect(corpus.lengths.map(Int.init) == [60, 40, 140])
     }
 
+    @Test("with a paragraph break between partitions, positions run on across it and so do chains")
+    func breaks() {
+        // One document of partitions 3, 2 and 4 tokens long, joined by two-token breaks addressed
+        // to the partition they follow: (0, 3), (0, 4), then (1, 2), (1, 3).
+        let partitions = [(0, 0, 3), (1, 1, 2), (2, 2, 4)].map { row, index, tokens in
+            PartitionRef(row: row, documentID: "D", documentName: "D", partitionIndex: index, partitionURL: nil,
+                         threadPartitionID: nil, textSHA256: "\(row)", tokenCount: tokens)
+        }
+        let addresses: [(Int32, Int32)] = [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (2, 2)]
+        let corpus = TrajectoryCorpus(
+            values: addresses.indices.map { Int32($0 + 1) }, keyRow: addresses.map(\.0), keyOffset: addresses.map(\.1),
+            partitions: partitions, breakLength: 2)
+        #expect(corpus.positions.map(Int.init) == Array(0..<12))
+        #expect(corpus.lengths == [13])
+        #expect((0..<11).allSatisfy { corpus.successor(of: $0) == $0 + 1 }, "a chain runs through both breaks")
+        #expect(corpus.successor(of: 11) == nil)
+        // An index made before the break: the next partition starts right after the last token.
+        let before = TrajectoryCorpus(values: [1, 2], keyRow: [0, 1], keyOffset: [2, 0], partitions: partitions)
+        #expect(before.positions == [2, 3] && before.successor(of: 0) == 1 && before.lengths == [9])
+    }
+
     @Test("a text that follows one document counts every token, across a partition boundary, to the document's end")
     func follows() {
         let steps = index.run(a(0..<60))

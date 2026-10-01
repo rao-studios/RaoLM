@@ -496,7 +496,9 @@ enum BraidScreen: StudioScreen {
         }
         let shares = trace.strands ?? []
         let order = shares.map(\.strand)
-        func colour(_ strand: String, _ fallback: Int) -> Color { BraidArt.strandColor(names.firstIndex(of: strand) ?? fallback, palette) }
+        func colour(_ strand: String, _ fallback: Int) -> Color {
+            strand == BraidStrandRef.commonsName ? palette.goldColor : BraidArt.strandColor(names.firstIndex(of: strand) ?? fallback, palette)
+        }
         func display(_ text: String) -> String { text.replacingOccurrences(of: "\n", with: glyphs.newline) }
         var rows: [Text] = []
         // Shares.
@@ -554,6 +556,9 @@ enum BraidScreen: StudioScreen {
                 if let backs = share.backs { line.append(i == leader ? " · leads     " : " · backs \(Format.f(backs, 2))", palette.dim) }
                 if prompt > 0 { line.append(" · knew \(knew(state, share.strand))/\(prompt)", palette.dim) }
                 line.append(" · alone " + (share.alone.map { Format.f($0, 2) } ?? "—"), palette.dim)
+                // With a commons strand: what this Thread knows of the token beyond the base model.
+                if let lift = share.lift { line.append(" · lift \(Format.f(lift, 1))", lift > 0 ? palette.text : palette.dim) }
+                if let thought = share.thought, i != leader { line.append(" · thinks alike \(Format.f(thought, 2))", palette.dim) }
                 // Its trajectory: how many tokens its retrieval has followed one of its documents, and how its hits move through them.
                 if let trajectory = share.trajectory {
                     line.append(" · traced \(trajectory.length)", trajectory.length > TrajectoryRule.standard.phrase ? palette.text : palette.dim)
@@ -653,7 +658,8 @@ enum BraidScreen: StudioScreen {
     }
 
     static func label(_ name: String, _ state: StudioState) -> String {
-        state.braid.nodes.first { $0.name == name }?.label ?? name
+        if name == BraidStrandRef.commonsName { return "Commons" }
+        return state.braid.nodes.first { $0.name == name }?.label ?? name
     }
 
     /// A prompt token: coloured by the Thread that supplied it, muted when no Thread predicted it.
@@ -842,6 +848,11 @@ enum BraidScreen: StudioScreen {
         }
         if let learned = s.factsLearned, let total = s.factsTotal, total > 0 { memory.append(" · facts \(learned)/\(total)", palette.dim) }
         lines.append(memory)
+        if s.heldOutLoss != nil || s.commonsLoss != nil {
+            // Loss on text the node never saw: unfed documents in its own voice, and the commons sample.
+            lines.append(Text("held out ", style: palette.muted) + Text(Format.f(s.heldOutLoss, 2), style: palette.text)
+                + Text(s.commonsLoss.map { " · commons \(Format.f($0, 2))" } ?? "", style: palette.dim))
+        }
         if s.stage == .training || !s.losses.isEmpty {
             let spark = Sparkline(s.losses.map(Double.init), style: Style(foreground: colour, background: palette.base.background), glyphs: glyphs)
                 .string(width: max(4, min(18, rect.width - 16)))

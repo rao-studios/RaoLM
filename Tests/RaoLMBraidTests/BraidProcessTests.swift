@@ -126,15 +126,17 @@ private func run(offline: Bool) async throws {
     #expect(!pids.isEmpty && pids.allSatisfy { kill($0, 0) != 0 }, "every node and Thread process is gone")
 }
 
-@Suite("Braid over node processes", .enabled(if: mlxTests), .serialized)
-struct BraidProcessTests {
-    @Test("the default node processes (ambient, craft, veil) on offline corpora: fed, live, routed, verified, withdrawn, stopped")
-    func offline() async throws {
-        try await run(offline: true)
-    }
+extension BraidMLXSuites {
+    @Suite("Braid over node processes", .serialized)
+    struct BraidProcessTests {
+        @Test("the default node processes (ambient, craft, veil) on offline corpora: fed, live, routed, verified, withdrawn, stopped")
+        func offline() async throws {
+            try await run(offline: true)
+        }
 
-    @Test("the default node processes each with a real Thread", .enabled(if: threadTests))
-    func threads() async throws {
-        try await run(offline: false)
+        @Test("the default node processes each with a real Thread", .enabled(if: threadTests))
+        func threads() async throws {
+            try await run(offline: false)
+        }
     }
 }

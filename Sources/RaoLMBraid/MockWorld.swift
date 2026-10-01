@@ -124,12 +124,17 @@ public final class MockWorld: @unchecked Sendable {
         public var shape: MockShape
         /// The dataset the nodes were fed from; nil for a world generated from the seed and shape.
         public var dataset: MockDatasetSource?
+        /// The model preset the nodes train; nil for `tiny`, the preset before presets were kept.
+        public var preset: String?
+        /// The training arm the nodes train on (`HypervisorSettings.arm`); nil for the reference recipe.
+        public var arm: String?
 
-        public init(names: [String], seed: UInt64, shape: MockShape, dataset: MockDatasetSource? = nil) {
+        public init(names: [String], seed: UInt64, shape: MockShape, dataset: MockDatasetSource? = nil, preset: String? = nil) {
             self.names = names
             self.seed = seed
             self.shape = shape
             self.dataset = dataset
+            self.preset = preset
         }
 
         public static func load(_ layout: BraidLayout) -> Record? { try? JSONCoding.read(Record.self, from: layout.world) }
@@ -139,11 +144,13 @@ public final class MockWorld: @unchecked Sendable {
         /// Whether nodes fed from `self` hold what `other` would feed them.
         public func sameWorld(as other: Record) -> Bool {
             names == other.names && seed == other.seed && shape == other.shape && dataset?.hash == other.dataset?.hash
+                && (preset ?? "tiny") == (other.preset ?? "tiny") && arm == other.arm
         }
 
         public var summary: String {
-            if let dataset { return "nodes \(names.joined(separator: ",")) · dataset \(dataset.name) (\(dataset.hash.prefix(12)))" }
-            return "nodes \(names.joined(separator: ",")) · seed \(seed) · \(shape.documentsPerNode) documents per node"
+            let model = (preset.map { " · preset \($0)" } ?? "") + (arm.map { " · arm \($0)" } ?? "")
+            if let dataset { return "nodes \(names.joined(separator: ",")) · dataset \(dataset.name) (\(dataset.hash.prefix(12)))" + model }
+            return "nodes \(names.joined(separator: ",")) · seed \(seed) · \(shape.documentsPerNode) documents per node" + model
         }
     }
 }
@@ -160,7 +167,7 @@ public enum MockFeeder {
         guard !next.isEmpty else { return [] }
         try await source.deposit(next)
         feed.deposited += next.map(\.id)
-        try save(feed, world: world, layout: layout)
+        try save(feed, world: world, layout: layout, node: node)
         return next
     }
 
@@ -171,16 +178,25 @@ public enum MockFeeder {
         guard let id = feed.present.last else { return nil }
         try await source.withdraw([id])
         feed.withdrawn.append(id)
-        try save(feed, world: world, layout: layout)
+        try save(feed, world: world, layout: layout, node: node)
         return world.document(id: id)
     }
 
-    static func save(_ feed: FeedState, world: MockWorld, layout: NodeLayout) throws {
+    /// Documents of a node's world held out of its feed: the last this many it has not been fed.
+    public static let heldOut = 8
+
+    static func save(_ feed: FeedState, world: MockWorld, layout: NodeLayout, node: String) throws {
         try JSONCoding.write(feed, to: layout.feed)
         let facts = feed.present.compactMap(world.document(id:)).flatMap(\.facts)
         let writer = try JSONLWriter(url: layout.facts, truncate: true)
         for fact in facts { try writer.append(fact) }
         writer.close()
+        // Text in the node's own voice it has never seen, for its held-out loss.
+        let deposited = Set(feed.deposited)
+        let unfed = world.documents(for: node).filter { !deposited.contains($0.id) }.suffix(heldOut)
+        let held = try JSONLWriter(url: layout.heldOut, truncate: true)
+        for document in unfed { try held.append(document) }
+        held.close()
     }
 
     /// The documents the feeder has deposited into a node and not withdrawn, in deposit order.

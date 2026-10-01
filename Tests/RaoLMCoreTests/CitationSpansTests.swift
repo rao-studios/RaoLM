@@ -93,6 +93,25 @@ struct CitationSpansTests {
         #expect(CitationSpans.summary(traces: traces, spans: spans).verbatimSpans == 0)
     }
 
+    @Test("a paragraph break (past its partition's tokens) is never cited, and no span runs onto it")
+    func breaksAreNotCited() {
+        // Partition 0 holds 50 tokens: offsets 50 and 51 are the break that follows it.
+        var traces = [
+            trace(1, token: 1, [(0, 47, 1, 1, true)]),
+            trace(2, token: 2, [(0, 48, 1, 1, true)]),
+            trace(3, token: 3, [(0, 49, 1, 1, true)]),
+            trace(4, token: 4, [(0, 50, 1, 0.9, true), (1, 7, 2, 0.1, true)]),
+            trace(5, token: 5, [(0, 51, 1, 1, true)]),
+        ]
+        #expect(CitationSpans.isBreak(TokenPosition(row: 0, offset: 50), partitions))
+        #expect(!CitationSpans.isBreak(TokenPosition(row: 0, offset: 49), partitions))
+        let spans = CitationSpans.annotate(traces: &traces, partitions: partitions, sharedNgrams: [], threadID: nil)
+        #expect(spans.count == 1 && spans[0].tokenRange == TokenRange(start: 1, end: 4))
+        // The break's own neighbour is skipped; the other partition is still cited.
+        #expect(traces[3].citations.map(\.row) == [1])
+        #expect(traces[4].citations.isEmpty && traces[4].uncited)
+    }
+
     @Test("confidence is bounded and monotone in its factors")
     func confidence() {
         #expect(CitationMath.confidence(score: 1, support: 1, sourceLoss: 0) == 1)

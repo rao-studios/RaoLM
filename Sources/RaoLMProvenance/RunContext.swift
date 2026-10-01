@@ -74,6 +74,10 @@ public final class RunContext {
             throw ProvenanceError.weakIndex(epoch: epoch, memorised: index.info.evalMemorisedFraction)
         }
         let model = try Checkpoint.load(from: checkpointDirectory, tapLayer: index.info.tapLayer)
+        guard IndexInfo.cut(of: model.config) == index.info.cut else {
+            throw ProvenanceError.corruptIndex(
+                "the index was keyed by a model cut at \(index.info.cut.map(String.init) ?? "none"), the checkpoint is cut at \(IndexInfo.cut(of: model.config).map(String.init) ?? "none")")
+        }
         let record = manifest.epochRecord(epoch)
         let ref = ManifestRef(
             runID: manifest.runID, epoch: epoch, checkpointSHA256: checkpointSHA, indexSHA256: index.sha256,
@@ -99,6 +103,7 @@ public final class RunContext {
     }
 
     public func tokenizedCorpus() throws -> TokenizedCorpus {
-        TokenizedCorpus(snapshot: try snapshot(), tokenizer: tokenizer, excluding: Set(manifest.excludedDocumentIDs))
+        TokenizedCorpus(snapshot: try snapshot(), tokenizer: tokenizer, excluding: Set(manifest.excludedDocumentIDs),
+                        paragraphBreak: index.info.paragraphBreak ?? manifest.paragraphBreak ?? [])
     }
 }

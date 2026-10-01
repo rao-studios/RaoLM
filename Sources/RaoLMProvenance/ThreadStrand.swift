@@ -7,7 +7,8 @@
 //        generation it keeps a session — a KV cache, every position's last hidden state, and
 //        the text's trajectory through this Thread's corpus — and answers three questions: the
 //        retrieval hits and trajectory of every prompt position (`open`), those after one more
-//        token (`advance`), and the hidden states the umbrella's head needs (`hidden`).
+//        token (`advance`), and the hidden states the umbrella's head needs (`hidden`), with the
+//        cut state beside each when the umbrella reads the node's thought (`states`).
 //  PIN:  Keys are built exactly as CitedGenerator builds them (the same body, the same final
 //        norm, the same ProvenanceKey), so a braid of one strand retrieves what a single model
 //        retrieves. The trajectory is read from those hits and the session's tokens; it changes
@@ -19,6 +20,7 @@ import MLX
 import MLXLMCommon
 import RaoLMCore
 import RaoLMModel
+import RaoLMTraining
 
 public enum StrandError: Error, CustomStringConvertible {
     case noSession(String)
@@ -44,6 +46,7 @@ public final class ThreadStrand {
     final class Session {
         let cache: [KVCache]
         var lasts: [MLXArray] = []
+        var cuts: [MLXArray] = []
         var count = 0
         var tracker: TrajectoryTracker
 
@@ -56,7 +59,11 @@ public final class ThreadStrand {
     private var sessions: [String: Session] = [:]
     /// Where each index entry sits in its document, built once per version.
     private lazy var trajectoryCorpus = TrajectoryCorpus(
-        values: index.values, keyRow: index.keyRow, keyOffset: index.keyOffset, partitions: index.partitions)
+        values: index.values, keyRow: index.keyRow, keyOffset: index.keyOffset, partitions: index.partitions,
+        breakLength: index.info.paragraphBreak?.count ?? 0)
+    /// The umbrella pack's anchor snippets; this version's cut state on each is computed once.
+    public var anchorTokens: [[Int]] = []
+    private var anchorStates: [Float]?
 
     public init(name: String, label: String, version: Int, context: RunContext, owner: String) {
         self.name = name
@@ -70,7 +77,7 @@ public final class ThreadStrand {
     public var index: ProvenanceIndex { context.index }
     public var model: RaoTransformer { context.model }
 
-    public func descriptor(vocabularySHA256: String) -> StrandDescriptor {
+    public func descriptor(vocabularySHA256: String, packSHA256: String? = nil) -> StrandDescriptor {
         let threadID = self.threadID
         let partitions = index.partitions.map { partition -> PartitionRef in
             var copy = partition
@@ -82,7 +89,18 @@ public final class ThreadStrand {
             vocabularySHA256: vocabularySHA256, hiddenSize: model.config.hiddenSize, tapLayer: index.info.tapLayer,
             alpha: index.info.alpha, defaultTau: index.info.defaultTau, defaultK: index.info.defaultK,
             indexEntries: index.count, partitions: partitions, sharedNgrams: PackedWords(index.sharedNgrams.sorted()),
-            owner: owner)
+            owner: owner, packSHA256: model.config.hasTrunk ? packSHA256 : nil, cut: IndexInfo.cut(of: model.config),
+            anchors: anchors().map(PackedFloats.init), calibration: index.info.calibration)
+    }
+
+    /// This version's cut state on each of the pack's anchors, the mean over the anchor's positions
+    /// ([anchors × hidden], row-major); nil without anchors.
+    public func anchors() -> [Float]? {
+        guard !anchorTokens.isEmpty else { return nil }
+        if let anchorStates { return anchorStates }
+        let states = UmbrellaPack.anchorStates(model: model, anchors: anchorTokens).asArray(Float.self)
+        anchorStates = states
+        return states
     }
 
     // MARK: - Sessions
@@ -105,11 +123,22 @@ public final class ThreadStrand {
     /// The last hidden state (the input of the final norm) at each of `positions`.
     public func hidden(session id: String, positions: [Int]) throws -> [[Float]] {
         guard let session = sessions[id] else { throw StrandError.noSession(id) }
-        for position in positions where position < 0 || position >= session.count {
-            throw StrandError.position(position, count: session.count)
+        return try rows(session.lasts, positions: positions, count: session.count)
+    }
+
+    /// The last hidden state and the cut state (entering the trunk) at each of `positions`.
+    public func states(session id: String, positions: [Int]) throws -> StrandStates {
+        guard let session = sessions[id] else { throw StrandError.noSession(id) }
+        return StrandStates(last: try rows(session.lasts, positions: positions, count: session.count),
+                            cut: try rows(session.cuts, positions: positions, count: session.count))
+    }
+
+    private func rows(_ steps: [MLXArray], positions: [Int], count: Int) throws -> [[Float]] {
+        for position in positions where position < 0 || position >= count {
+            throw StrandError.position(position, count: count)
         }
         guard !positions.isEmpty else { return [] }
-        let all = session.lasts.count == 1 ? session.lasts[0] : concatenated(session.lasts, axis: 0)
+        let all = steps.count == 1 ? steps[0] : concatenated(steps, axis: 0)
         let taken = all.take(MLXArray(positions.map { Int32($0) }), axis: 0).asType(.float32)
         eval(taken)
         let width = model.config.hiddenSize
@@ -125,12 +154,14 @@ public final class ThreadStrand {
 
     private func step(_ session: Session, tokens: [Int], k: Int) throws -> [StrandStep] {
         let input = MLXArray(tokens.map { Int32($0) }, [1, tokens.count])
-        let body = model.body(input, cache: session.cache, captureTap: true)
+        let body = model.body(input, cache: session.cache, captureTap: true, captureCut: true)
         guard let tap = body.tap else { throw ProvenanceError.corruptIndex("the model captured no tap layer") }
         let keys = ProvenanceKey.make(tap: tap, final: model.normed(body.last), alpha: index.info.alpha)
         let last = body.last[0]
-        eval(keys, last)
+        let cut = (body.cut ?? body.last)[0]
+        eval(keys, last, cut)
         session.lasts.append(last)
+        session.cuts.append(cut)
         let positions = input.dim(1)
         session.count += positions
         return (0..<positions).map { j in
@@ -225,23 +256,48 @@ public enum StrandLinkError: Error, CustomStringConvertible {
     }
 }
 
+/// A node's last hidden states and its cut states (entering the trunk) at the same positions.
+public struct StrandStates: Sendable {
+    public var last: [[Float]]
+    /// Empty when the link cannot read them.
+    public var cut: [[Float]]
+
+    public init(last: [[Float]], cut: [[Float]]) {
+        self.last = last
+        self.cut = cut
+    }
+}
+
 /// How the umbrella reaches one Thread node's live version.
 public protocol StrandLink: AnyObject {
     var descriptor: StrandDescriptor { get }
     func open(session: String, tokens: [Int], k: Int) -> StrandCall<[StrandStep]>
     func advance(session: String, token: Int, k: Int) -> StrandCall<StrandStep>
     func hidden(session: String, positions: [Int]) -> StrandCall<[[Float]]>
+    /// `hidden`, with the cut state beside each: one request for both.
+    func states(session: String, positions: [Int]) -> StrandCall<StrandStates>
     func close(session: String)
+}
+
+extension StrandLink {
+    public func states(session: String, positions: [Int]) -> StrandCall<StrandStates> {
+        hidden(session: session, positions: positions).map { StrandStates(last: $0, cut: []) }
+    }
 }
 
 /// A strand in this process: every call runs at once, on the caller's thread.
 public final class LocalStrandLink: StrandLink {
     public let strand: ThreadStrand
-    public let descriptor: StrandDescriptor
+    /// What the umbrella is told of the strand; a bench may set a calibration on it.
+    public var descriptor: StrandDescriptor
 
-    public init(strand: ThreadStrand, vocabularySHA256: String) {
+    public init(strand: ThreadStrand, vocabularySHA256: String, packSHA256: String? = nil) {
         self.strand = strand
-        self.descriptor = strand.descriptor(vocabularySHA256: vocabularySHA256)
+        self.descriptor = strand.descriptor(vocabularySHA256: vocabularySHA256, packSHA256: packSHA256)
+    }
+
+    public func states(session: String, positions: [Int]) -> StrandCall<StrandStates> {
+        .done { try strand.states(session: session, positions: positions) }
     }
 
     public func open(session: String, tokens: [Int], k: Int) -> StrandCall<[StrandStep]> {

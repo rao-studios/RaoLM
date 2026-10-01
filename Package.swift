@@ -125,6 +125,7 @@ let package = Package(
                 "RaoLMCore", "RaoLMModel", "RaoLMTraining", "RaoLMProvenance", "RaoLMThread",
                 .product(name: "MLX", package: "Frigate"),
                 .product(name: "MLXNN", package: "Frigate"),
+                .product(name: "FrigateHub", package: "Frigate"),
             ],
             swiftSettings: v5
         ),

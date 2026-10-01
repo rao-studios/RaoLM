@@ -114,11 +114,16 @@ public struct BraidGate: Codable, Sendable, Equatable {
     public var trajectoryBeta: Float
     public var ask: Ask
     public var askFloor: Float
-
+    /// A Thread that thinks what the leading Thread thinks (their cut states agree, read through
+    /// the pack's anchors) is lifted beside it as if its retrieval backed the leader's candidate.
+    public var thoughtAgreement: Bool
+    /// With a commons strand: the memory the commons starts with. Threads share the rest.
+    public var commonsPrior: Float
     public init(
         evidenceFloor: Float = 0.05, evidenceCeiling: Float = 0.5, share: Share = .variable, shareRate: Float = 0.1,
         credibility: Bool = true, credibilityRate: Float = 0.3, agreement: Bool = true, generatedEvidence: Bool = false,
-        trajectory: TrajectoryUse = .off, trajectoryBeta: Float = 1, ask: Ask = .gate, askFloor: Float = 0.25
+        trajectory: TrajectoryUse = .off, trajectoryBeta: Float = 1, ask: Ask = .gate, askFloor: Float = 0.25,
+        thoughtAgreement: Bool = false, commonsPrior: Float = 0.9
     ) {
         self.evidenceFloor = evidenceFloor
         self.evidenceCeiling = evidenceCeiling
@@ -132,11 +137,13 @@ public struct BraidGate: Codable, Sendable, Equatable {
         self.trajectoryBeta = trajectoryBeta
         self.ask = ask
         self.askFloor = askFloor
+        self.thoughtAgreement = thoughtAgreement
+        self.commonsPrior = commonsPrior
     }
 
     private enum CodingKeys: String, CodingKey {
         case evidenceFloor, evidenceCeiling, share, shareRate, credibility, credibilityRate, agreement, generatedEvidence
-        case trajectory, trajectoryBeta, ask, askFloor
+        case trajectory, trajectoryBeta, ask, askFloor, thoughtAgreement, commonsPrior
     }
 
     public init(from decoder: Decoder) throws {
@@ -154,6 +161,8 @@ public struct BraidGate: Codable, Sendable, Equatable {
         trajectoryBeta = try c.decodeIfPresent(Float.self, forKey: .trajectoryBeta) ?? defaults.trajectoryBeta
         ask = try c.decodeIfPresent(Ask.self, forKey: .ask) ?? defaults.ask
         askFloor = try c.decodeIfPresent(Float.self, forKey: .askFloor) ?? defaults.askFloor
+        thoughtAgreement = try c.decodeIfPresent(Bool.self, forKey: .thoughtAgreement) ?? defaults.thoughtAgreement
+        commonsPrior = try c.decodeIfPresent(Float.self, forKey: .commonsPrior) ?? defaults.commonsPrior
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -171,6 +180,8 @@ public struct BraidGate: Codable, Sendable, Equatable {
         if trajectoryBeta != defaults.trajectoryBeta { try c.encode(trajectoryBeta, forKey: .trajectoryBeta) }
         if ask != defaults.ask { try c.encode(ask, forKey: .ask) }
         if askFloor != defaults.askFloor { try c.encode(askFloor, forKey: .askFloor) }
+        if thoughtAgreement != defaults.thoughtAgreement { try c.encode(thoughtAgreement, forKey: .thoughtAgreement) }
+        if commonsPrior != defaults.commonsPrior { try c.encode(commonsPrior, forKey: .commonsPrior) }
     }
 
     /// Eight hex digits naming these settings, for a generation's id.
@@ -222,6 +233,15 @@ public struct StrandShare: Codable, Sendable, Equatable {
     public var alone: Float?
     /// The Thread's trajectory through its own corpus at the position that predicts the token.
     public var trajectory: StrandTrajectory?
+    /// With a commons strand: log p_t(token) − log p_commons(token), what this Thread knows of the
+    /// token beyond what the base model already did. Nil for the commons, or when either was not asked.
+    public var lift: Float?
+    /// How far this Thread's thought agreed with the leading Thread's (0 to 1), when read.
+    public var thought: Float?
+    /// With a commons strand: the fraction of the token this strand earns in the owner's blend. A form
+    /// token (whitespace, punctuation, a function word) is wholly the commons'; a content token is
+    /// each strand's as it supplied it (`share`). A token's credits sum to 1. Nil without a commons.
+    public var credit: Float?
 
     public init(
         strand: String, threadID: String?, gate: Float, open: Bool, bestScore: Float?, lmProb: Float?, lmEntropy: Float?,
@@ -251,10 +271,12 @@ public struct BraidStrandRef: Codable, Sendable, Equatable {
     public var rowCount: Int
     /// Global index entries start here for this Thread.
     public var entryOffset: Int
+    /// The umbrella's commons strand (the pack's base model): it holds no Thread and earns nothing.
+    public var commons: Bool?
 
     public init(
         name: String, label: String, threadID: String?, version: Int, manifest: ManifestRef, rowOffset: Int, rowCount: Int,
-        entryOffset: Int
+        entryOffset: Int, commons: Bool? = nil
     ) {
         self.name = name
         self.label = label
@@ -264,7 +286,13 @@ public struct BraidStrandRef: Codable, Sendable, Equatable {
         self.rowOffset = rowOffset
         self.rowCount = rowCount
         self.entryOffset = entryOffset
+        self.commons = commons
     }
+
+    public var isCommons: Bool { commons == true }
+
+    /// The name the umbrella's commons strand goes by.
+    public static let commonsName = "commons"
 
     public func contains(row: Int) -> Bool { row >= rowOffset && row < rowOffset + rowCount }
 }
@@ -278,15 +306,19 @@ public struct BraidRef: Codable, Sendable, Equatable {
     public var gating: BraidGating?
     /// The braided gate's settings, when that gate was used.
     public var gate: BraidGate?
+    /// The umbrella pack when it has a trunk (its vocabulary is `vocabularySHA256`).
+    public var packSHA256: String?
 
     public init(
-        vocabularySHA256: String, gateFloor: Float, strands: [BraidStrandRef], gating: BraidGating? = nil, gate: BraidGate? = nil
+        vocabularySHA256: String, gateFloor: Float, strands: [BraidStrandRef], gating: BraidGating? = nil, gate: BraidGate? = nil,
+        packSHA256: String? = nil
     ) {
         self.vocabularySHA256 = vocabularySHA256
         self.gateFloor = gateFloor
         self.strands = strands
         self.gating = gating
         self.gate = gate
+        self.packSHA256 = packSHA256
     }
 
     public func strand(row: Int) -> BraidStrandRef? { strands.first { $0.contains(row: row) } }
@@ -304,7 +336,7 @@ public struct BraidRef: Codable, Sendable, Equatable {
         }
         return ManifestRef(
             runID: "braid:" + names, epoch: strands.map(\.version).reduce(0, +),
-            checkpointSHA256: fold([vocabularySHA256] + strands.map(\.manifest.checkpointSHA256)),
+            checkpointSHA256: fold([packSHA256 ?? vocabularySHA256] + strands.map(\.manifest.checkpointSHA256)),
             indexSHA256: fold(strands.map(\.manifest.indexSHA256)),
             corpusHash: fold(strands.map(\.manifest.corpusHash)),
             tokenizerSHA256: tokenizerSHA256, ledgerSHA256: nil, threadID: nil)
@@ -330,11 +362,21 @@ public struct StrandDescriptor: Codable, Sendable, Equatable {
     /// Token 3-grams shared by two or more of this Thread's documents.
     public var sharedNgrams: PackedWords
     public var owner: String
+    /// The umbrella pack the node mirrors, when it has a trunk, and where the trunk starts.
+    public var packSHA256: String?
+    public var cut: Int?
+    /// The umbrella's commons strand, not a Thread.
+    public var commons: Bool?
+    /// The node's cut state on each of the pack's anchors ([count, hiddenSize], row-major).
+    public var anchors: PackedFloats?
+    /// λ and the kNN temperature the node set from its own corpus's self-trajectory.
+    public var calibration: StrandCalibration?
 
     public init(
         name: String, label: String, threadID: String?, version: Int, manifest: ManifestRef, vocabularySHA256: String,
         hiddenSize: Int, tapLayer: Int, alpha: Float, defaultTau: Float, defaultK: Int, indexEntries: Int,
-        partitions: [PartitionRef], sharedNgrams: PackedWords, owner: String
+        partitions: [PartitionRef], sharedNgrams: PackedWords, owner: String, packSHA256: String? = nil, cut: Int? = nil,
+        commons: Bool? = nil, anchors: PackedFloats? = nil, calibration: StrandCalibration? = nil
     ) {
         self.name = name
         self.label = label
@@ -351,6 +393,45 @@ public struct StrandDescriptor: Codable, Sendable, Equatable {
         self.partitions = partitions
         self.sharedNgrams = sharedNgrams
         self.owner = owner
+        self.packSHA256 = packSHA256
+        self.cut = cut
+        self.commons = commons
+        self.anchors = anchors
+        self.calibration = calibration
+    }
+
+    public var isCommons: Bool { commons == true }
+}
+
+/// A Thread's λ and kNN temperature, set once per version from how its own corpus traces itself:
+/// each sampled document retrieved against the rest of the corpus, its own entries left out.
+public struct StrandCalibration: Codable, Sendable, Equatable {
+    public var documents: Int
+    public var positions: Int
+    /// The share of those positions at which another document's chain reached the trajectory's
+    /// `phrase` (a stretch retrieval would follow into the wrong document), and the longest such chain.
+    public var falseChainRate: Float
+    public var longestFalseChain: Int
+    /// The kNN temperature under which the rest of the corpus best predicts each next token, and the
+    /// mean log-likelihood at every temperature tried.
+    public var tau: Float
+    public var tauGrid: [Float]
+    public var tauLogLikelihood: [Float]
+    /// λ_t = λ · lambdaScale, from the false-chain rate.
+    public var lambdaScale: Float
+
+    public init(
+        documents: Int, positions: Int, falseChainRate: Float, longestFalseChain: Int, tau: Float, tauGrid: [Float],
+        tauLogLikelihood: [Float], lambdaScale: Float
+    ) {
+        self.documents = documents
+        self.positions = positions
+        self.falseChainRate = falseChainRate
+        self.longestFalseChain = longestFalseChain
+        self.tau = tau
+        self.tauGrid = tauGrid
+        self.tauLogLikelihood = tauLogLikelihood
+        self.lambdaScale = lambdaScale
     }
 }
 

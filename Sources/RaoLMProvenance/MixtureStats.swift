@@ -21,10 +21,13 @@ public enum MixtureStats {
     public struct Position: Sendable {
         public var weights: [Float]
         public var knn: [Int: Float]
+        /// The mixture's λ at this position when Threads use λs of their own; nil: the call's.
+        public var lambda: Float?
 
-        public init(weights: [Float], knn: [Int: Float]) {
+        public init(weights: [Float], knn: [Int: Float], lambda: Float? = nil) {
             self.weights = weights
             self.knn = knn
+            self.lambda = lambda
         }
     }
 
@@ -44,12 +47,15 @@ public enum MixtureStats {
         guard count > 0 else { return result }
         guard let vocabulary = heads.compactMap({ $0 }).first?.dim(-1) else {
             // No head anywhere: the head part is empty, and the mixture is retrieval alone.
-            let l = min(max(lambda, 0), 1)
             result.strands = positions.map { _ in heads.map { _ in nil } }
             result.lm = positions.map { _ in 0 }
-            result.mixed = positions.map { position in CitationMath.entropy(position.knn.values.map { $0 * l }) }
+            result.mixed = positions.map { position in
+                let l = min(max(position.lambda ?? lambda, 0), 1)
+                return CitationMath.entropy(position.knn.values.map { $0 * l })
+            }
             return result
         }
+        let uniform = positions.allSatisfy { $0.lambda == nil }
         let l = min(max(lambda, 0), 1)
         var start = 0
         while start < count {
@@ -92,7 +98,13 @@ public enum MixtureStats {
                 }
             }
             let knn = putAlong(zeros([n, vocabulary]), MLXArray(indices, [n, width]), values: MLXArray(values, [n, width]), axis: -1)
-            let mixed = head * (1 - l) + knn * l
+            let mixed: MLXArray
+            if uniform {
+                mixed = head * (1 - l) + knn * l
+            } else {
+                let ls = MLXArray(span.map { min(max($0.lambda ?? lambda, 0), 1) }, [n, 1])
+                mixed = head * (1 - ls) + knn * ls
+            }
             let mixedEntropy = -which(mixed .> 0, mixed * log(mixed), 0).sum(axis: -1)
 
             eval([lm, mixedEntropy] + strandEntropy.compactMap { $0 })

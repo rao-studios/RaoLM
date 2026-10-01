@@ -46,10 +46,18 @@ public final class CitedGenerator {
         self.manifestRef = manifestRef
     }
 
+    /// The kNN temperature and λ this run uses: the request's, or the index's own calibration when
+    /// the Thread set one (as a braid applies it to the same Thread).
+    func calibrated(_ params: GenerationParameters) -> (tau: Float, lambda: Float) {
+        guard let calibration = index.info.calibration else { return (params.tau, params.lambda) }
+        return (calibration.tau, min(max(params.lambda * calibration.lambdaScale, 0), 1))
+    }
+
     /// `onToken` sees each generated token as it is chosen; throwing from it (for example a
     /// `CancellationError`) stops the generation and rethrows.
     public func generate(_ request: GenerationRequest, onToken: ((TokenTrace) throws -> Void)? = nil) throws -> CitedGeneration {
         let params = request.params
+        let mixing = calibrated(params)
         guard !request.promptTokens.isEmpty else { throw ProvenanceError.emptyPrompt }
         let prompt = request.promptTokens
         let eos = tokenizer.eosTokenID
@@ -76,7 +84,7 @@ public final class CitedGenerator {
         }
         if prompt.count > 1 {
             Self.fill(&traces, from: 0, with: MixtureStats.entropies(
-                heads: [promptLogits[0..<(prompt.count - 1)]], positions: mixtures, lambda: params.lambda))
+                heads: [promptLogits[0..<(prompt.count - 1)]], positions: mixtures, lambda: mixing.lambda))
         }
 
         var generated: [Int] = []
@@ -89,7 +97,7 @@ public final class CitedGenerator {
                 forced: nil, params: params, rng: &rng)
             var one = [trace]
             Self.fill(&one, from: 0, with: MixtureStats.entropies(
-                heads: [logits.reshaped(1, -1)], positions: [MixtureStats.Position(weights: [1], knn: knn)], lambda: params.lambda))
+                heads: [logits.reshaped(1, -1)], positions: [MixtureStats.Position(weights: [1], knn: knn)], lambda: mixing.lambda))
             trace = one[0]
             if trace.token == eos {
                 stoppedOnEOS = true
@@ -141,11 +149,12 @@ public final class CitedGenerator {
         logits logitValues: [Float], key: MLXArray, index position: Int, forced: Int?, params: GenerationParameters,
         rng: inout SplitMix64
     ) -> (TokenTrace, [Int: Float]) {
+        let mixing = calibrated(params)
         let pLM = CitationMixer.softmax(logitValues)
         let hits = index.query(key, k: params.k)
-        var neighbours = CitationMixer.neighbours(hits: hits, index: index, tau: params.tau)
+        var neighbours = CitationMixer.neighbours(hits: hits, index: index, tau: mixing.tau)
         let knn = CitationMixer.knnDistribution(neighbours)
-        let mixed = CitationMixer.mix(pLM: pLM, knn: knn, lambda: params.lambda)
+        let mixed = CitationMixer.mix(pLM: pLM, knn: knn, lambda: mixing.lambda)
 
         let token: Int
         if let forced {
@@ -154,7 +163,7 @@ public final class CitedGenerator {
             token = CitationMixer.choose(mixed) { CitationMixer.citedAge($0, neighbours: neighbours) { index.partitionsByRow[$0] } }
         } else {
             let tempered = CitationMixer.mix(
-                pLM: CitationMixer.softmax(logitValues, temperature: params.temperature), knn: knn, lambda: params.lambda)
+                pLM: CitationMixer.softmax(logitValues, temperature: params.temperature), knn: knn, lambda: mixing.lambda)
             token = CitationMixer.sample(tempered, topK: params.topK, rng: &rng)
         }
         for i in neighbours.indices { neighbours[i].matches = neighbours[i].value == token }
@@ -164,7 +173,7 @@ public final class CitedGenerator {
             lmEntropy: 0, knnEntropy: CitationMath.entropy(knn.values),
             mixedEntropy: 0, sourceEntropy: CitationMixer.sourceEntropy(neighbours),
             lmProb: token < pLM.count ? pLM[token] : 0, agreement: knn[token] ?? 0,
-            mixedProb: token < mixed.count ? mixed[token] : 0, lambda: params.lambda, neighbours: neighbours)
+            mixedProb: token < mixed.count ? mixed[token] : 0, lambda: mixing.lambda, neighbours: neighbours)
         return (trace, knn)
     }
 

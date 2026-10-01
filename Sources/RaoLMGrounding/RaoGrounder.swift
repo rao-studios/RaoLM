@@ -130,7 +130,7 @@ public struct GroundingInputs: Sendable {
     public static func make(
         generation: CitedGeneration, sources: [GroundingSource], policy: GroundingSourcePolicy, eos: Int,
         includeEOS: Bool = true, decode: ([Int]) -> String = { _ in "" }, maxPositions: Int? = nil,
-        trainedLength: Int? = nil
+        trainedLength: Int? = nil, paragraphBreak: [Int] = []
     ) throws -> GroundingInputs {
         var seen = Set<String>()
         let unique = sources.filter { seen.insert($0.id).inserted }
@@ -144,14 +144,14 @@ public struct GroundingInputs: Sendable {
             // The context side feeds context[0..<n−1], then [last] + sampled.dropLast():
             // n − 1 + |sampled| positions in all.
             let budget = maxPositions + 1 - max(sampled.count, 1)
-            kept = GroundingSources.fit(unique, promptCount: prompt.count, budget: budget)
-            let length = GroundingSources.contextLength(sources: kept, promptCount: prompt.count)
+            kept = GroundingSources.fit(unique, promptCount: prompt.count, budget: budget, paragraphBreak: paragraphBreak)
+            let length = GroundingSources.contextLength(sources: kept, promptCount: prompt.count, paragraphBreak: paragraphBreak)
             if length > budget {
                 throw GroundingError.contextTooLong(tokens: length - 1 + max(sampled.count, 1), limit: maxPositions)
             }
         }
         let keptIDs = Set(kept.map(\.id))
-        let context = GroundingSources.contextTokens(sources: kept, prompt: prompt, eos: eos)
+        let context = GroundingSources.contextTokens(sources: kept, prompt: prompt, eos: eos, paragraphBreak: paragraphBreak)
         let positions = context.count - 1 + sampled.count
         let partitions = kept.map { source in
             Partition(id: source.id, documentId: source.ref.documentID, text: decode(source.tokens), tokenIds: source.tokens, score: 0)
@@ -247,7 +247,7 @@ public final class RaoGrounder {
         return try GroundingInputs.make(
             generation: generation, sources: sources, policy: policy, eos: tokenizer.eosTokenID, includeEOS: includeEOS,
             decode: { tokenizer.decode($0) }, maxPositions: context.model.config.maxPositionEmbeddings,
-            trainedLength: context.manifest.hyperparameters.seqLen)
+            trainedLength: context.manifest.hyperparameters.seqLen, paragraphBreak: context.index.info.paragraphBreak ?? [])
     }
 
     /// Step 2: teacher-force the output with and without the sources. Synchronous MLX on the

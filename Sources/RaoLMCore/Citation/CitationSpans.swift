@@ -68,12 +68,19 @@ public enum CitationSpans {
         return 1 - Float(shared) / Float(total)
     }
 
+    /// A position past its partition's own tokens: the paragraph break that follows the partition,
+    /// which is in the index so chains run on across it, but is never cited.
+    static func isBreak(_ position: TokenPosition, _ partitions: [Int: PartitionRef]) -> Bool {
+        guard let partition = partitions[position.row] else { return false }
+        return position.offset >= partition.tokenCount
+    }
+
     /// Every partition the token's matching neighbours come from, strongest first.
     public static func groupedCitations(
         _ trace: TokenTrace, partitions: [Int: PartitionRef], threadID: String?
     ) -> [Citation] {
         var groups: [Int: (weight: Float, best: Neighbour)] = [:]
-        for neighbour in trace.neighbours where neighbour.matches {
+        for neighbour in trace.neighbours where neighbour.matches && !isBreak(neighbour.cited, partitions) {
             let row = neighbour.cited.row
             if let existing = groups[row] {
                 let better = neighbour.score > existing.best.score
@@ -133,7 +140,8 @@ public enum CitationSpans {
         // 2. Chain eligibility: matching, rank ≤ R, keyed by the cited (value) position.
         var eligible: [[TokenPosition: (rank: Int, weight: Float)]] = traces.map { trace in
             var map: [TokenPosition: (rank: Int, weight: Float)] = [:]
-            for neighbour in trace.neighbours where neighbour.matches && neighbour.rank <= settings.rankThreshold {
+            for neighbour in trace.neighbours where neighbour.matches && neighbour.rank <= settings.rankThreshold
+                && !isBreak(neighbour.cited, partitions) {
                 if let existing = map[neighbour.cited], existing.rank <= neighbour.rank { continue }
                 map[neighbour.cited] = (neighbour.rank, neighbour.weight)
             }

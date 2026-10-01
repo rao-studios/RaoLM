@@ -7,7 +7,8 @@
 //        each by number and also sends events (its state, log lines, promotions) at any time.
 //  PIN:  Only retrieval hits, the node's trajectory through its corpus (a few numbers a
 //        position) and hidden states cross for generation — never weights, logits or corpus
-//        text. Float arrays travel as base64 of their little-endian bytes, exact.
+//        text. A cut state (what the umbrella reads of a node's thought) travels only beside the
+//        hidden state it came with. Float arrays travel as base64 of their little-endian bytes, exact.
 //
 
 import Foundation
@@ -27,6 +28,8 @@ public struct NodeRequest: Codable, Sendable {
         case open(session: String, tokens: [Int], k: Int)
         case advance(session: String, token: Int, k: Int)
         case hidden(session: String, positions: [Int])
+        /// `hidden`, with the cut state (entering the umbrella's trunk) beside each.
+        case states(session: String, positions: [Int])
         case close(session: String)
         /// Stop the running update at its next step.
         case cancel
@@ -35,7 +38,7 @@ public struct NodeRequest: Codable, Sendable {
         /// Answered from the live version between training steps rather than queued behind an update.
         public var isServing: Bool {
             switch self {
-            case .describe, .probe, .open, .advance, .hidden, .close: return true
+            case .describe, .probe, .open, .advance, .hidden, .states, .close: return true
             default: return false
             }
         }
@@ -59,6 +62,9 @@ public struct NodeHello: Codable, Sendable, Equatable {
     public var liveVersion: Int?
     public var vocabularySHA256: String
     public var state: StrandState
+    /// The umbrella pack when it has a trunk, and the first block of the trunk.
+    public var packSHA256: String?
+    public var cut: Int?
 }
 
 public enum NodeReply: Codable, Sendable {
@@ -68,6 +74,7 @@ public enum NodeReply: Codable, Sendable {
     case opened([StrandStep])
     case hits(StrandStep)
     case hidden([PackedFloats])
+    case states(last: [PackedFloats], cut: [PackedFloats])
     case ok
 }
 

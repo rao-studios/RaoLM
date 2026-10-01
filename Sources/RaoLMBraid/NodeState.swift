@@ -112,6 +112,13 @@ public struct StrandState: Codable, Sendable, Equatable {
     public var history: [VersionMark]
     public var error: String?
     public var updatedAt: Date
+    /// The umbrella pack the node mirrors, when it has a trunk, and the first block of the trunk.
+    public var packSHA256: String?
+    public var cut: Int?
+    /// The live version's mean loss on unfed documents in the Thread's own voice, and on the
+    /// pack's commons sample (nats per token).
+    public var heldOutLoss: Float?
+    public var commonsLoss: Float?
 
     public init(name: String, label: String, offline: Bool, vocabularySHA256: String, blocks: Int) {
         self.name = name
@@ -195,6 +202,10 @@ public struct StrandState: Codable, Sendable, Equatable {
         history = try c.decodeIfPresent([VersionMark].self, forKey: .history) ?? []
         error = try c.decodeIfPresent(String.self, forKey: .error)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        packSHA256 = try c.decodeIfPresent(String.self, forKey: .packSHA256)
+        cut = try c.decodeIfPresent(Int.self, forKey: .cut)
+        heldOutLoss = try c.decodeIfPresent(Float.self, forKey: .heldOutLoss)
+        commonsLoss = try c.decodeIfPresent(Float.self, forKey: .commonsLoss)
     }
 
     /// Whether the umbrella can route to this node.
@@ -256,6 +267,12 @@ public enum VersionGates {
     public static func vocabulary(found: String, expected: String) -> GateResult {
         GateResult("vocabulary", found == expected,
                    found == expected ? "shared \(found.prefix(12))…" : "holds \(found.prefix(12))…, the umbrella reads \(expected.prefix(12))…")
+    }
+
+    /// The umbrella's trunk: the blocks from the cut on must be the pack's, byte for byte.
+    public static func trunk(found: String, expected: String) -> GateResult {
+        GateResult("trunk", found == expected,
+                   found == expected ? "the umbrella's \(expected.prefix(12))…" : "holds \(found.prefix(12))…, the umbrella's is \(expected.prefix(12))…")
     }
 
     /// No row of the index may belong to a withdrawn document.

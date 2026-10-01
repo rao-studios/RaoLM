@@ -26,6 +26,8 @@ public struct NodeServerOptions: Codable, Sendable, Equatable {
     /// The braid's root directory.
     public var root: String
     public var vocabularySHA256: String
+    /// The umbrella pack when it has a base model (nil: the vocabulary alone).
+    public var packSHA256: String?
     public var offline: Bool
     public var threadBinary: String?
     public var httpPort: Int?
@@ -34,13 +36,14 @@ public struct NodeServerOptions: Codable, Sendable, Equatable {
     public var settings: HypervisorSettings
 
     public init(
-        name: String, label: String, root: String, vocabularySHA256: String, offline: Bool, threadBinary: String?, httpPort: Int?,
-        grpcPort: Int?, owner: String, settings: HypervisorSettings
+        name: String, label: String, root: String, vocabularySHA256: String, packSHA256: String? = nil, offline: Bool, threadBinary: String?,
+        httpPort: Int?, grpcPort: Int?, owner: String, settings: HypervisorSettings
     ) {
         self.name = name
         self.label = label
         self.root = root
         self.vocabularySHA256 = vocabularySHA256
+        self.packSHA256 = packSHA256
         self.offline = offline
         self.threadBinary = threadBinary
         self.httpPort = httpPort
@@ -270,9 +273,15 @@ public final class NodeServer: @unchecked Sendable {
         if let megabytes = options.settings.cacheLimitMB, megabytes > 0 { Memory.cacheLimit = megabytes * 1_048_576 }
         let root = BraidLayout(root: URL(fileURLWithPath: options.root))
         let tokenizer = try Blocking.run { try await RaoTokenizer.load() }
-        let vocabulary = try VocabularyPack.load(from: root.vocabulary(sha256: options.vocabularySHA256))
-        guard vocabulary.sha256 == options.vocabularySHA256 else {
-            throw VocabularyError.fingerprint(expected: options.vocabularySHA256, found: vocabulary.sha256)
+        let pack: UmbrellaPack
+        if let packSHA256 = options.packSHA256 {
+            pack = try UmbrellaPack.load(from: root.pack(sha256: packSHA256))
+            guard pack.sha256 == packSHA256 else { throw UmbrellaPackError.fingerprint(expected: packSHA256, found: pack.sha256, what: "pack") }
+        } else {
+            pack = UmbrellaPack(vocabulary: try VocabularyPack.load(from: root.vocabulary(sha256: options.vocabularySHA256)))
+        }
+        guard pack.vocabulary.sha256 == options.vocabularySHA256 else {
+            throw VocabularyError.fingerprint(expected: options.vocabularySHA256, found: pack.vocabulary.sha256)
         }
         let source: CorpusSource
         var threadPID: Int32?
@@ -295,7 +304,7 @@ public final class NodeServer: @unchecked Sendable {
             log("Thread \(endpoint.nodeID?.uuidString ?? "?") healthy (pid \(threadPID ?? 0))")
         }
         let hypervisor = try ThreadHypervisor(
-            name: options.name, label: options.label, layout: layout, vocabulary: vocabulary, tokenizer: tokenizer, source: source,
+            name: options.name, label: options.label, layout: layout, pack: pack, tokenizer: tokenizer, source: source,
             settings: options.settings, owner: options.owner)
         hypervisor.setProcess(pid: getpid(), threadPID: threadPID, httpPort: options.offline ? nil : options.httpPort,
                               grpcPort: options.offline ? nil : options.grpcPort)
@@ -342,7 +351,8 @@ public final class NodeServer: @unchecked Sendable {
                 reply(request.id, .hello(NodeHello(
                     name: options.name, label: options.label, pid: getpid(), threadPID: state.threadPID, threadID: state.threadID,
                     httpPort: state.httpPort, grpcPort: state.grpcPort, offline: options.offline,
-                    liveVersion: hypervisor.liveVersion?.version, vocabularySHA256: options.vocabularySHA256, state: state)))
+                    liveVersion: hypervisor.liveVersion?.version, vocabularySHA256: options.vocabularySHA256, state: state,
+                    packSHA256: hypervisor.packSHA256, cut: hypervisor.pack.cut)))
             case .describe:
                 reply(request.id, .described(hypervisor.descriptor()))
             case .probe(let tokens):
@@ -358,6 +368,10 @@ public final class NodeServer: @unchecked Sendable {
             case .hidden(let session, let positions):
                 guard let strand = sessions[session] else { throw StrandError.noSession(session) }
                 reply(request.id, .hidden(try strand.hidden(session: session, positions: positions).map(PackedFloats.init)))
+            case .states(let session, let positions):
+                guard let strand = sessions[session] else { throw StrandError.noSession(session) }
+                let states = try strand.states(session: session, positions: positions)
+                reply(request.id, .states(last: states.last.map(PackedFloats.init), cut: states.cut.map(PackedFloats.init)))
             case .close(let session):
                 sessions.removeValue(forKey: session)?.close(session: session)
                 reply(request.id, .ok)

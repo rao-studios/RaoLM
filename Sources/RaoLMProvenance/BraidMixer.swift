@@ -167,26 +167,32 @@ extension BraidMixer {
         public var knn: [Int: Float]
         /// The umbrella head's distribution from this Thread's hidden state; nil when it was not asked.
         public var pLM: [Float]?
+        /// λ_t = λ · lambdaScale: 1 unless the Thread set its own, 0 for the commons (no retrieval).
+        public var lambdaScale: Float
 
-        public init(hits: [StrandHit], tau: Float, logits: [Float]?) {
+        public init(hits: [StrandHit], tau: Float, logits: [Float]?, lambdaScale: Float = 1) {
             self.hits = hits
             weights = CitationMixer.weights(hits.map(\.score), tau: tau)
             var knn: [Int: Float] = [:]
             for (i, hit) in hits.enumerated() { knn[hit.value, default: 0] += weights[i] }
             self.knn = knn
             pLM = logits.map { CitationMixer.softmax($0) }
+            self.lambdaScale = lambdaScale
         }
 
-        /// p_t(y) = λ·p_knn,t(y) + (1−λ)·p_lm,t(y); nil without the head.
+        /// This Thread's λ under the request's.
+        public func lambda(_ lambda: Float) -> Float { min(max(lambda * lambdaScale, 0), 1) }
+
+        /// p_t(y) = λ_t·p_knn,t(y) + (1−λ_t)·p_lm,t(y); nil without the head.
         public func probability(of token: Int, lambda: Float) -> Float? {
             guard let pLM else { return nil }
-            let l = min(max(lambda, 0), 1)
+            let l = self.lambda(lambda)
             return l * (knn[token] ?? 0) + (1 - l) * (token < pLM.count ? pLM[token] : 0)
         }
 
         /// What retrieval alone guarantees of p_t(y), for a Thread whose head was not asked.
         public func lowerBound(of token: Int, lambda: Float) -> Float {
-            min(max(lambda, 0), 1) * (knn[token] ?? 0)
+            self.lambda(lambda) * (knn[token] ?? 0)
         }
 
         public var bestScore: Float? { hits.map(\.score).max() }
@@ -210,10 +216,18 @@ extension BraidMixer {
         public var pLM: [Float]
         public var knn: [Int: Float]
         public var mixed: [Float]
+        /// The λ the mixture used overall, Σ_t w_t·λ_t: the request's when every Thread uses it.
         public var lambda: Float
+        /// The request's λ, which each Thread scales by its own.
+        public var baseLambda: Float
+        /// Each Thread's weight in the head part and in the retrieval part: w_t·(1−λ_t)/(1−λ) and
+        /// w_t·λ_t/λ, which are the gate's weights when every Thread's λ is the same.
+        public var headWeights: [Float]
+        public var knnWeights: [Float]
     }
 
-    /// p = Σ_t w_t · (λ·p_knn,t + (1−λ)·p_lm,t) over the open Threads, w renormalised over them.
+    /// p = Σ_t w_t · (λ_t·p_knn,t + (1−λ_t)·p_lm,t) over the open Threads, w renormalised over them.
+    /// When every open Thread's λ_t is the same this is λ·Σ w·p_knn + (1−λ)·Σ w·p_lm, computed so.
     public static func mix(experts: [Expert], posterior: [Float], open: [Bool], lambda: Float, vocabularySize: Int) -> ExpertMix {
         let usable = experts.indices.map { open[$0] && experts[$0].pLM != nil }
         let total = experts.indices.reduce(Float(0)) { $0 + (usable[$1] ? posterior[$1] : 0) }
@@ -222,16 +236,29 @@ extension BraidMixer {
             guard usable[t] else { return 0 }
             return total > 0 ? posterior[t] / total : 1 / max(count, 1)
         }
+        let lambdas = experts.map { $0.lambda(lambda) }
+        let active = experts.indices.filter { weights[$0] > 0 }
+        var l = min(max(lambda, 0), 1)
+        var headWeights = weights
+        var knnWeights = weights
+        if let first = active.first, active.allSatisfy({ lambdas[$0] == lambdas[first] }) {
+            l = lambdas[first]
+        } else if !active.isEmpty {
+            l = min(max(active.reduce(Float(0)) { $0 + weights[$1] * lambdas[$1] }, 0), 1)
+            headWeights = experts.indices.map { t in l < 1 && weights[t] > 0 ? weights[t] * (1 - lambdas[t]) / (1 - l) : 0 }
+            knnWeights = experts.indices.map { t in l > 0 && weights[t] > 0 ? weights[t] * lambdas[t] / l : 0 }
+        }
         var pLM = [Float](repeating: 0, count: vocabularySize)
         var knn: [Int: Float] = [:]
         for t in experts.indices where weights[t] > 0 {
-            let w = weights[t]
-            if let p = experts[t].pLM { for i in 0..<min(p.count, vocabularySize) { pLM[i] += w * p[i] } }
-            for (token, q) in experts[t].knn { knn[token, default: 0] += w * q }
+            let h = headWeights[t]
+            if h > 0, let p = experts[t].pLM { for i in 0..<min(p.count, vocabularySize) { pLM[i] += h * p[i] } }
+            let q = knnWeights[t]
+            if q > 0 { for (token, value) in experts[t].knn { knn[token, default: 0] += q * value } }
         }
-        let l = min(max(lambda, 0), 1)
         return ExpertMix(posterior: posterior, weights: weights, open: usable, pLM: pLM, knn: knn,
-                         mixed: CitationMixer.mix(pLM: pLM, knn: knn, lambda: l), lambda: l)
+                         mixed: CitationMixer.mix(pLM: pLM, knn: knn, lambda: l), lambda: l, baseLambda: lambda,
+                         headWeights: headWeights, knnWeights: knnWeights)
     }
 
     public static func choose(
@@ -240,34 +267,45 @@ extension BraidMixer {
     ) -> Int {
         if temperature <= 0 { return CitationMixer.choose(mix.mixed, age: age) }
         var tempered = [Float](repeating: 0, count: mix.pLM.count)
-        for t in experts.indices where mix.weights[t] > 0 {
+        for t in experts.indices where mix.headWeights[t] > 0 {
             guard let raw = logits[t] else { continue }
             let p = CitationMixer.softmax(raw, temperature: temperature)
-            for i in 0..<min(p.count, tempered.count) { tempered[i] += mix.weights[t] * p[i] }
+            for i in 0..<min(p.count, tempered.count) { tempered[i] += mix.headWeights[t] * p[i] }
         }
         return CitationMixer.sample(CitationMixer.mix(pLM: tempered, knn: mix.knn, lambda: mix.lambda), topK: topK, rng: &rng)
     }
 
     /// What each Thread supplied to `token`: share_t = w_t · p_t(token) / p(token). `memory` and
     /// `backs` are the braided gate's two parts, recorded when that gate weighed the Threads. Each
-    /// Thread's head entropy is left for the generator to fill from MixtureStats.
+    /// Thread's head entropy is left for the generator to fill from MixtureStats. With a commons
+    /// strand, every Thread's lift over it is recorded; credit is the generator's, once the words
+    /// the tokens belong to are whole (`TokenRoles`).
     public static func shares(
         _ mix: ExpertMix, experts: [Expert], token: Int, names: [String], threadIDs: [String?], memory: [Float]? = nil,
-        backs: [Float]? = nil
+        backs: [Float]? = nil, commons: Int? = nil
     ) -> [StrandShare] {
         let total = token < mix.mixed.count ? mix.mixed[token] : 0
+        let base = commons.flatMap { experts.indices.contains($0) ? experts[$0].probability(of: token, lambda: mix.baseLambda) : nil }
+        let parts = experts.indices.map { t -> Float in
+            let expert = experts[t]
+            let l = expert.lambda(mix.baseLambda)
+            let p = expert.pLM.map { token < $0.count ? $0[token] : 0 } ?? 0
+            return mix.weights[t] * (l * (expert.knn[token] ?? 0) + (1 - l) * p)
+        }
         return experts.indices.map { t in
             let expert = experts[t]
             let w = mix.weights[t]
             let p = expert.pLM.map { token < $0.count ? $0[token] : 0 }
-            let part = w * (mix.lambda * (expert.knn[token] ?? 0) + (1 - mix.lambda) * (p ?? 0))
             var share = StrandShare(
                 strand: names[t], threadID: threadIDs[t], gate: mix.posterior[t], open: mix.open[t], bestScore: expert.bestScore,
                 lmProb: p, lmEntropy: nil, knn: w * (expert.knn[token] ?? 0),
-                share: total > 0 ? part / total : mix.weights[t])
+                share: total > 0 ? parts[t] / total : mix.weights[t])
             share.memory = memory.map { $0[t] }
             share.backs = backs.map { $0[t] }
-            share.alone = expert.probability(of: token, lambda: mix.lambda)
+            share.alone = expert.probability(of: token, lambda: mix.baseLambda)
+            if t != commons, let base, let alone = share.alone {
+                share.lift = Float(log(Double(max(alone, 1e-30))) - log(Double(max(base, 1e-30))))
+            }
             return share
         }
     }
@@ -286,7 +324,7 @@ extension BraidMixer {
         }
         return top.map { candidate in
             let parts = experts.indices.map { t -> Float in
-                guard mix.weights[t] > 0, let p = experts[t].probability(of: candidate.token, lambda: mix.lambda) else { return 0 }
+                guard mix.weights[t] > 0, let p = experts[t].probability(of: candidate.token, lambda: mix.baseLambda) else { return 0 }
                 return mix.weights[t] * p / candidate.prob
             }
             return TokenCandidate(token: candidate.token, text: text(candidate.token), prob: candidate.prob, parts: parts)
@@ -307,13 +345,21 @@ extension BraidMixer {
         /// Tokens observed, and how many each Thread predicted (gave at least the evidence floor).
         public var seen: Int
         public var predicted: [Int]
+        /// The commons strand, when the braid has one: the memory starts on it, and a Thread's
+        /// evidence is its lift over it.
+        public var commons: Int?
 
-        public init(threads: Int) {
+        public init(threads: Int, commons: Int? = nil, prior: Float = 0.9) {
             let n = max(0, threads)
             memory = [Float](repeating: n > 0 ? 1 / Float(n) : 0, count: n)
             credibility = [Float](repeating: 0, count: n)
             seen = 0
             predicted = [Int](repeating: 0, count: n)
+            if let commons, (0..<n).contains(commons) {
+                self.commons = commons
+                let p = n > 1 ? min(max(prior, 0), 1) : 1
+                memory = (0..<n).map { $0 == commons ? p : (1 - p) / Float(n - 1) }
+            }
         }
 
         /// The Thread with the most memory; the first of equals.
@@ -338,6 +384,10 @@ extension BraidMixer {
     /// Thread gives up weight only on a token it failed to predict, so a lead holds through text
     /// every Thread predicts and fades through text none does.
     public static func observe(_ state: inout GateState, likelihoods: [Float], gate: BraidGate) {
+        if let commons = state.commons {
+            observeLift(&state, likelihoods: likelihoods, commons: commons, gate: gate)
+            return
+        }
         let n = state.memory.count
         guard n > 0, likelihoods.count == n else { return }
         let floor = max(gate.evidenceFloor, 1e-6)
@@ -369,14 +419,59 @@ extension BraidMixer {
         }
     }
 
+    /// The lift gate: with a commons strand, a Thread's evidence for a token is what it gave the
+    /// token over what the commons gave it, p_t(x)/p_c(x), bounded to one token counting at most
+    /// ceiling/floor to 1 either way; the commons' own evidence is 1. A Thread that knows no more
+    /// than the base model moves nothing, so the memory stays where it started, on the commons.
+    /// Credibility is how much of the recent text the best Thread out-predicted the commons, and a
+    /// Thread gives up weight (variable share) only on a token it predicted worse than the commons.
+    static func observeLift(_ state: inout GateState, likelihoods: [Float], commons c: Int, gate: BraidGate) {
+        let n = state.memory.count
+        guard n > 0, likelihoods.count == n else { return }
+        let floor = max(gate.evidenceFloor, 1e-6)
+        let reach = max(gate.evidenceCeiling / floor, 1 + 1e-6)
+        let span = log(reach)
+        let base = max(likelihoods[c], 1e-12)
+        let ratios = (0..<n).map { t -> Float in t == c ? 1 : min(max(likelihoods[t] / base, 1 / reach), reach) }
+        let gains = ratios.map { max(0, log($0)) / span }
+        let losses = ratios.map { max(0, -log($0)) / span }
+        state.seen += 1
+        for t in 0..<n where likelihoods[t] >= floor { state.predicted[t] += 1 }
+        let rate = min(max(gate.credibilityRate, 0), 1)
+        for t in 0..<n { state.credibility[t] = (1 - rate) * state.credibility[t] + rate * gains[t] }
+        guard n > 1 else {
+            state.memory = [1]
+            return
+        }
+        let weight = gate.credibility ? ((0..<n).filter { $0 != c }.map { state.credibility[$0] }.max() ?? 0) : 1
+        var updated = (0..<n).map { state.memory[$0] * pow(ratios[$0], weight) }
+        let total = updated.reduce(0, +)
+        updated = total > 0 ? updated.map { $0 / total } : state.memory
+        let alpha = min(max(gate.shareRate, 0), 1)
+        switch gate.share {
+        case .fixed:
+            state.memory = updated.map { (1 - alpha) * $0 + alpha / Float(n) }
+        case .variable:
+            let given = (0..<n).map { updated[$0] * (1 - pow(1 - alpha, losses[$0])) }
+            let pool = given.reduce(0, +)
+            state.memory = (0..<n).map { updated[$0] - given[$0] + (pool - given[$0]) / Float(n - 1) }
+        }
+    }
+
+    /// The leader's top retrieved token, the one agreement asks the other Threads to back.
+    static func candidate(experts: [Expert], leader: Int) -> Int? {
+        guard experts.indices.contains(leader) else { return nil }
+        return experts[leader].knn.max { a, b in a.value != b.value ? a.value < b.value : a.key > b.key }?.key
+    }
+
     /// How much of each Thread's retrieval backs the leader's top retrieved token: 1 for the
     /// leader, and 0 everywhere when the leader retrieved nothing.
     public static func agreement(experts: [Expert], leader: Int) -> [Float] {
         guard experts.indices.contains(leader) else { return experts.map { _ in 0 } }
-        let top = experts[leader].knn.max { a, b in a.value != b.value ? a.value < b.value : a.key > b.key }
-        guard let candidate = top?.key else { return experts.indices.map { $0 == leader ? 1 : 0 } }
+        guard let candidate = candidate(experts: experts, leader: leader) else { return experts.indices.map { $0 == leader ? 1 : 0 } }
         return experts.indices.map { t in t == leader ? 1 : min(max(experts[t].knn[candidate] ?? 0, 0), 1) }
     }
+
 
     /// g_t ∝ m_t + o_t·(m_leader − m_t): a Thread that backs the leader's candidate in full stands
     /// beside it, one that does not keeps its memory.

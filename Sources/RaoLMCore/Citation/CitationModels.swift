@@ -205,6 +205,11 @@ public struct TokenTrace: Codable, Sendable, Equatable {
     public var threadEntropy: Float?
     /// In a braid: the mixture's likeliest tokens at this position, each split by Thread.
     public var candidates: [TokenCandidate]?
+    /// In a braid with a commons strand: the token's role in the owner's blend (form is the commons',
+    /// content the Threads'), and its bits, −log₂ of what the commons gave it: the weight its credit
+    /// counts with.
+    public var role: TokenRole? = nil
+    public var bits: Float? = nil
 
     public init(
         index: Int, token: Int, text: String, isPrompt: Bool, lmEntropy: Float, knnEntropy: Float,

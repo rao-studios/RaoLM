@@ -165,7 +165,13 @@ enum BraidArt {
             return max(0, 1 - abs(pulse * Double(rows.count + 1) - position) / 1.2)
         }
         let topStyle = Style(foreground: Color.mix(ground, palette.line, 0.4 + 0.6 * lit(Double(rows.count + 1))), background: palette.base.background)
-        frame.canvas.put("▲ last", x: rect.minX, y: rect.minY, style: topStyle, clip: rect)
+        if let cut = state.cut {
+            // Above the node's own blocks: the umbrella's frozen trunk, in the umbrella's gold.
+            let trunk = Style(foreground: Color.mix(ground, palette.goldColor, 0.5 + 0.5 * lit(Double(rows.count + 1))), background: palette.base.background)
+            frame.canvas.put("▲ trunk \(cut)+", x: rect.minX, y: rect.minY, style: trunk, clip: rect)
+        } else {
+            frame.canvas.put("▲ last", x: rect.minX, y: rect.minY, style: topStyle, clip: rect)
+        }
         for (i, row) in rows.enumerated() {
             let y = rect.minY + 1 + i
             guard y < rect.maxY - 1 else { break }
@@ -239,6 +245,12 @@ enum BraidArt {
     /// A generated token's colour: its dominant Thread's strand, off-white when Threads share it.
     static func tokenStyle(_ trace: TokenTrace, strands: [String], palette: Palette, dimUncited: Bool = true) -> Style {
         guard let shares = trace.strands, !shares.isEmpty else { return palette.text }
+        if trace.dominantStrand(threshold: 0.6)?.strand == BraidStrandRef.commonsName {
+            // What the base model already knew: no Thread's, the umbrella's gold.
+            var style = Style(foreground: palette.goldColor, background: palette.base.background)
+            if dimUncited, trace.uncited { style = style.dim() }
+            return style
+        }
         guard let dominant = trace.dominantStrand(threshold: 0.6), let index = strands.firstIndex(of: dominant.strand) else {
             return Style(foreground: palette.line, background: palette.base.background)
         }

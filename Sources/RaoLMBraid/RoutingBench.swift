@@ -153,24 +153,54 @@ public enum RoutingBench {
     }
 
     /// Loads each node's live version from the braid's directory (no node process runs): the
-    /// nodes `names` lists, or every node directory.
+    /// nodes `names` lists, or every node directory. The pack is the one the live versions name
+    /// (their vocabulary alone before packs).
     public static func strands(
         layout: BraidLayout, tokenizer: RaoTokenizer, owner: String, names only: [String]? = nil
     ) throws -> (VocabularyPack, [ThreadStrand]) {
-        let pointer = try JSONCoding.read(BraidVocabulary.Current.self, from: layout.vocabularies.appendingPathComponent("current.json"))
-        let vocabulary = try VocabularyPack.load(from: layout.vocabulary(sha256: pointer.sha256))
+        let (pack, strands) = try packStrands(layout: layout, tokenizer: tokenizer, owner: owner, names: only)
+        return (pack.vocabulary, strands)
+    }
+
+    public static func packStrands(
+        layout: BraidLayout, tokenizer: RaoTokenizer, owner: String, names only: [String]? = nil
+    ) throws -> (UmbrellaPack, [ThreadStrand]) {
         let names = only ?? ((try? FileManager.default.contentsOfDirectory(atPath: layout.nodes.path)) ?? []).sorted()
         var strands: [ThreadStrand] = []
+        var pack: UmbrellaPack?
         for name in names {
             let node = layout.node(name)
             guard let live = try? JSONCoding.read(LivePointer.self, from: node.live) else { continue }
             let directory = node.version(live.version)
             let version = try JSONCoding.read(NodeVersion.self, from: directory.appendingPathComponent(NodeVersion.fileName))
             let context = try RunContext.load(runDirectory: directory, epoch: version.epoch, allowWeakIndex: true, tokenizer: tokenizer)
-            strands.append(ThreadStrand(name: name, label: name.prefix(1).uppercased() + name.dropFirst(), version: version.version,
-                                        context: context, owner: owner))
+            if pack == nil {
+                if let sha = version.packSHA256 {
+                    pack = try UmbrellaPack.load(from: layout.pack(sha256: sha))
+                } else {
+                    pack = UmbrellaPack(vocabulary: try VocabularyPack.load(from: layout.vocabulary(sha256: version.vocabularySHA256)))
+                }
+            }
+            let strand = ThreadStrand(name: name, label: name.prefix(1).uppercased() + name.dropFirst(), version: version.version,
+                                      context: context, owner: owner)
+            strand.anchorTokens = pack?.anchors.map(\.tokens) ?? []
+            strands.append(strand)
         }
-        return (vocabulary, strands)
+        if pack == nil {
+            let pointer = try JSONCoding.read(BraidVocabulary.Current.self, from: layout.vocabularies.appendingPathComponent("current.json"))
+            pack = UmbrellaPack(vocabulary: try VocabularyPack.load(from: layout.vocabulary(sha256: pointer.sha256)))
+        }
+        return (pack!, strands)
+    }
+
+    /// The umbrella over in-process strands: their links and a generator (with the commons strand
+    /// when the pack has a base model).
+    public static func umbrella(
+        pack: UmbrellaPack, strands: [ThreadStrand], tokenizer: RaoTokenizer
+    ) throws -> (umbrella: BraidUmbrella, links: [LocalStrandLink], generator: BraidedGenerator) {
+        let umbrella = try BraidUmbrella(pack: pack, tokenizer: tokenizer)
+        let links = strands.map { LocalStrandLink(strand: $0, vocabularySHA256: pack.vocabulary.sha256, packSHA256: umbrella.packSHA256) }
+        return (umbrella, links, try umbrella.generator(links: links))
     }
 
     public struct Sizes: Sendable {
@@ -186,10 +216,9 @@ public enum RoutingBench {
         layout: BraidLayout, tokenizer: RaoTokenizer, world: MockWorld, sizes: Sizes = Sizes(), arms: [GateArm] = GateArm.all,
         owner: String = "raolm-braid", progress: ((String) -> Void)? = nil
     ) throws -> GateBenchReport {
-        let (vocabulary, strands) = try self.strands(layout: layout, tokenizer: tokenizer, owner: owner, names: world.names)
+        let (pack, strands) = try packStrands(layout: layout, tokenizer: tokenizer, owner: owner, names: world.names)
         guard !strands.isEmpty else { throw BraidSessionError.noLiveNodes }
-        let links = strands.map { LocalStrandLink(strand: $0, vocabularySHA256: vocabulary.sha256) }
-        let generator = try BraidedGenerator(links: links, head: UmbrellaHead(vocabulary: vocabulary), tokenizer: tokenizer)
+        let (_, links, generator) = try umbrella(pack: pack, strands: strands, tokenizer: tokenizer)
         let present: [BraidExample.Node] = strands.map { strand in
             (name: strand.name, label: strand.label, threadID: strand.threadID,
              documents: MockFeeder.present(node: strand.name, world: world, layout: layout.node(strand.name)))

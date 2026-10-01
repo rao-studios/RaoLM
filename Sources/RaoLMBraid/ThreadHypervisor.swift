@@ -7,7 +7,9 @@
 //        live version's snapshot, and climbs the ladder cheapest first — reindex the live
 //        weights over the new snapshot (new text citable at once, withdrawn text no longer),
 //        then, when enough changed, train the blocks from the live weights against the frozen
-//        shared vocabulary — and a candidate goes live only when every gate passes.
+//        shared vocabulary — and a candidate goes live only when every gate passes. With an
+//        umbrella pack that has a base model, a node's first blocks start as the base's, and the
+//        trunk above the cut is frozen with the vocabulary: the node trains blocks 0 ..< cut.
 //  OUT:  versions/vNNNN (a standard run directory plus version.json), live.json, and a stream
 //        of StrandState snapshots for the panel.
 //  PIN:  Everything here runs on the node's one MLX thread. `service` is called between
@@ -52,11 +54,35 @@ public struct HypervisorSettings: Codable, Sendable, Equatable {
     public var cacheLimitMB: Int? = 2048
     /// A model shape other than the preset's (tests use a small one).
     public var config: RaoLMConfig?
+    /// The peak learning rate when the blocks start from a pretrained base (nil: 5e-4). A rate
+    /// that trains blocks from scratch would wash out what the base knew.
+    public var warmLR: Float?
+    /// Set λ and the kNN temperature from the corpus's self-trajectory at every version (nil: no).
+    public var calibrate: Bool?
+    /// A phase-2 training arm (nil: the reference recipe). `passage-break`: a document's
+    /// partitions are joined by the tokenizer's paragraph break in every stream, attention stays
+    /// inside a document, and no window opens with eos in place of its first token. `canon` and
+    /// `gated-attention` train the same stream with Canon layers, or a gate on each attention
+    /// head, in the node's blocks. `muon` trains it with Muon for the blocks' weight matrices;
+    /// `wsd` with a warmup-stable-decay schedule that anneals once a version has learned.
+    public var arm: String?
+
+    /// The arms a braid can be started with.
+    public static let arms = ["passage-break", "canon", "gated-attention", "muon", "wsd"]
+    /// The arm a new braid of the base preset trains unless another is named: the passage break,
+    /// adopted on 2026-10-01 once it held every rule of bench-architecture. A braid recorded
+    /// without an arm keeps the recipe it was trained with (eos-first windows on a pack).
+    public static let baseArm = "passage-break"
 
     public init() {}
 
+    /// Whether the nodes train on the passage-break stream: every arm does.
+    public var passageBreak: Bool { arm.map(Self.arms.contains) ?? false }
+
     public func modelConfig() throws -> RaoLMConfig {
-        let config = try self.config ?? RaoLMConfig.preset(preset)
+        var config = try self.config ?? RaoLMConfig.preset(preset)
+        if arm == "canon" { config.canon = true }
+        if arm == "gated-attention" { config.attentionGate = true }
         try config.validate()
         return config
     }
@@ -66,7 +92,8 @@ public final class ThreadHypervisor {
     public let name: String
     public let label: String
     public let layout: NodeLayout
-    public let vocabulary: VocabularyPack
+    public let pack: UmbrellaPack
+    public var vocabulary: VocabularyPack { pack.vocabulary }
     public let tokenizer: RaoTokenizer
     public let source: CorpusSource
     public let settings: HypervisorSettings
@@ -89,29 +116,68 @@ public final class ThreadHypervisor {
     /// The standing prompt a candidate completes at each evaluation.
     public var probeTokens: [Int] = []
 
-    public init(
+    public convenience init(
         name: String, label: String, layout: NodeLayout, vocabulary: VocabularyPack, tokenizer: RaoTokenizer,
+        source: CorpusSource, settings: HypervisorSettings, owner: String
+    ) throws {
+        try self.init(name: name, label: label, layout: layout, pack: UmbrellaPack(vocabulary: vocabulary), tokenizer: tokenizer,
+                      source: source, settings: settings, owner: owner)
+    }
+
+    public init(
+        name: String, label: String, layout: NodeLayout, pack: UmbrellaPack, tokenizer: RaoTokenizer,
         source: CorpusSource, settings: HypervisorSettings, owner: String
     ) throws {
         self.name = name
         self.label = label
         self.layout = layout
-        self.vocabulary = vocabulary
+        self.pack = pack
         self.tokenizer = tokenizer
         self.source = source
         self.settings = settings
         self.owner = owner
         let config = try settings.modelConfig()
+        let vocabulary = pack.vocabulary
         guard config.hiddenSize == vocabulary.info.hiddenSize, config.vocabSize == vocabulary.info.vocabSize else {
             throw VocabularyError.shape(expected: [config.vocabSize, config.hiddenSize],
                                         found: [vocabulary.info.vocabSize, vocabulary.info.hiddenSize], what: "vocabulary")
         }
+        if let base = pack.info?.config, pack.hasBase {
+            guard base.numHiddenLayers == config.numHiddenLayers, base.cut == config.cut, base.intermediateSize == config.intermediateSize,
+                  base.numAttentionHeads == config.numAttentionHeads, base.numKeyValueHeads == config.numKeyValueHeads
+            else {
+                throw UmbrellaPackError.shape(
+                    "the node is \(config.numHiddenLayers) blocks cut at \(config.cut), the pack \(base.numHiddenLayers) cut at \(base.cut)")
+            }
+        }
         self.config = config
         self.state = StrandState(name: name, label: label, offline: source is DirectoryCorpusSource,
-                                 vocabularySHA256: vocabulary.sha256, blocks: config.numHiddenLayers)
+                                 vocabularySHA256: vocabulary.sha256, blocks: config.cut)
         state.threadID = source.threadID
+        state.packSHA256 = pack.hasTrunk ? pack.sha256 : nil
+        state.cut = pack.cut
         try FileManager.default.createDirectory(at: layout.versions, withIntermediateDirectories: true)
         try loadLive()
+    }
+
+    /// The pack's sha when it has a trunk: what a node's records and descriptor name beside the vocabulary.
+    public var packSHA256: String? { pack.hasTrunk ? pack.sha256 : nil }
+
+    /// A strand over a loaded version, reading the pack's anchors.
+    private func strand(version: Int, context: RunContext) -> ThreadStrand {
+        let strand = ThreadStrand(name: name, label: label, version: version, context: context, owner: owner)
+        strand.anchorTokens = pack.anchors.map(\.tokens)
+        return strand
+    }
+
+    /// Whether a model holds the pack: its vocabulary, and its trunk when there is one.
+    private func checkPack(_ model: RaoTransformer) throws {
+        let found = VocabularyPack.fingerprint(of: model)
+        guard found == vocabulary.sha256 else { throw VocabularyError.mismatch(node: found, umbrella: vocabulary.sha256) }
+        if pack.hasTrunk {
+            let trunk = UmbrellaPack.fingerprint(of: model)
+            guard trunk == pack.sha256 else { throw UmbrellaPackError.fingerprint(expected: pack.sha256, found: trunk, what: "trunk") }
+        }
     }
 
     // MARK: - Live version
@@ -135,12 +201,9 @@ public final class ThreadHypervisor {
         do {
             let version = try JSONCoding.read(NodeVersion.self, from: directory.appendingPathComponent(NodeVersion.fileName))
             let context = try RunContext.load(runDirectory: directory, epoch: version.epoch, allowWeakIndex: true, tokenizer: tokenizer)
-            guard VocabularyPack.fingerprint(of: context.model) == vocabulary.sha256 else {
-                throw VocabularyError.mismatch(node: VocabularyPack.fingerprint(of: context.model), umbrella: vocabulary.sha256)
-            }
+            try checkPack(context.model)
             let snapshot = try CorpusSnapshot.load(from: URL(fileURLWithPath: version.snapshotPath))
-            adopt(ThreadStrand(name: name, label: label, version: version.version, context: context, owner: owner),
-                  version: version, snapshot: snapshot)
+            adopt(strand(version: version.version, context: context), version: version, snapshot: snapshot)
             if let memorisedMap = try? liveMemorisedMap(directory: directory, epoch: version.epoch, corpus: context.tokenizedCorpus()) {
                 liveMemorised = memorisedMap
                 memorised = memorisedMap
@@ -166,9 +229,11 @@ public final class ThreadHypervisor {
         state.partitions = version.partitions
         state.tokens = version.tokens
         state.threadID = strand.threadID ?? source.threadID
+        state.heldOutLoss = version.heldOutLoss
+        state.commonsLoss = version.commonsLoss
     }
 
-    public func descriptor() -> StrandDescriptor? { live?.descriptor(vocabularySHA256: vocabulary.sha256) }
+    public func descriptor() -> StrandDescriptor? { live?.descriptor(vocabularySHA256: vocabulary.sha256, packSHA256: packSHA256) }
 
     /// The processes a node process reports: itself and its Thread.
     public func setProcess(pid: Int32?, threadPID: Int32?, httpPort: Int?, grpcPort: Int?) {
@@ -301,7 +366,8 @@ public final class ThreadHypervisor {
         let checkpoint = RunLayout.checkpoint(directory, epoch: epoch)
         try Self.link(RunLayout.checkpoint(parentDirectory, epoch: parent.epoch), to: checkpoint)
 
-        let corpus = TokenizedCorpus(snapshot: snapshot, tokenizer: tokenizer)
+        // The stream the live weights were trained and indexed on.
+        let corpus = TokenizedCorpus(snapshot: snapshot, tokenizer: tokenizer, paragraphBreak: live.index.info.paragraphBreak ?? [])
         let alpha = live.index.info.alpha
         let evalResult = EvalPass.run(model: live.model, corpus: corpus, seqLen: settings.seqLen, batchSize: 8, captureKeys: true, alpha: alpha)
         service()
@@ -309,7 +375,8 @@ public final class ThreadHypervisor {
             epoch: epoch, tapLayer: live.index.info.tapLayer, alpha: alpha, keyDims: ProvenanceKey.dimensions(for: live.model.config),
             count: evalResult.indexableCount, checkpointSHA256: parent.checkpointSHA256, corpusHash: snapshot.corpusHash,
             tokenizerSHA256: tokenizer.tokenizerSHA256, threadID: snapshot.threadID, evalLoss: evalResult.meanLoss,
-            evalMemorisedFraction: evalResult.memorisedFraction)
+            evalMemorisedFraction: evalResult.memorisedFraction, cut: IndexInfo.cut(of: live.model.config),
+            paragraphBreak: live.index.info.paragraphBreak)
         let indexDirectory = RunLayout.provenance(directory, epoch: epoch)
         let indexSHA = try ProvenanceIndexer.write(eval: evalResult, corpus: corpus, info: info, memorisedAtEpoch: [:], to: indexDirectory)
 
@@ -319,6 +386,8 @@ public final class ThreadHypervisor {
             tokenizer: tokenizer.ref, corpus: corpusRef(snapshot, path: path, corpus: corpus),
             hyperparameters: parentManifest.hyperparameters, provenance: parentManifest.provenance)
         manifest.vocabularySHA256 = vocabulary.sha256
+        manifest.packSHA256 = packSHA256
+        manifest.paragraphBreak = parentManifest.paragraphBreak
         manifest.notes.append("Reindex of v\(parent.version): its weights re-keyed over snapshot \(snapshot.corpusHash.prefix(12)); nothing trained.")
         manifest.epochs = [EpochRecord(
             epoch: epoch, steps: 0, trainLoss: .nan, trainEntropy: .nan, evalLoss: evalResult.meanLoss,
@@ -369,14 +438,16 @@ public final class ThreadHypervisor {
         if let parent, let live {
             model = try Checkpoint.load(
                 from: RunLayout.checkpoint(layout.version(parent.version), epoch: parent.epoch), tapLayer: live.index.info.tapLayer)
-            let found = VocabularyPack.fingerprint(of: model)
-            guard found == vocabulary.sha256 else { throw VocabularyError.mismatch(node: found, umbrella: vocabulary.sha256) }
-            VocabularyPack.freeze(model)
+            try checkPack(model)
+            // The vocabulary and the trunk stay frozen: only the node's own blocks continue.
+            pack.freeze(model)
         } else {
-            model = try RaoTransformer.make(config: config, seed: settings.seed &+ UInt64(number), tapLayer: config.numHiddenLayers / 2)
-            try vocabulary.install(into: model)
+            // Fresh blocks: the base's own when the pack has one (a warm start), else seeded.
+            model = try RaoTransformer.make(config: config, seed: settings.seed &+ UInt64(number), tapLayer: config.defaultTapLayer)
+            try pack.install(into: model)
         }
-        let corpus = TokenizedCorpus(snapshot: snapshot, tokenizer: tokenizer)
+        let corpus = TokenizedCorpus(
+            snapshot: snapshot, tokenizer: tokenizer, paragraphBreak: settings.passageBreak ? tokenizer.paragraphBreak : [])
         let located = FactLocator.locate(loadFacts(), corpus: corpus, tokenizer: tokenizer).located
         let (epochs, evalEvery) = Self.schedule(
             tokens: corpus.tokenCount, seqLen: settings.seqLen, batchSize: settings.batchSize,
@@ -384,18 +455,36 @@ public final class ThreadHypervisor {
             maxEpochs: parent == nil ? settings.scratchEpochs : settings.continueEpochs, evalSteps: settings.evalSteps)
         // The node decides when to stop, not the trainer: the whole corpus and what changed must
         // both be learned, or a new document would go live half-remembered.
-        let hyper = TrainingHyperparameters(
-            batchSize: settings.batchSize, seqLen: settings.seqLen, epochs: epochs, peakLR: settings.lr,
+        var hyper = TrainingHyperparameters(
+            batchSize: settings.batchSize, seqLen: settings.seqLen, epochs: epochs, peakLR: pack.hasBase ? (settings.warmLR ?? 5e-4) : settings.lr,
             seed: settings.seed &+ UInt64(number), evalEvery: evalEvery, indexEvery: 0, keepCheckpoints: 1,
-            earlyStopMemorised: nil)
+            earlyStopMemorised: nil, checkpointEvaluatedOnly: true,
+            eosFirstWindows: pack.hasBase && !settings.passageBreak ? true : nil, maskDocuments: settings.passageBreak ? true : nil)
+        if settings.arm == "muon" {
+            hyper.optimizer = "muon"
+            hyper.muonScale = 0.2 * Float(config.hiddenSize).squareRoot()
+        }
+        // With a warmup-stable-decay schedule a version that learns anneals before it is indexed.
+        let stableDecay = settings.arm == "wsd"
+        if stableDecay {
+            hyper.schedule = "wsd"
+            hyper.annealFraction = 0.2
+            hyper.annealMinSteps = 50
+        }
         let provenance = ProvenanceSettings(tapLayer: model.tapLayer, alpha: 0.5)
         let directory = layout.version(number)
         var manifest = RunManifest(
             runID: String(format: "%@-v%04d", name, number), preset: settings.preset, model: config, tokenizer: tokenizer.ref,
             corpus: corpusRef(snapshot, path: path, corpus: corpus), hyperparameters: hyper, provenance: provenance)
         manifest.vocabularySHA256 = vocabulary.sha256
-        manifest.notes.append(parent.map { "Blocks continued from v\($0.version); the shared vocabulary stays frozen." }
-            ?? "Fresh blocks against the shared vocabulary, which stays frozen.")
+        manifest.packSHA256 = packSHA256
+        if pack.hasTrunk {
+            manifest.notes.append(parent.map { "Blocks 0..<\(config.cut) continued from v\($0.version); the vocabulary and the umbrella's trunk stay frozen." }
+                ?? "Blocks 0..<\(config.cut) start as the base model's (\(pack.name)); the vocabulary and the umbrella's trunk stay frozen.")
+        } else {
+            manifest.notes.append(parent.map { "Blocks continued from v\($0.version); the shared vocabulary stays frozen." }
+                ?? "Fresh blocks against the shared vocabulary, which stays frozen.")
+        }
 
         let changedKeys = parent == nil ? nil : Set(change.added + change.changed)
         let changedDocuments = Set(change.addedDocuments)
@@ -418,8 +507,8 @@ public final class ThreadHypervisor {
             runDirectory: directory, manifest: manifest)
         var result = try trainer.run(shouldStop: { [self] in
             self.service()
-            return learned || self.shouldCancel()
-        }) { [self] event in
+            return (learned && !stableDecay) || self.shouldCancel()
+        }, shouldAnneal: { learned }) { [self] event in
             switch event {
             case .started(let total, _, _):
                 self.state.steps = total
@@ -438,7 +527,7 @@ public final class ThreadHypervisor {
                 self.state.preview = self.preview(model)
                 let changed = changedKeys.map { keys in keys.isEmpty ? overall : Stats.mean(keys.map { self.memorised[$0] ?? 0 }) } ?? overall
                 let facts = changedFacts.isEmpty ? 1 : Float(factsMemorised.intersection(changedFacts).count) / Float(changedFacts.count)
-                if overall >= self.settings.earlyStop, changed >= self.settings.earlyStop, facts >= 0.9 {
+                if !learned, overall >= self.settings.earlyStop, changed >= self.settings.earlyStop, facts >= 0.9 {
                     learned = true
                     self.log(String(format: "v%d learned after epoch %d: %.1f%% memorised, %.1f%% of what changed, %.0f%% of its facts",
                                     number, record.epoch, overall * 100, changed * 100, facts * 100))
@@ -447,7 +536,9 @@ public final class ThreadHypervisor {
             case .indexed(let epoch, let entries, _, _):
                 self.mark("index", .done, "epoch \(epoch) · \(entries) entries")
                 self.stage(.indexing, "indexed epoch \(epoch)")
-            case .earlyStop, .message:
+            case .message(let line):
+                self.log("v\(number): \(line)")
+            case .earlyStop:
                 break
             }
             self.service()
@@ -464,7 +555,8 @@ public final class ThreadHypervisor {
                 epoch: record.epoch, tapLayer: model.tapLayer, alpha: provenance.alpha, keyDims: ProvenanceKey.dimensions(for: model.config),
                 count: evalResult.indexableCount, checkpointSHA256: checkpointSHA, corpusHash: snapshot.corpusHash,
                 tokenizerSHA256: tokenizer.tokenizerSHA256, threadID: snapshot.threadID, evalLoss: evalResult.meanLoss,
-                evalMemorisedFraction: evalResult.memorisedFraction)
+                evalMemorisedFraction: evalResult.memorisedFraction, cut: IndexInfo.cut(of: model.config),
+                paragraphBreak: corpus.paragraphBreak.isEmpty ? nil : corpus.paragraphBreak.map(Int.init))
             let indexDirectory = RunLayout.provenance(directory, epoch: record.epoch)
             let sha = try ProvenanceIndexer.write(
                 eval: evalResult, corpus: corpus, info: info, memorisedAtEpoch: Self.memorisedAtEpoch(directory: directory, epoch: record.epoch),
@@ -497,12 +589,12 @@ public final class ThreadHypervisor {
         (try? JSONCoding.readLines(Fact.self, from: layout.facts)) ?? []
     }
 
-    /// Per-block parameters, copied: the optimizer updates arrays in place.
+    /// Per-block parameters of the node's own blocks (below the cut), copied: the optimizer
+    /// updates arrays in place.
     static func blockParameters(_ model: RaoTransformer) -> [Int: [MLXArray]] {
         var blocks: [Int: [MLXArray]] = [:]
-        for (key, value) in model.parameters().flattened() where key.hasPrefix("model.layers.") {
-            let parts = key.split(separator: ".")
-            guard parts.count > 2, let block = Int(parts[2]) else { continue }
+        for (key, value) in model.parameters().flattened() {
+            guard let block = RaoTransformer.blockIndex(ofKey: key), block < model.cut else { continue }
             blocks[block, default: []].append(value + 0)
         }
         for arrays in blocks.values { eval(arrays) }
@@ -613,7 +705,7 @@ public final class ThreadHypervisor {
         mark("gates", .running)
         stage(.gating, "gating v\(number)")
         var gates: [GateResult] = []
-        let context: RunContext
+        var context: RunContext
         do {
             context = try RunContext.load(runDirectory: directory, epoch: epoch, allowWeakIndex: true, tokenizer: tokenizer)
             gates.append(GateResult("chain", true, "index ↔ checkpoint \(context.checkpointSHA256.prefix(8)) ↔ tokenizer"))
@@ -622,7 +714,21 @@ public final class ThreadHypervisor {
             return hold(kind: kind, number: number, directory: directory, epoch: epoch, gates: gates, snapshot: snapshot,
                         path: path, change: change, started: started, epochsTrained: epochsTrained)
         }
+        if settings.calibrate == true {
+            // λ and τ from how the corpus traces itself, written into the index the version serves.
+            stage(.gating, "v\(number): reading the corpus's self-trajectory")
+            let calibration = SelfTrajectory.calibrate(
+                model: context.model, index: context.index, corpus: try context.tokenizedCorpus(), alpha: context.index.info.alpha)
+            var info = context.index.info
+            info.calibration = calibration
+            try JSONCoding.write(info, to: RunLayout.provenance(directory, epoch: epoch).appendingPathComponent(ProvenanceIndexFiles.info))
+            context = try RunContext.load(runDirectory: directory, epoch: epoch, allowWeakIndex: true, tokenizer: tokenizer)
+            service()
+        }
         gates.append(VersionGates.vocabulary(found: VocabularyPack.fingerprint(of: context.model), expected: vocabulary.sha256))
+        if pack.hasTrunk {
+            gates.append(VersionGates.trunk(found: UmbrellaPack.fingerprint(of: context.model), expected: pack.sha256))
+        }
         let fraction = context.index.info.evalMemorisedFraction
         if let gate = VersionGates.memorised(fraction, kind: kind, floor: settings.memorisedFloor) { gates.append(gate) }
         gates.append(VersionGates.withdrawn(indexDocuments: Set(context.index.partitions.map(\.documentID)), removed: change.removedDocuments))
@@ -631,15 +737,21 @@ public final class ThreadHypervisor {
         service()
         state.gates = gates
 
-        let strand = ThreadStrand(name: name, label: label, version: number, context: context, owner: owner)
+        let strand = self.strand(version: number, context: context)
         let corpus = try context.tokenizedCorpus()
-        let version = NodeVersion(
+        let losses = heldOutLosses(context.model, paragraphBreak: context.index.info.paragraphBreak ?? [])
+        service()
+        var version = NodeVersion(
             version: number, parent: liveVersion?.version, kind: kind, snapshotBefore: liveSnapshot?.corpusHash,
             snapshotAfter: snapshot.corpusHash, snapshotPath: path, change: change, vocabularySHA256: vocabulary.sha256,
             checkpointSHA256: context.checkpointSHA256, indexSHA256: context.index.sha256, epoch: epoch, epochsTrained: epochsTrained,
             memorised: fraction, evalLoss: context.index.info.evalLoss, documents: corpus.documents.count,
             partitions: corpus.partitions.count, tokens: corpus.tokenCount, gates: gates, promoted: gates.allSatisfy(\.passed),
             seconds: Date().timeIntervalSince(started), createdAt: .wholeSecond())
+        version.packSHA256 = packSHA256
+        version.heldOutLoss = losses.own
+        version.commonsLoss = losses.commons
+        version.calibration = context.index.info.calibration
         try JSONCoding.write(version, to: directory.appendingPathComponent(NodeVersion.fileName))
         refreshHistory()
         guard version.promoted else {
@@ -689,6 +801,19 @@ public final class ThreadHypervisor {
         log("v\(version.version) held: \(reason)")
         stage(.held, "v\(version.version) held · \(failed.map(\.name).joined(separator: ", "))")
         return nil
+    }
+
+    /// A model's mean loss on the unfed documents the feeder left beside the node (its own
+    /// voice), and on the pack's commons sample. Own documents are read as the version's stream reads them.
+    func heldOutLosses(_ model: RaoTransformer, paragraphBreak: [Int] = []) -> (own: Float?, commons: Float?) {
+        let documents = (try? JSONCoding.readLines(CorpusDocument.self, from: layout.heldOut)) ?? []
+        let eos = Int32(tokenizer.eosTokenID)
+        let own = documents.isEmpty ? nil
+            : HeldOut.loss(
+                model: model, texts: documents.map { HeldOut.tokens($0, tokenizer: tokenizer, paragraphBreak: paragraphBreak) }, eos: eos,
+                seqLen: settings.seqLen)
+        let commons = pack.heldOut.isEmpty ? nil : HeldOut.loss(model: model, texts: pack.heldOut.map(\.tokens), eos: eos, seqLen: settings.seqLen)
+        return (own, commons)
     }
 
     /// Probes a candidate with facts from the changed documents; the spans it emits must verify

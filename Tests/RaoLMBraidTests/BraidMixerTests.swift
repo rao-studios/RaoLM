@@ -470,14 +470,16 @@ struct BraidTrajectoryGateTests {
         #expect(BraidMixer.asked(manner: [0], gate: byManner) == [true])
     }
 
-    @Test("a request's default gate reads the trajectory both ways at β 4 and asks by manner; a gate recorded without them reads as off")
+    @Test("a request's default gate reads the trajectory both ways at β 4, asks by manner and leaves agreement off; a gate recorded without them reads as off")
     func requestDefault() throws {
         let gate = BraidRequest.defaultGate
         #expect(gate.trajectory == .both && gate.trajectoryBeta == 4 && gate.ask == .manner && gate.askFloor == 0.25)
+        #expect(gate.agreement == false)
         let request = BraidRequest(promptTokens: [1], promptText: "", params: GenerationParameters(tapLayer: 1, alpha: 0.5))
         #expect(request.gate == gate && request.gating == .braided)
         let written = String(decoding: try JSONCoding.lineEncoder().encode(gate), as: UTF8.self)
         #expect(written.contains("\"trajectory\":\"both\"") && written.contains("\"ask\":\"manner\"") && written.contains("\"trajectoryBeta\":4"))
+        #expect(written.contains("\"agreement\":false"))
         #expect(gate.fingerprint != BraidGate().fingerprint)
         let old = #"{"agreement":true,"credibility":true,"credibilityRate":0.3,"evidenceCeiling":0.5,"evidenceFloor":0.05,"generatedEvidence":false,"share":"variable","shareRate":0.1}"#
         #expect(try JSONCoding.decoder().decode(BraidGate.self, from: Data(old.utf8)) == BraidGate())

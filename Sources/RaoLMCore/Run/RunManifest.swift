@@ -32,13 +32,39 @@ public struct TrainingHyperparameters: Codable, Sendable, Equatable {
     /// Stop early once an eval pass reports at least this memorised fraction.
     public var earlyStopMemorised: Float?
     public var evalBatchSize: Int
+    /// Checkpoint only the epochs that are evaluated or indexed (and the last), not every epoch:
+    /// a braid node keeps only the checkpoint it indexes. Nil (absent) checkpoints every epoch.
+    public var checkpointEvaluatedOnly: Bool?
+    /// Every other window of the grid begins with eos in place of its first token. The eval pass
+    /// and the provenance index read each document from eos at position 0; a warm-started model's
+    /// first position is its attention sink, and trained only on windows that open mid-text its
+    /// eos-first state can drift until the eval and the index keys break while the training loss
+    /// stays low. Nil (absent) leaves every window as the stream gives it.
+    public var eosFirstWindows: Bool?
+    /// Attention stays inside a document: a token attends only to earlier tokens of its own document,
+    /// an eos belonging to the document it opens. Every whole document in a window is then computed
+    /// as the eval pass and the index compute it. Nil (absent): the causal mask over the window.
+    public var maskDocuments: Bool?
+    /// The optimizer. Nil: AdamW for every parameter. "muon": Muon for the node blocks' 2-D weight
+    /// matrices, at the schedule's rate times `muonScale`, and AdamW for the rest.
+    public var optimizer: String?
+    /// Muon's rate as a multiple of the schedule's: 0.2·√hidden matches its update's size to AdamW's.
+    public var muonScale: Float?
+    /// The schedule. Nil: warmup, then cosine to `finalLR` over the planned steps. "wsd": warmup, the
+    /// peak held until the caller asks for the anneal (or the plan runs short), then a linear fall to
+    /// `finalLR` over max(`annealMinSteps`, `annealFraction` × the steps so far), to an epoch's end,
+    /// where training stops.
+    public var schedule: String?
+    public var annealFraction: Float?
+    public var annealMinSteps: Int?
 
     public init(
         batchSize: Int = 4, seqLen: Int = 512, epochs: Int = 60, peakLR: Float = 2e-3,
         warmupFraction: Float = 0.05, finalLR: Float = 1e-4, beta1: Float = 0.9, beta2: Float = 0.95,
         eps: Float = 1e-8, weightDecay: Float = 0.01, biasCorrection: Bool = true, gradClip: Float = 1.0,
         seed: UInt64 = 42, evalEvery: Int = 10, indexEvery: Int = 0, keepCheckpoints: Int = 3,
-        earlyStopMemorised: Float? = 0.98, evalBatchSize: Int = 8
+        earlyStopMemorised: Float? = 0.98, evalBatchSize: Int = 8, checkpointEvaluatedOnly: Bool? = nil,
+        eosFirstWindows: Bool? = nil, maskDocuments: Bool? = nil
     ) {
         self.batchSize = batchSize
         self.seqLen = seqLen
@@ -58,6 +84,9 @@ public struct TrainingHyperparameters: Codable, Sendable, Equatable {
         self.keepCheckpoints = keepCheckpoints
         self.earlyStopMemorised = earlyStopMemorised
         self.evalBatchSize = evalBatchSize
+        self.checkpointEvaluatedOnly = checkpointEvaluatedOnly
+        self.eosFirstWindows = eosFirstWindows
+        self.maskDocuments = maskDocuments
     }
 }
 
@@ -74,7 +103,7 @@ public struct ProvenanceSettings: Codable, Sendable, Equatable {
     }
 
     public static func defaults(for config: RaoLMConfig) -> ProvenanceSettings {
-        ProvenanceSettings(tapLayer: config.numHiddenLayers / 2, alpha: 0.5)
+        ProvenanceSettings(tapLayer: config.defaultTapLayer, alpha: 0.5)
     }
 }
 
@@ -214,6 +243,11 @@ public struct RunManifest: Codable, Sendable {
     /// Set when the embedding and final norm were a frozen, shared vocabulary: only the blocks
     /// trained. Absent in runs that trained everything.
     public var vocabularySHA256: String?
+    /// Set when the blocks from the model's cut on were an umbrella pack's frozen trunk as well.
+    public var packSHA256: String?
+    /// The paragraph break that joined each document's partitions in every stream the run built
+    /// (training, eval, index); nil: partitions joined with nothing (runs made before the break).
+    public var paragraphBreak: [Int]?
 
     public init(
         runID: String, preset: String, model: RaoLMConfig, tokenizer: TokenizerRef, corpus: CorpusRef,

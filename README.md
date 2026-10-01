@@ -36,6 +36,13 @@ Thread, under one umbrella.
   its hidden state `h` only when the manner or the gate calls for it, runs the head once per
   Thread, and mixes the predictions into one distribution, split exactly by Thread.
 
+**The `base` preset (v2)** gives the umbrella layers of its own without ever training them when a
+node joins: an umbrella pack cut from SmolLM2-135M. Its vocabulary is shared as before; its upper
+ten blocks are a frozen trunk every node runs after its own twenty, which start as SmolLM2's; and the
+whole base model runs at the umbrella as the commons strand, so what SmolLM2 already knew earns no
+Thread anything. [ARCHITECTURE.md](Docs/ARCHITECTURE.md) has the design and its bench,
+[RESEARCH.md](Docs/RESEARCH.md) the reading behind it.
+
 ## The idea
 
 - **Distributed Threads.** A Thread's documents stay on its node. The node hosts the lower half
@@ -62,6 +69,7 @@ Requirements: macOS 15+ on Apple Silicon, Swift 6.3+, sibling checkouts of `../F
 scripts/cli.sh doctor                # checks the setup
 scripts/cli.sh braid                 # the studio on 9 Braid, three Thread nodes starting (ambient, craft, veil)
 scripts/cli.sh braid demo --offline  # the same headless, with no Thread binary needed
+scripts/cli.sh braid --preset base   # nodes warm-started from SmolLM2-135M under its frozen trunk (the braid keeps the preset)
 scripts/cli.sh demo                  # one model end to end: corpus, Thread, training, citations, checks
 ```
 
@@ -156,9 +164,9 @@ MLX and no Thread, run `raolm ui --fixtures Tests/RaoLMStudioTests/Fixtures/demo
 | Target | Role |
 |---|---|
 | `RaoLMCore` | Corpus, hashing, synthetic corpus, snapshots, manifests, citation schemas, the braid's values. |
-| `RaoLMModel` | The transformer, split into body and head; the provenance key, tokenizer, shared vocabulary and checkpoint I/O. |
+| `RaoLMModel` | The transformer, split into body and head and cut into a node's blocks and the umbrella's trunk; the provenance key, tokenizer, shared vocabulary, umbrella pack and checkpoint I/O. |
 | `RaoLMTraining` | Tokenized corpus, pretraining, eval pass, entropy ledger and indexer. |
-| `RaoLMProvenance` | Retrieval, logit mixing, cited and braided generation, the gate, the verifier and evaluation. |
+| `RaoLMProvenance` | Retrieval, logit mixing, cited and braided generation, the gate, the commons strand, each Thread's own λ and τ, thought agreement, the verifier and evaluation. |
 | `RaoLMThread` | The gRPC client for a Thread node, and a host that runs one. |
 | `RaoLMGrounding` | The two-fold harness over SinatraHarness. |
 | `RaoLMBraid` | A transformer per Thread: node processes and their wire, the update loop and gates, the gate bench. |
@@ -177,8 +185,14 @@ Use `scripts/test.sh` rather than `swift test`: it places MLX's Metal library in
 
 ## Known limits
 
-- **Tiny, memorising models.** Real corpora will need a warm start from SmolLM2 weights. The
-  loader accepts them, but that path is untested.
+- **Tiny, memorising models by default.** The `base` preset warm-starts every node from SmolLM2-135M
+  (`raolm umbrella build` downloads it once, about 270 MB); a `base` checkpoint is 540 MB, so its
+  braids belong on a large disk.
+- **`base` has not earned the default.** On the adopted recipe its nodes learn in about 2.5×
+  fewer steps and score a quarter of tiny's loss on unfed text in their own voice. On every fact
+  prompt they answer 95% exactly against tiny's 86%. But fed twice the documents they answer 91%,
+  a 4-point drop the bench allows only 2 of, so `bench-umbrella` qualifies no arm
+  ([ARCHITECTURE.md](Docs/ARCHITECTURE.md), Results). A `base` braid also needs a large disk.
 - **Withdrawn text stays in a node's weights** until the node retrains. Its index drops the text
   at once, so it can no longer be cited.
 - **Once only one Thread knows the text, it supplies nearly every word.** The braid shows in the

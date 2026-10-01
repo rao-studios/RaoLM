@@ -30,7 +30,9 @@ public enum RaoLoss {
         model: RaoTransformer
     ) -> (RaoTransformer, [MLXArray]) -> ([MLXArray], ModuleParameters) {
         valueAndGrad(model: model) { (model: RaoTransformer, arrays: [MLXArray]) -> [MLXArray] in
-            let logits = model.forward(arrays[0], cache: nil, captureTap: false).logits.asType(.float32)
+            // arrays: inputs, targets, loss mask, and optionally the attention mask (a document's own tokens).
+            let logits = model.forward(arrays[0], cache: nil, captureTap: false, attention: arrays.count > 3 ? arrays[3] : nil)
+                .logits.asType(.float32)
             let (perToken, entropy) = tokenStats(logits: logits, targets: arrays[1])
             let mask = arrays[2]
             let loss = (perToken * mask).sum() / MLX.maximum(mask.sum(), MLXArray(Float(1)))

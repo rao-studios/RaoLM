@@ -190,7 +190,7 @@ public enum VocabularyBench {
         try commonsVocabulary.install(into: fresh)
         try await measure(Arm(name: "commons, fresh blocks", vocabulary: String(commonsVocabulary.sha256.prefix(12)), model: fresh))
 
-        let warm = try Checkpoint.load(from: URL(fileURLWithPath: commonsCheckpoint), tapLayer: config.numHiddenLayers / 2)
+        let warm = try Checkpoint.load(from: URL(fileURLWithPath: commonsCheckpoint), tapLayer: config.defaultTapLayer)
         VocabularyPack.freeze(warm)
         try await measure(Arm(name: "commons, warm blocks", vocabulary: String(commonsVocabulary.sha256.prefix(12)), model: warm))
         try commonsVocabulary.save(to: options.directory.appendingPathComponent("commons-vocabulary", isDirectory: true))

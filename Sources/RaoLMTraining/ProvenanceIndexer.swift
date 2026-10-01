@@ -33,11 +33,19 @@ public struct IndexInfo: Codable, Sendable, Equatable {
     public var defaultTau: Float
     public var defaultK: Int
     public var createdAt: Date
+    /// The first block of the umbrella's trunk in the model that keyed the index; nil without a
+    /// trunk. config.json is not covered by the checkpoint's hash, so the index records it.
+    public var cut: Int?
+    /// λ and the kNN temperature set from the corpus's self-trajectory; nil: the request's own.
+    public var calibration: StrandCalibration?
+    /// The paragraph break that joined each document's partitions when the index was keyed; nil:
+    /// partitions joined with nothing (indexes made before the break).
+    public var paragraphBreak: [Int]?
 
     public init(
         epoch: Int, tapLayer: Int, alpha: Float, keyDims: Int, count: Int, checkpointSHA256: String,
         corpusHash: String, tokenizerSHA256: String, threadID: String?, evalLoss: Float,
-        evalMemorisedFraction: Float, defaultTau: Float = 0.05, defaultK: Int = 16
+        evalMemorisedFraction: Float, defaultTau: Float = 0.05, defaultK: Int = 16, cut: Int? = nil, paragraphBreak: [Int]? = nil
     ) {
         self.version = 1
         self.epoch = epoch
@@ -55,7 +63,13 @@ public struct IndexInfo: Codable, Sendable, Equatable {
         self.defaultTau = defaultTau
         self.defaultK = defaultK
         self.createdAt = Date()
+        self.cut = cut
+        self.calibration = nil
+        self.paragraphBreak = paragraphBreak
     }
+
+    /// `cut` as an index records it: nil for a model with no trunk.
+    public static func cut(of config: RaoLMConfig) -> Int? { config.hasTrunk ? config.cut : nil }
 }
 
 public enum ProvenanceIndexFiles {

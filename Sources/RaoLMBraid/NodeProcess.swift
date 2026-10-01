@@ -174,6 +174,13 @@ public final class ProcessStrandLink: StrandLink {
         }
     }
 
+    public func states(session: String, positions: [Int]) -> StrandCall<StrandStates> {
+        node.send(.states(session: session, positions: positions)).map { reply in
+            guard case .states(let last, let cut) = reply else { throw StrandLinkError.unexpected("\(reply)") }
+            return StrandStates(last: last.map(\.values), cut: cut.map(\.values))
+        }
+    }
+
     public func close(session: String) {
         _ = node.send(.close(session: session))
     }

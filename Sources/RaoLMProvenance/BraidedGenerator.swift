@@ -8,11 +8,16 @@
 //        applies the one shared final norm and tied head to each, mixes the Threads' own
 //        kNN-LMs by their gates, chooses a token, and sends it to every Thread. Each trace
 //        records what every Thread supplied.
+//        With an umbrella pack that has a base model, the commons strand joins the Threads: the
+//        base model the nodes started from, always asked, retrieving nothing and cited to
+//        nothing. The gate then weighs a Thread by what it knows beyond the commons (its lift),
+//        from a memory that starts on the commons, so what the base already knew is no one's.
 //  OUT:  A CitedGeneration over one partition table that holds every Thread's rows, each
 //        partition carrying its Thread, so spans, citations and verification run unchanged.
 //  PIN:  Requests go to every Thread before the umbrella waits on any. Prompt positions are
 //        scored in one batch per Thread, as a model's prefill is, so a braid of one Thread
-//        reproduces CitedGenerator number for number under every gating.
+//        reproduces CitedGenerator number for number under every gating. A Thread's own λ and
+//        τ (its calibration) apply exactly as CitedGenerator applies them to that Thread alone.
 //
 
 import Foundation
@@ -54,7 +59,10 @@ public struct BraidRequest: Sendable {
     /// bench chose both, β 4 under its rule; the owner made it and asking by manner the default
     /// (2026-09-29, Docs/BRAID.md). `BraidGate()` stays the gate without them, and it is what a
     /// recorded gate without trajectory settings reads as.
-    public static let defaultGate = BraidGate(trajectory: .both, trajectoryBeta: 4, ask: .manner)
+    /// The trajectory both ways at β 4 and asking by manner (the owner's choice, 2026-09-29); agreement
+    /// off (2026-10-01): it lifted every Thread whose retrieval backed a token they all write, such as
+    /// the space before a number, and cost the owner its lead.
+    public static let defaultGate = BraidGate(agreement: false, trajectory: .both, trajectoryBeta: 4, ask: .manner)
 }
 
 /// One position of a braided generation as it happens, for a live display.
@@ -68,6 +76,7 @@ public enum BraidError: Error, CustomStringConvertible {
     case noStrands
     case vocabulary(strand: String, found: String, expected: String)
     case hiddenSize(strand: String, found: Int, expected: Int)
+    case pack(strand: String, found: String?, expected: String?)
 
     public var description: String {
         switch self {
@@ -76,6 +85,8 @@ public enum BraidError: Error, CustomStringConvertible {
             return "\(strand) embeds with vocabulary \(found.prefix(12))…, the umbrella's head is \(expected.prefix(12))…"
         case .hiddenSize(let strand, let found, let expected):
             return "\(strand) sends \(found)-wide hidden states, the umbrella's head reads \(expected)"
+        case .pack(let strand, let found, let expected):
+            return "\(strand) runs the umbrella pack \(found.map { String($0.prefix(12)) + "…" } ?? "none"), the umbrella's is \(expected.map { String($0.prefix(12)) + "…" } ?? "none")"
         }
     }
 }
@@ -88,8 +99,18 @@ public final class BraidedGenerator {
     public let partitionsByRow: [Int: PartitionRef]
     public let sharedNgrams: Set<UInt64>
     public var timeout: TimeInterval = 120
+    /// The commons strand's place among the links, when there is one.
+    public let commons: Int?
+    /// Per strand: its kNN temperature (nil: the request's) and the scale of its λ.
+    let taus: [Float?]
+    let lambdaScales: [Float]
+    private lazy var thoughtReader = ThoughtReader(descriptors: links.map(\.descriptor))
 
-    public init(links: [StrandLink], head: UmbrellaHead, tokenizer: RaoTokenizer, gateFloor: Float = BraidMixer.defaultGateFloor) throws {
+    /// `packSHA256`: the umbrella pack every Thread must run when it has a trunk.
+    public init(
+        links: [StrandLink], head: UmbrellaHead, tokenizer: RaoTokenizer, gateFloor: Float = BraidMixer.defaultGateFloor,
+        packSHA256: String? = nil
+    ) throws {
         guard !links.isEmpty else { throw BraidError.noStrands }
         var strands: [BraidStrandRef] = []
         var partitions: [Int: PartitionRef] = [:]
@@ -104,9 +125,12 @@ public final class BraidedGenerator {
             guard d.hiddenSize == head.hiddenSize else {
                 throw BraidError.hiddenSize(strand: d.name, found: d.hiddenSize, expected: head.hiddenSize)
             }
+            guard d.isCommons || d.packSHA256 == packSHA256 else {
+                throw BraidError.pack(strand: d.name, found: d.packSHA256, expected: packSHA256)
+            }
             strands.append(BraidStrandRef(
                 name: d.name, label: d.label, threadID: d.threadID, version: d.version, manifest: d.manifest,
-                rowOffset: rowOffset, rowCount: d.partitions.count, entryOffset: entryOffset))
+                rowOffset: rowOffset, rowCount: d.partitions.count, entryOffset: entryOffset, commons: d.isCommons ? true : nil))
             for partition in d.partitions {
                 var global = partition
                 global.row = rowOffset + partition.row
@@ -120,12 +144,66 @@ public final class BraidedGenerator {
         self.links = links
         self.head = head
         self.tokenizer = tokenizer
-        self.braid = BraidRef(vocabularySHA256: head.vocabularySHA256, gateFloor: gateFloor, strands: strands)
+        self.braid = BraidRef(vocabularySHA256: head.vocabularySHA256, gateFloor: gateFloor, strands: strands, packSHA256: packSHA256)
         self.partitionsByRow = partitions
         self.sharedNgrams = ngrams
+        self.commons = links.firstIndex { $0.descriptor.isCommons }
+        self.taus = links.map { $0.descriptor.isCommons ? nil : $0.descriptor.calibration?.tau }
+        self.lambdaScales = links.map { $0.descriptor.isCommons ? 0 : ($0.descriptor.calibration?.lambdaScale ?? 1) }
     }
 
     public var names: [String] { braid.strands.map(\.name) }
+
+    /// Strand t's own kNN-LM at one position, under its own τ and λ.
+    func expert(_ t: Int, hits: [StrandHit], logits: [Float]?, params: GenerationParameters) -> BraidMixer.Expert {
+        BraidMixer.Expert(hits: hits, tau: taus[t] ?? params.tau, logits: logits, lambdaScale: lambdaScales[t])
+    }
+
+    /// Which strands the prompt asks for their hidden state: the gate's rule over the Threads, and
+    /// always the commons.
+    func askedAtPrompt(manner: [Float?], gate: BraidGate) -> [Bool] {
+        guard let commons else { return BraidMixer.asked(manner: manner, gate: gate) }
+        var threads = manner
+        threads.remove(at: commons)
+        var asked = threads.isEmpty ? [] : BraidMixer.asked(manner: threads, gate: gate)
+        asked.insert(true, at: commons)
+        return asked
+    }
+
+    /// The gate's open strands, and always the commons.
+    func openStrands(_ gates: [Float], floor: Float) -> [Bool] {
+        var open = BraidMixer.gate(gates, floor: floor)
+        if let commons, open.indices.contains(commons) { open[commons] = true }
+        return open
+    }
+
+    /// How far each Thread thinks what the leading Thread thinks, from their descriptions of one
+    /// position; nil when the commons leads or the leader was not read.
+    func thought(_ descriptions: [[Float]?], leader: Int) -> [Float]? {
+        guard leader != commons, descriptions.indices.contains(leader), let lead = descriptions[leader] else { return nil }
+        return descriptions.indices.map { t in
+            if t == leader { return 1 }
+            guard t != commons, let own = descriptions[t] else { return 0 }
+            return thoughtReader.agreement(t, leader, own, lead)
+        }
+    }
+
+    /// Whether strand t's thought is read under `gate`.
+    func reads(_ t: Int, gate: BraidGate) -> Bool {
+        gate.thoughtAgreement && t != commons && thoughtReader.reads(t)
+    }
+
+    /// Strand t's hidden states at `positions`, with its cut states when its thought is read.
+    func fetch(_ t: Int, session: String, positions: [Int], gate: BraidGate) -> StrandCall<StrandStates> {
+        reads(t, gate: gate)
+            ? links[t].states(session: session, positions: positions)
+            : links[t].hidden(session: session, positions: positions).map { StrandStates(last: $0, cut: []) }
+    }
+
+    /// A MixtureStats position for a mix: its λ recorded only when it is not the request's.
+    static func position(_ mix: BraidMixer.ExpertMix, lambda: Float) -> MixtureStats.Position {
+        MixtureStats.Position(weights: mix.headWeights, knn: mix.knn, lambda: mix.lambda == min(max(lambda, 0), 1) ? nil : mix.lambda)
+    }
 
     /// `onPrompt` sees the prompt's traces once every Thread has scored it; `onStep` sees each
     /// generated token as it is chosen. Throwing from either stops the generation.
@@ -166,25 +244,28 @@ public final class BraidedGenerator {
         let everyPosition = Array(0..<prompt.count)
         // Every Thread scores the prompt, unless the gate asks by manner: then the Threads whose
         // retrieval moves through their documents the way the prompt runs (all, when none does).
-        let asked = BraidMixer.asked(manner: promptSteps.map { $0.last?.trajectory?.manner }, gate: gate)
-        let hiddenCalls = links.indices.map { t in asked[t] ? links[t].hidden(session: session, positions: everyPosition) : nil }
-        let promptArrays = try hiddenCalls.map { call in try call.map { head.logitsArray(hiddens: try $0.wait(timeout: timeout)) } }
+        // The commons is always asked.
+        let asked = askedAtPrompt(manner: promptSteps.map { $0.last?.trajectory?.manner }, gate: gate)
+        let stateCalls = links.indices.map { t in asked[t] ? fetch(t, session: session, positions: everyPosition, gate: gate) : nil }
+        let promptStates = try stateCalls.map { try $0?.wait(timeout: timeout) }
+        let promptArrays = promptStates.map { $0.map { head.logitsArray(hiddens: $0.last) } }
         let promptLogits = promptArrays.map { $0.map { head.rows($0) } }
+        let promptThoughts = links.indices.map { t in reads(t, gate: gate) ? promptStates[t].flatMap { thoughtReader.describe(t, states: $0.cut) } : nil }
 
-        var state = BraidMixer.GateState(threads: links.count)
+        var state = BraidMixer.GateState(threads: links.count, commons: commons, prior: gate.commonsPrior)
         var traces: [TokenTrace] = []
         var mixtures: [MixtureStats.Position] = []
         for j in 1..<prompt.count {
-            let experts = links.indices.map { t in
-                BraidMixer.Expert(hits: promptSteps[t][j - 1].hits, tau: params.tau, logits: promptLogits[t]?[j - 1])
-            }
+            let experts = links.indices.map { t in expert(t, hits: promptSteps[t][j - 1].hits, logits: promptLogits[t]?[j - 1], params: params) }
             let trajectories = promptSteps.map { $0[j - 1].trajectory }
-            let backs = BraidMixer.agreement(experts: experts, leader: state.leader)
+            var backs = BraidMixer.agreement(experts: experts, leader: state.leader)
+            let thinking = thought(promptThoughts.map { $0?[j - 1] }, leader: state.leader)
+            if let thinking { backs = zip(backs, thinking).map { max($0, $1) } }
             let gates = BraidMixer.weights(state: state, agreement: backs, trace: BraidMixer.traces(trajectories), gate: gate)
             let mix = BraidMixer.mix(experts: experts, posterior: gates, open: asked, lambda: lambda, vocabularySize: vocabulary)
             traces.append(trace(mix: mix, experts: experts, token: prompt[j], index: j, forced: true, names: names, threadIDs: threadIDs,
-                                memory: state.memory, backs: backs, trajectories: trajectories))
-            mixtures.append(MixtureStats.Position(weights: mix.weights, knn: mix.knn))
+                                memory: state.memory, backs: backs, trajectories: trajectories, thought: thinking))
+            mixtures.append(Self.position(mix, lambda: lambda))
             // A Thread that was not asked is credited with what its retrieval alone gave the token.
             let likelihoods = experts.map { $0.probability(of: prompt[j], lambda: lambda) ?? $0.lowerBound(of: prompt[j], lambda: lambda) }
             BraidMixer.observe(&state, likelihoods: likelihoods, gate: gate)
@@ -196,25 +277,30 @@ public final class BraidedGenerator {
         try onPrompt?(traces)
 
         var experts = links.indices.map { t in
-            BraidMixer.Expert(hits: promptSteps[t][prompt.count - 1].hits, tau: params.tau, logits: promptLogits[t]?[prompt.count - 1])
+            expert(t, hits: promptSteps[t][prompt.count - 1].hits, logits: promptLogits[t]?[prompt.count - 1], params: params)
         }
         var trajectories = promptSteps.map { $0[prompt.count - 1].trajectory }
         var logits: [Int: [Float]] = [:]
         var arrays: [Int: MLXArray] = [:]
+        var descriptions: [[Float]?] = promptThoughts.map { $0?[prompt.count - 1] }
         for t in links.indices {
             if let rows = promptLogits[t] { logits[t] = rows[prompt.count - 1] }
             if let array = promptArrays[t] { arrays[t] = array[(prompt.count - 1)..<prompt.count] }
         }
         var backs = BraidMixer.agreement(experts: experts, leader: state.leader)
+        var thinking = thought(descriptions, leader: state.leader)
+        if let thinking { backs = zip(backs, thinking).map { max($0, $1) } }
         var gates = BraidMixer.weights(state: state, agreement: backs, trace: BraidMixer.traces(trajectories), gate: gate)
-        var open = BraidMixer.gate(gates, floor: floor)
+        var open = openStrands(gates, floor: floor)
         // A Thread the prompt did not ask that the gate opens now is asked for its last position.
         for t in links.indices where open[t] && logits[t] == nil {
-            if let hidden = try links[t].hidden(session: session, positions: [prompt.count - 1]).wait(timeout: timeout).first {
+            let states = try fetch(t, session: session, positions: [prompt.count - 1], gate: gate).wait(timeout: timeout)
+            if let hidden = states.last.first {
                 let array = head.logitsArray(hiddens: [hidden])
                 arrays[t] = array
                 logits[t] = head.rows(array)[0]
-                experts[t] = BraidMixer.Expert(hits: experts[t].hits, tau: params.tau, logits: logits[t])
+                experts[t] = expert(t, hits: experts[t].hits, logits: logits[t], params: params)
+                if reads(t, gate: gate) { descriptions[t] = thoughtReader.describe(t, states: states.cut)?.first }
             }
         }
         var generated: [Int] = []
@@ -230,9 +316,10 @@ public final class BraidedGenerator {
                 break
             }
             var step = [trace(mix: mix, experts: experts, token: token, index: prompt.count + generated.count, forced: false,
-                              names: names, threadIDs: threadIDs, memory: state.memory, backs: backs, trajectories: trajectories)]
+                              names: names, threadIDs: threadIDs, memory: state.memory, backs: backs, trajectories: trajectories,
+                              thought: thinking)]
             Self.fill(&step, from: 0, with: MixtureStats.entropies(
-                heads: links.indices.map { arrays[$0] }, positions: [MixtureStats.Position(weights: mix.weights, knn: mix.knn)], lambda: lambda))
+                heads: links.indices.map { arrays[$0] }, positions: [Self.position(mix, lambda: lambda)], lambda: lambda))
             traces.append(step[0])
             generated.append(token)
             try onStep?(BraidStep(trace: step[0], open: links.indices.filter { mix.open[$0] }.map { names[$0] }))
@@ -247,21 +334,31 @@ public final class BraidedGenerator {
             let hits = steps.map(\.hits)
             trajectories = steps.map(\.trajectory)
             // Retrieval alone decides who is asked: it arrives with every advance, asked or not.
-            let retrieved = links.indices.map { t in BraidMixer.Expert(hits: hits[t], tau: params.tau, logits: nil) }
+            let retrieved = links.indices.map { t in expert(t, hits: hits[t], logits: nil, params: params) }
             backs = BraidMixer.agreement(experts: retrieved, leader: state.leader)
             gates = BraidMixer.weights(state: state, agreement: backs, trace: BraidMixer.traces(trajectories), gate: gate)
-            open = BraidMixer.gate(gates, floor: floor)
-            let calls = links.indices.map { t in open[t] ? links[t].hidden(session: session, positions: [position + 1]) : nil }
+            open = openStrands(gates, floor: floor)
+            let calls = links.indices.map { t in open[t] ? fetch(t, session: session, positions: [position + 1], gate: gate) : nil }
             logits = [:]
             arrays = [:]
+            descriptions = links.map { _ in nil }
             for t in links.indices {
-                if let call = calls[t], let hidden = try call.wait(timeout: timeout).first {
+                if let call = calls[t] {
+                    let states = try call.wait(timeout: timeout)
+                    guard let hidden = states.last.first else { continue }
                     let array = head.logitsArray(hiddens: [hidden])
                     arrays[t] = array
                     logits[t] = head.rows(array)[0]
+                    if reads(t, gate: gate) { descriptions[t] = thoughtReader.describe(t, states: states.cut)?.first }
                 }
             }
-            experts = links.indices.map { t in BraidMixer.Expert(hits: hits[t], tau: params.tau, logits: logits[t]) }
+            // Thought can lift only a Thread already asked: its cut state comes with its hidden state.
+            thinking = thought(descriptions, leader: state.leader)
+            if let thinking {
+                backs = zip(backs, thinking).map { max($0, $1) }
+                gates = BraidMixer.weights(state: state, agreement: backs, trace: BraidMixer.traces(trajectories), gate: gate)
+            }
+            experts = links.indices.map { t in expert(t, hits: hits[t], logits: logits[t], params: params) }
         }
         return finish(traces: traces, prompt: prompt, generated: generated, stoppedOnEOS: stoppedOnEOS, request: request)
     }
@@ -310,12 +407,12 @@ public final class BraidedGenerator {
         var mixtures: [MixtureStats.Position] = []
         let allOpen = links.map { _ in true }
         for j in 1..<prompt.count {
-            let experts = links.indices.map { t in BraidMixer.Expert(hits: promptHits[t][j - 1], tau: params.tau, logits: promptLogits[t][j - 1]) }
+            let experts = links.indices.map { t in expert(t, hits: promptHits[t][j - 1], logits: promptLogits[t][j - 1], params: params) }
             let mix = BraidMixer.mix(experts: experts, posterior: BraidMixer.posterior(logLikelihood), open: allOpen, lambda: lambda,
                                      vocabularySize: vocabulary)
             traces.append(trace(mix: mix, experts: experts, token: prompt[j], index: j, forced: true, names: names, threadIDs: threadIDs,
                                 trajectories: promptSteps.map { $0[j - 1].trajectory }))
-            mixtures.append(MixtureStats.Position(weights: mix.weights, knn: mix.knn))
+            mixtures.append(Self.position(mix, lambda: lambda))
             for t in links.indices {
                 logLikelihood[t] += log(Double(max(experts[t].probability(of: prompt[j], lambda: lambda) ?? 0, 1e-30)))
             }
@@ -327,7 +424,7 @@ public final class BraidedGenerator {
         try onPrompt?(traces)
 
         var experts = links.indices.map { t in
-            BraidMixer.Expert(hits: promptHits[t][prompt.count - 1], tau: params.tau, logits: promptLogits[t][prompt.count - 1])
+            expert(t, hits: promptHits[t][prompt.count - 1], logits: promptLogits[t][prompt.count - 1], params: params)
         }
         var logits: [Int: [Float]] = Dictionary(uniqueKeysWithValues: links.indices.map { ($0, promptLogits[$0][prompt.count - 1]) })
         var arrays: [Int: MLXArray] = Dictionary(uniqueKeysWithValues: links.indices.map {
@@ -353,7 +450,7 @@ public final class BraidedGenerator {
             var step = [trace(mix: mix, experts: experts, token: token, index: prompt.count + generated.count, forced: false,
                               names: names, threadIDs: threadIDs, trajectories: trajectories)]
             Self.fill(&step, from: 0, with: MixtureStats.entropies(
-                heads: links.indices.map { arrays[$0] }, positions: [MixtureStats.Position(weights: mix.weights, knn: mix.knn)], lambda: lambda))
+                heads: links.indices.map { arrays[$0] }, positions: [Self.position(mix, lambda: lambda)], lambda: lambda))
             traces.append(step[0])
             generated.append(token)
             try onStep?(BraidStep(trace: step[0], open: links.indices.filter { mix.open[$0] }.map { names[$0] }))
@@ -376,7 +473,7 @@ public final class BraidedGenerator {
                 let rows = head.logits(hiddens: try links[t].hidden(session: session, positions: missed[t].map(\.position)).wait(timeout: timeout))
                 for (i, miss) in missed[t].enumerated() {
                     let pLM = CitationMixer.softmax(rows[i])
-                    let l = min(max(lambda, 0), 1)
+                    let l = min(max(lambda * lambdaScales[t], 0), 1)
                     let exact = l * miss.knn + (1 - l) * (miss.token < pLM.count ? pLM[miss.token] : 0)
                     logLikelihood[t] += log(Double(max(exact, 1e-30))) - log(Double(max(l * miss.knn, 1e-30)))
                 }
@@ -394,7 +491,7 @@ public final class BraidedGenerator {
                     logits[t] = head.rows(array)[0]
                 }
             }
-            experts = links.indices.map { t in BraidMixer.Expert(hits: hits[t], tau: params.tau, logits: logits[t]) }
+            experts = links.indices.map { t in expert(t, hits: hits[t], logits: logits[t], params: params) }
         }
         return finish(traces: traces, prompt: prompt, generated: generated, stoppedOnEOS: stoppedOnEOS, request: request)
     }
@@ -403,11 +500,12 @@ public final class BraidedGenerator {
     /// its Thread's weight times its weight within that Thread.
     private func trace(
         mix: BraidMixer.ExpertMix, experts: [BraidMixer.Expert], token: Int, index position: Int, forced: Bool, names: [String],
-        threadIDs: [String?], memory: [Float]? = nil, backs: [Float]? = nil, trajectories: [StrandTrajectory?]? = nil
+        threadIDs: [String?], memory: [Float]? = nil, backs: [Float]? = nil, trajectories: [StrandTrajectory?]? = nil,
+        thought: [Float]? = nil
     ) -> TokenTrace {
         var pooled: [(strand: Int, hit: StrandHit, weight: Float)] = []
-        for t in experts.indices where mix.weights[t] > 0 {
-            for (i, hit) in experts[t].hits.enumerated() { pooled.append((t, hit, mix.weights[t] * experts[t].weights[i])) }
+        for t in experts.indices where mix.knnWeights[t] > 0 {
+            for (i, hit) in experts[t].hits.enumerated() { pooled.append((t, hit, mix.knnWeights[t] * experts[t].weights[i])) }
         }
         pooled.sort { a, b in
             if a.weight != b.weight { return a.weight > b.weight }
@@ -430,7 +528,10 @@ public final class BraidedGenerator {
             lmProb: token < mix.pLM.count ? mix.pLM[token] : 0, agreement: mix.knn[token] ?? 0,
             mixedProb: token < mix.mixed.count ? mix.mixed[token] : 0, lambda: mix.lambda, neighbours: neighbours)
         trace.strands = BraidMixer.shares(mix, experts: experts, token: token, names: names, threadIDs: threadIDs,
-                                          memory: memory, backs: backs)
+                                          memory: memory, backs: backs, commons: commons)
+        if let thought, trace.strands?.count == thought.count {
+            for t in thought.indices where t != commons { trace.strands?[t].thought = thought[t] }
+        }
         Self.record(trajectories, in: &trace)
         trace.threadEntropy = BraidMixer.threadEntropy(mix.posterior)
         trace.candidates = BraidMixer.candidates(mix, experts: experts) { tokenizer.tokenText($0) }
@@ -516,6 +617,10 @@ public final class BraidedGenerator {
     ) -> CitedGeneration {
         var traces = traces
         let params = request.params
+        if let commons {
+            // The owner's blend: form is the commons', content each strand's as it supplied it.
+            TokenRoles.assignCredit(&traces, commons: names[commons], texts: (prompt + generated).map { tokenizer.tokenText($0) })
+        }
         let spans = CitationSpans.annotate(
             traces: &traces, partitions: partitionsByRow, sharedNgrams: sharedNgrams, threadID: nil,
             settings: CitationSpans.Settings(rankThreshold: params.rankThreshold, minSpanLength: params.minSpanLength))
@@ -578,7 +683,7 @@ public final class BraidedGenerator {
     private func citedAge(_ token: Int, mix: BraidMixer.ExpertMix, experts: [BraidMixer.Expert]) -> Int64? {
         let parts = experts.indices.map { t -> Float in
             guard mix.weights[t] > 0 else { return 0 }
-            return mix.weights[t] * (experts[t].probability(of: token, lambda: mix.lambda) ?? experts[t].lowerBound(of: token, lambda: mix.lambda))
+            return mix.weights[t] * (experts[t].probability(of: token, lambda: mix.baseLambda) ?? experts[t].lowerBound(of: token, lambda: mix.baseLambda))
         }
         guard let t = parts.indices.max(by: { parts[$0] < parts[$1] }), parts[t] > 0 else { return nil }
         let hits = experts[t].hits
