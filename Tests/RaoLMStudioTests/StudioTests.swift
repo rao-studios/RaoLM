@@ -476,6 +476,32 @@ struct StudioStateTests {
         #expect(s.braid.prompt.text == "Who is the mayor of Tillyburn?")
     }
 
+    @Test("r turns the question adapter off and on: off, a typed question is completed as written")
+    func braidQuestionToggle() {
+        var s = state()
+        s.screen = .braid
+        s.braid.started = true
+        s.braid.running = true
+        var live = StrandState(name: "ambient", label: "Ambient", offline: true, vocabularySHA256: "v", blocks: 4)
+        live.liveVersion = 1
+        s.braid.states["ambient"] = live
+        s.braid.prompt.set("Who is the mayor of Tillyburn?")
+        func asked() -> Bool? {
+            let jobs = BraidScreen.generate(&s)
+            s.braid.generating = false
+            guard jobs.count == 1, case .braid(.generate(let spec)) = jobs[0] else { return nil }
+            return spec.question
+        }
+        #expect(s.braid.questions && asked() == true && BraidScreen.hints(s).contains(KeyHint("r", "Q/A: on")))
+        _ = StudioApp.handle(.key(KeyEvent(.char("r"))), state: &s)
+        #expect(!s.braid.questions && asked() == false && BraidScreen.hints(s).contains(KeyHint("r", "Q/A: off")))
+        _ = StudioApp.handle(.key(KeyEvent(.char("r"))), state: &s)
+        #expect(s.braid.questions && asked() == true)
+        // A prompt that is not a question is completed either way.
+        s.braid.prompt.set("The mayor of Tillyburn is")
+        #expect(asked() == false)
+    }
+
     @Test("the commons is shown by its pack name once the braid says which pack it runs")
     func braidCommonsAlone() {
         var s = state()

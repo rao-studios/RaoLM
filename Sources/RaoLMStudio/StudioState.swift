@@ -290,6 +290,9 @@ public struct BraidScreenState: Sendable {
     /// answers alone.
     public var gating: BraidGating = BraidRequest.defaultGating
     public var temperature: Float = 0
+    /// Whether a typed prompt ending in "?" goes through the umbrella's question adapter (r);
+    /// off, every prompt is completed as written.
+    public var questions = true
     public var askAlone = false
     /// Each Thread's own answer to the current generation's prompt.
     public var alone: [String: String] = [:]

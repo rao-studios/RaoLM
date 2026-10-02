@@ -283,6 +283,11 @@ enum BraidScreen: StudioScreen {
             let order: [BraidGating] = [.braided, .posterior, .retrieval]
             state.braid.gating = order[((order.firstIndex(of: state.braid.gating) ?? 0) + 1) % order.count]
             state.status.message = "gate: \(state.braid.gating.rawValue) · " + gateDescription(state.braid.gating)
+        case .char("r"):
+            state.braid.questions.toggle()
+            state.status.message = state.braid.questions
+                ? "Q/A on: a prompt ending in \"?\" is rewritten by the commons into a stem the Threads complete"
+                : "Q/A off: every prompt is completed as written, a question too"
         case .char("t"):
             state.braid.temperature = state.braid.temperature > 0 ? 0 : 0.8
             state.status.message = state.braid.temperature > 0
@@ -416,8 +421,8 @@ enum BraidScreen: StudioScreen {
             return []
         }
         let answerTokens = state.braid.exampleExpected.map { max(2, $0.count / 3) } ?? 12
-        // A typed question goes through the umbrella's adapter: no key, the "?" says so.
-        let question = state.braid.exampleTokens == nil && text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+        // A typed question goes through the umbrella's adapter, the "?" says so, unless r turned it off.
+        let question = state.braid.questions && state.braid.exampleTokens == nil && text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
         state.braid.generating = true
         return [.braid(.generate(BraidGenerateSpec(
             promptTokens: state.braid.exampleTokens, promptText: text, source: state.braid.exampleSource,
@@ -433,7 +438,7 @@ enum BraidScreen: StudioScreen {
                             KeyHint("R", state.braid.fresh ? "fresh: on" : "fresh: off"), KeyHint("d", "dataset: \(sourceLabel(state))")]
         }
         var hints = [KeyHint("f", "feed"), KeyHint("d", "dataset"), KeyHint("tab", "node"), KeyHint("x", "example"), KeyHint("^U", "clear"), KeyHint("⏎", "ask"),
-                     KeyHint("a", "alone"), KeyHint("←→", "token")]
+                     KeyHint("a", "alone"), KeyHint("r", state.braid.questions ? "Q/A: on" : "Q/A: off"), KeyHint("←→", "token")]
         if state.braid.generation != nil { hints.append(KeyHint("v", "verify")) }
         hints += [KeyHint("g", "gate"), KeyHint("w", "withdraw"), KeyHint("X", "stop")]
         return hints

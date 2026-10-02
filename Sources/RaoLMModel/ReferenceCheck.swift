@@ -23,6 +23,9 @@ public enum ReferenceCheck {
         let data = try Data(contentsOf: folder.appendingPathComponent("config.json"))
         let llama = LlamaModel(try JSONDecoder().decode(LlamaConfiguration.self, from: data))
         try loadWeights(modelDirectory: folder, model: llama)
+        // Hub weights are bf16, and Frigate's Llama computes in what it loads; RaoLM's checkpoint
+        // loader widens to float32, so the reference is widened alike.
+        llama.update(parameters: llama.parameters().mapValues { $0.asType(.float32) })
         var worst: Float = 0
         for prompt in prompts where !prompt.isEmpty {
             let tokens = MLXArray(prompt.map(Int32.init), [1, prompt.count])

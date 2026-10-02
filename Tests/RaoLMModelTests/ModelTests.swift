@@ -597,6 +597,12 @@ extension ModelMLXSuites {
             #expect(try ReferenceCheck.llama(folder: directory, model: model, prompts: prompts) < ReferenceCheck.tolerance)
             let other = try RaoTransformer.make(config: testConfig, seed: 10)
             #expect(try ReferenceCheck.llama(folder: directory, model: other, prompts: prompts) > ReferenceCheck.tolerance)
+            // Weights stored in bf16, as the hub's are: both sides read them widened to float32.
+            let weights = directory.appendingPathComponent(Checkpoint.weightsFile)
+            try MLX.save(arrays: try loadArrays(url: weights).mapValues { $0.asType(.bfloat16) }, url: weights)
+            let widened = RaoTransformer(testConfig)
+            try Checkpoint.loadWeights(into: widened, from: directory)
+            #expect(try ReferenceCheck.llama(folder: directory, model: widened, prompts: prompts) < ReferenceCheck.tolerance)
         }
     }
 }
