@@ -26,6 +26,11 @@ public enum DatasetsRoot {
         return URL(fileURLWithPath: workArea, isDirectory: true).appendingPathComponent("datasets", isDirectory: true)
     }
 
+    /// Where braids made with --data-dir live, each a data root of its own: the work area, when mounted.
+    public static var braidAreas: [URL] {
+        FileManager.default.fileExists(atPath: workArea) ? [URL(fileURLWithPath: workArea, isDirectory: true)] : []
+    }
+
     /// A dataset by name (inside the root) or by path (anything with a slash).
     public static func resolve(_ nameOrPath: String) throws -> URL {
         if nameOrPath.contains("/") { return URL(fileURLWithPath: (nameOrPath as NSString).expandingTildeInPath, isDirectory: true) }

@@ -226,3 +226,40 @@ struct QuestionBenchTests {
         #expect(abs(QuestionBench.tokenF1("Tillyburn was founded in", "The town of Tillyburn was founded in") - 8.0 / 11) < 1e-6)
     }
 }
+
+@Suite("Commons bench rules")
+struct CommonsBenchTests {
+    static func arm(_ name: String, exact: Int = 380, citation: Float = 0.95, lift: Float = 0.97, leads: Float = 0.8, share: Float = 0.12,
+                    gate: Float = 0.4) -> (prompts: UmbrellaArmResult, facts: UmbrellaArmResult) {
+        var prompts = UmbrellaBenchTests.arm(name, leads: leads, threadGate: gate, threadShare: share)
+        prompts.facts = 0
+        var facts = UmbrellaBenchTests.arm(name, citation: citation, lift: lift)
+        facts.facts = 400
+        facts.factsExact = exact
+        return (prompts, facts)
+    }
+
+    static func evaluate(child: (prompts: UmbrellaArmResult, facts: UmbrellaArmResult), heldOut: [String: [Float]] = ["pack": [3.2, 3.1], "web": [3.0, 2.8]]) -> CommonsEvaluation {
+        let parent = arm("parent")
+        return CommonsBench.evaluate(heldOut: heldOut, arms: [parent.prompts, child.prompts], facts: [parent.facts, child.facts])
+    }
+
+    @Test("a child no worse than its parent qualifies, against the parent and not against U3's and U4's absolute bars")
+    func qualifies() {
+        let good = Self.evaluate(child: Self.arm("child", exact: 372, citation: 0.94, lift: 0.96, leads: 0.79, share: 0.13))
+        #expect(good.qualifies, "\(good.rules.filter { !$0.passed })")
+        #expect(good.rules.map(\.rule) == ["C1 general English", "C2 Threads on it", "C3 nobody's text", "C4 inherited knowledge unattributed"])
+    }
+
+    @Test("each rule fails on its own measure")
+    func failures() {
+        func failed(_ evaluation: CommonsEvaluation) -> [String] { evaluation.rules.filter { !$0.passed }.map(\.rule) }
+        #expect(failed(Self.evaluate(child: Self.arm("child"), heldOut: ["pack": [3.2, 3.25], "web": [3.0, 2.8]])) == ["C1 general English"])
+        #expect(failed(Self.evaluate(child: Self.arm("child"), heldOut: [:])) == ["C1 general English"])
+        #expect(failed(Self.evaluate(child: Self.arm("child", exact: 360))) == ["C2 Threads on it"])
+        #expect(failed(Self.evaluate(child: Self.arm("child", citation: 0.92))) == ["C2 Threads on it"])
+        #expect(failed(Self.evaluate(child: Self.arm("child", leads: 0.77))) == ["C3 nobody's text"])
+        #expect(failed(Self.evaluate(child: Self.arm("child", share: 0.15))) == ["C4 inherited knowledge unattributed"])
+        #expect(failed(Self.evaluate(child: Self.arm("child", lift: 0.94))) == ["C4 inherited knowledge unattributed"])
+    }
+}

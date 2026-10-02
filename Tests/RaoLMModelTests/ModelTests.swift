@@ -582,3 +582,34 @@ extension ModelMLXSuites {
         }
     }
 }
+
+extension ModelMLXSuites {
+    @Suite("The importer's reference check (C0)", .serialized)
+    struct ReferenceCheckTests {
+        @Test("RaoLM's transformer and Frigate's Llama agree on a saved checkpoint; tampered weights do not")
+        func agrees() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("raolm-ref-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let model = try RaoTransformer.make(config: testConfig, seed: 9)
+            let tokenizer = try await RaoTokenizer.load()
+            _ = try Checkpoint.save(model: model, to: directory, tokenizerDirectory: tokenizer.directory)
+            let prompts = [tokenizer.encode("The river ran north past the mill."), tokenizer.encode("A second, longer prompt about the tide and the harbour wall.")]
+            #expect(try ReferenceCheck.llama(folder: directory, model: model, prompts: prompts) < ReferenceCheck.tolerance)
+            let other = try RaoTransformer.make(config: testConfig, seed: 10)
+            #expect(try ReferenceCheck.llama(folder: directory, model: other, prompts: prompts) > ReferenceCheck.tolerance)
+        }
+    }
+}
+
+@Suite("Presets for imported shapes")
+struct ImportedPresetTests {
+    @Test("SmolLM2-360M's preset is its config, cut at 22; base-360m trains about 216M parameters per node")
+    func smolLM2_360M() throws {
+        let config = try RaoLMConfig.preset("base-360m")
+        #expect(config.numHiddenLayers == 32 && config.hiddenSize == 960 && config.cut == 22 && config.hasTrunk)
+        #expect(config.hiddenSize / config.numAttentionHeads == 64 && config.tieWordEmbeddings)
+        #expect(abs(Double(config.nodeParameterCount) / 1e6 - 216) < 2, "\(config.nodeParameterCount)")
+        try config.validate()
+        #expect(RaoLMConfig.presetNames.contains("base-360m"))
+    }
+}

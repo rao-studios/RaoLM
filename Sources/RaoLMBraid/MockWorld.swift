@@ -128,6 +128,10 @@ public final class MockWorld: @unchecked Sendable {
         public var preset: String?
         /// The training arm the nodes train on (`HypervisorSettings.arm`); nil for the reference recipe.
         public var arm: String?
+        /// The umbrella pack the braid runs on (its name); nil before packs were recorded, or for a
+        /// preset without a trunk. Not part of the world: a braid rebased onto another pack keeps
+        /// its documents, and its nodes retrain from the new base.
+        public var packSHA256: String?
 
         public init(names: [String], seed: UInt64, shape: MockShape, dataset: MockDatasetSource? = nil, preset: String? = nil) {
             self.names = names
@@ -148,7 +152,7 @@ public final class MockWorld: @unchecked Sendable {
         }
 
         public var summary: String {
-            let model = (preset.map { " · preset \($0)" } ?? "") + (arm.map { " · arm \($0)" } ?? "")
+            let model = (preset.map { " · preset \($0)" } ?? "") + (arm.map { " · arm \($0)" } ?? "") + (packSHA256.map { " · pack \($0.prefix(12))" } ?? "")
             if let dataset { return "nodes \(names.joined(separator: ",")) · dataset \(dataset.name) (\(dataset.hash.prefix(12)))" + model }
             return "nodes \(names.joined(separator: ",")) · seed \(seed) · \(shape.documentsPerNode) documents per node" + model
         }

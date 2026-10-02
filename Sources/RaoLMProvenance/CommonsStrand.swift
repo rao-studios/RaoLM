@@ -22,6 +22,8 @@ public final class CommonsLink: StrandLink {
 
     public let model: RaoTransformer
     public var descriptor: StrandDescriptor
+    /// The pack the commons is (its name, e.g. "rao-commons-1"): what the braid shows it as.
+    public let packName: String
 
     final class Session {
         let cache: [KVCache]
@@ -37,8 +39,9 @@ public final class CommonsLink: StrandLink {
     public init(pack: UmbrellaPack, tokenizerSHA256: String) throws {
         let model = try pack.baseModel()
         self.model = model
+        self.packName = pack.name
         self.descriptor = StrandDescriptor(
-            name: Self.strandName, label: "Commons", threadID: nil, version: 0,
+            name: Self.strandName, label: "Commons · \(pack.name)", threadID: nil, version: 0,
             manifest: ManifestRef(
                 runID: "commons:\(pack.name)", epoch: 0, checkpointSHA256: pack.info?.baseSHA256 ?? pack.sha256, indexSHA256: "",
                 corpusHash: "", tokenizerSHA256: tokenizerSHA256, ledgerSHA256: nil, threadID: nil),
@@ -104,5 +107,23 @@ public final class CommonsLink: StrandLink {
         let width = model.config.hiddenSize
         let flat = taken.asArray(Float.self)
         return (0..<positions.count).map { Array(flat[($0 * width)..<(($0 + 1) * width)]) }
+    }
+
+    /// The commons alone on a prompt: its greedy continuation, no Thread asked. With
+    /// `stopAtSentenceEnd`, it stops where a question's answer would.
+    public func complete(_ prompt: [Int], maxTokens: Int, tokenizer: RaoTokenizer, stopAtSentenceEnd: Bool = false) -> String {
+        guard !prompt.isEmpty else { return "" }
+        let cache = model.newCache(parameters: nil)
+        var output = model.forward(MLXArray(prompt.map(Int32.init), [1, prompt.count]), cache: cache, captureTap: false)
+        var generated: [Int] = []
+        while generated.count < maxTokens {
+            let next = argMax(output.logits[0, -1]).item(Int.self)
+            if next == tokenizer.eosTokenID { break }
+            if stopAtSentenceEnd, !generated.isEmpty,
+               AnswerStop.sentenceEnded(previous: tokenizer.decode(generated), next: tokenizer.tokenText(next)) { break }
+            generated.append(next)
+            output = model.forward(MLXArray([Int32(next)], [1, 1]), cache: cache, captureTap: false)
+        }
+        return tokenizer.decode(generated)
     }
 }

@@ -400,7 +400,7 @@ struct StudioStateTests {
 
         // Found, with the braid stopped: it starts on the dataset, and nodes fed from another world start over.
         let first = StudioApp.reduce(.braidDataset(path), state: &s)
-        guard first.count == 1, case .braid(.start(let offline, let fresh, let world, let switching)) = first[0] else {
+        guard first.count == 1, case .braid(.start(let offline, let fresh, let world, let switching, _)) = first[0] else {
             Issue.record("a found dataset starts the braid")
             return
         }
@@ -430,7 +430,7 @@ struct StudioStateTests {
         }
         #expect(s.braid.restarting)
         let again = StudioApp.reduce(.braid(.stopped), state: &s)
-        guard again.count == 1, case .braid(.start(_, _, let next, let switchingAgain)) = again[0] else {
+        guard again.count == 1, case .braid(.start(_, _, let next, let switchingAgain, _)) = again[0] else {
             Issue.record("and starts again once stopped")
             return
         }
@@ -438,14 +438,119 @@ struct StudioStateTests {
 
         // An ordinary stop stays stopped; S then starts the chosen dataset, refusing another world as before.
         s.braid.running = true
-        #expect(StudioApp.reduce(.braid(.stopped), state: &s).isEmpty && !s.braid.started)
+        let stopped = StudioApp.reduce(.braid(.stopped), state: &s)
+        guard stopped.count == 1, case .braid(.catalog) = stopped[0] else {
+            Issue.record("an ordinary stop lists the braids again")
+            return
+        }
+        #expect(!s.braid.started)
         #expect(BraidScreen.hints(s).contains(KeyHint("d", "dataset: braid-cross-v1")))
         let plain = StudioApp.handle(.key(KeyEvent(.char("S"))), state: &s)
-        guard plain.count == 1, case .braid(.start(_, _, let kept, let switchingPlain)) = plain[0] else {
+        guard plain.count == 1, case .braid(.start(_, _, let kept, let switchingPlain, _)) = plain[0] else {
             Issue.record("S starts the braid")
             return
         }
         #expect(kept.dataset == "/sets/other" && !switchingPlain)
+    }
+
+    @Test("Ctrl-U empties the braid prompt from anywhere, example and all, and the next examples leave it empty")
+    func braidClearPrompt() {
+        var s = state()
+        s.screen = .braid
+        s.braid.started = true
+        s.braid.running = true
+        let example = BraidExample(label: "Ambient · Tillyburn", node: "ambient", promptTokens: [1, 2, 3],
+                                   promptText: "The article says Tillyburn was founded in", expected: " 1128", source: nil, kind: .fact)
+        _ = BraidScreen.apply(.examples([example]), state: &s)
+        #expect(s.braid.prompt.text == "The article says Tillyburn was founded in" && s.braid.exampleTokens == [1, 2, 3])
+        _ = StudioApp.handle(.key(KeyEvent(.ctrl("u"))), state: &s)
+        #expect(s.braid.prompt.text.isEmpty && s.braid.exampleTokens == nil && s.braid.exampleLabel == nil && s.braid.editingPrompt)
+        #expect(BraidScreen.hints(s).contains { $0.key == "^U" })
+        // Leaving the editor empty, a feed's new examples do not put the long example back.
+        _ = StudioApp.handle(.key(KeyEvent(.escape)), state: &s)
+        _ = BraidScreen.apply(.examples([example, example]), state: &s)
+        #expect(s.braid.prompt.text.isEmpty && !s.braid.editingPrompt)
+        // Typing works at once after Ctrl-U from browsing.
+        _ = StudioApp.handle(.key(KeyEvent(.ctrl("u"))), state: &s)
+        for c in "Who is the mayor of Tillyburn?" { _ = StudioApp.handle(.key(KeyEvent(.char(c))), state: &s) }
+        #expect(s.braid.prompt.text == "Who is the mayor of Tillyburn?")
+    }
+
+    @Test("the commons is shown by its pack name once the braid says which pack it runs")
+    func braidCommonsAlone() {
+        var s = state()
+        s.screen = .braid
+        #expect(BraidScreen.label(BraidStrandRef.commonsName, s) == "Commons")
+        _ = StudioApp.reduce(.braidCommons("rao-commons-1"), state: &s)
+        #expect(s.braid.commonsPack == "rao-commons-1")
+        #expect(BraidScreen.label(BraidStrandRef.commonsName, s) == "Commons · rao-commons-1")
+        _ = StudioApp.reduce(.braidCommons(nil), state: &s)
+        #expect(BraidScreen.label(BraidStrandRef.commonsName, s) == "Commons")
+    }
+
+    @Test("9 Braid: the catalog lists every braid; ↑↓ chooses one with its own nodes and mode, ⏎ loads it from its data root")
+    func braidCatalog() {
+        var s = state()
+        s.screen = .braid
+        let home = BraidCatalogEntry(
+            name: "home", root: URL(fileURLWithPath: "/tmp/raolm-studio-test"), isHome: true,
+            nodes: [BraidNodeSpec(name: "ambient", label: "Ambient"), BraidNodeSpec(name: "craft", label: "Craft")], live: ["ambient": 7, "craft": 10],
+            preset: "tiny")
+        let other = BraidCatalogEntry(
+            name: "braid-commons-1", root: URL(fileURLWithPath: "/work/braid-commons-1"), isHome: false, nodes: BraidNodeSpec.defaults,
+            live: ["ambient": 3, "craft": 3], preset: "base", arm: "passage-break", commons: "rao-commons-1", commonsSHA256: "ae6f5b5d208a903e",
+            dataset: "braid-cross-v1", offline: true)
+        // The first catalog chooses the studio's own braid.
+        _ = StudioApp.reduce(.braidCatalog([home, other]), state: &s)
+        #expect(BraidScreen.selectedBraid(s) == home && s.braid.nodes == home.nodes && !s.braid.offline)
+        #expect(BraidScreen.hints(s).contains(KeyHint("⏎", "load")))
+        let text = snapshot(s)
+        #expect(text.contains("Braids · 2") && text.contains("braid-commons-1") && text.contains("rao-commons-1") && text.contains("2/3 live"))
+        // ↓ chooses the next: its nodes, its mode, its own world, never fresh.
+        s.braid.fresh = true
+        s.braid.world = BraidWorldChoice(dataset: "/sets/home")
+        _ = StudioApp.handle(.key(KeyEvent(.down)), state: &s)
+        #expect(BraidScreen.selectedBraid(s) == other && s.braid.nodes.count == 3 && s.braid.offline && !s.braid.fresh && s.braid.world.isEmpty)
+        #expect(snapshot(s).contains("rao-commons-1 ae6f5b5d208a"))
+        // ⏎ loads it from its data root.
+        let jobs = StudioApp.handle(.key(KeyEvent(.enter)), state: &s)
+        guard jobs.count == 1, case .braid(.start(let offline, let fresh, let world, _, let root)) = jobs[0] else {
+            Issue.record("⏎ starts the chosen braid")
+            return
+        }
+        #expect(offline && !fresh && world.isEmpty && root == other.root && s.braid.started && s.braid.loaded == other)
+        // Stopped, the catalog is asked for again, and the selection stays on the braid that ran.
+        s.braid.running = true
+        let stopped = StudioApp.reduce(.braid(.stopped), state: &s)
+        guard stopped.count == 1, case .braid(.catalog) = stopped[0] else {
+            Issue.record("a stop lists the braids again")
+            return
+        }
+        _ = StudioApp.reduce(.braidCatalog([home, other]), state: &s)
+        #expect(BraidScreen.selectedBraid(s) == other && snapshot(s).contains("Braids · 2"))
+    }
+
+    @Test("9 Braid: the answer by Thread has a row for the commons when the answer has one")
+    func braidCommonsRow() async throws {
+        var h = try Harness()
+        h.state.screen = .braid
+        try await h.run(.braid(.start(offline: true, fresh: false)))
+        _ = StudioApp.reduce(.braidCommons("rao-commons-1"), state: &h.state)
+        func row(_ text: String) -> Bool { text.split(separator: "\n").contains { $0.contains("Commons · rao-commons-1") && $0.contains("· led ") } }
+        // The recording has no commons strand: no row.
+        #expect(!row(h.render().snapshot))
+        var generation = try #require(h.state.braid.generation)
+        // The commons supplies 80% of every answer token, the Threads the rest as they did.
+        for i in generation.traces.indices where !generation.traces[i].isPrompt {
+            for j in generation.traces[i].strands?.indices ?? 0 ..< 0 { generation.traces[i].strands?[j].share *= 0.2 }
+            generation.traces[i].strands?.append(StrandShare(
+                strand: BraidStrandRef.commonsName, threadID: nil, gate: 1, open: true, bestScore: nil, lmProb: nil, lmEntropy: nil, knn: 0, share: 0.8))
+        }
+        h.state.braid.generation = generation
+        let text = h.render().snapshot
+        #expect(row(text))
+        let answered = generation.traces.filter { !$0.isPrompt }.count
+        #expect(text.contains("led \(answered)/\(answered)"))
     }
 
     @Test("a braid start refused before any node came up lets S start again, and says why")

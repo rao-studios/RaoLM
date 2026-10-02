@@ -38,7 +38,7 @@ public enum StudioApp {
 
     /// What the studio asks for as soon as it opens.
     public static func initialJobs(_ state: StudioState) -> [StudioJob] {
-        var jobs: [StudioJob] = [.scanRuns, .doctor, .threadStatus(withLog: false), .scanCorpora, .scanSnapshots]
+        var jobs: [StudioJob] = [.scanRuns, .doctor, .threadStatus(withLog: false), .scanCorpora, .scanSnapshots, .braid(.catalog)]
         if state.braid.autoStart { jobs.append(.braid(.start(offline: state.braid.offline, fresh: state.braid.fresh, world: state.braid.world))) }
         return jobs
     }
@@ -124,7 +124,9 @@ public enum StudioApp {
                 return [LedgerScreen.job(state)].compactMap { $0 }
             }
             return []
-        case .doctor, .braid:
+        case .braid:
+            return state.braid.started ? [] : [.braid(.catalog)]
+        case .doctor:
             return []
         }
     }
@@ -438,6 +440,10 @@ public enum StudioApp {
             state.braid.alone = answers
         case .braidDataset(let dataset):
             return BraidScreen.restart(on: dataset, state: &state)
+        case .braidCommons(let name):
+            state.braid.commonsPack = name
+        case .braidCatalog(let entries):
+            BraidScreen.catalogLoaded(entries, state: &state)
         case .braidSource(let source):
             state.braid.source = source
             state.braid.events.append(Text("feeds come from " + (source.map { "the dataset \($0.name) (\(abbreviate($0.path)))" } ?? "a generated mock world"),

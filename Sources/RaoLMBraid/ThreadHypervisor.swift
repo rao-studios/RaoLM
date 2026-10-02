@@ -176,7 +176,7 @@ public final class ThreadHypervisor {
         guard found == vocabulary.sha256 else { throw VocabularyError.mismatch(node: found, umbrella: vocabulary.sha256) }
         if pack.hasTrunk {
             let trunk = UmbrellaPack.fingerprint(of: model)
-            guard trunk == pack.sha256 else { throw UmbrellaPackError.fingerprint(expected: pack.sha256, found: trunk, what: "trunk") }
+            guard trunk == pack.seamSHA256 else { throw UmbrellaPackError.fingerprint(expected: pack.seamSHA256, found: trunk, what: "trunk") }
         }
     }
 
@@ -200,6 +200,15 @@ public final class ThreadHypervisor {
         let directory = layout.version(pointer.version)
         do {
             let version = try JSONCoding.read(NodeVersion.self, from: directory.appendingPathComponent(NodeVersion.fileName))
+            // Rebase, never migrate: a version trained under another pack is retired, and the node
+            // retrains from the new base (its next sync takes the fresh-blocks path).
+            if let trained = version.packSHA256, let running = packSHA256, trained != running {
+                state.rebasedFrom = trained
+                log("v\(version.version) was trained on pack \(trained.prefix(12)); the braid now runs on \(running.prefix(12)): retired, retraining from the new base")
+                state.stage = .empty
+                state.stageDetail = "rebased · retraining"
+                return
+            }
             let context = try RunContext.load(runDirectory: directory, epoch: version.epoch, allowWeakIndex: true, tokenizer: tokenizer)
             try checkPack(context.model)
             let snapshot = try CorpusSnapshot.load(from: URL(fileURLWithPath: version.snapshotPath))
@@ -727,7 +736,7 @@ public final class ThreadHypervisor {
         }
         gates.append(VersionGates.vocabulary(found: VocabularyPack.fingerprint(of: context.model), expected: vocabulary.sha256))
         if pack.hasTrunk {
-            gates.append(VersionGates.trunk(found: UmbrellaPack.fingerprint(of: context.model), expected: pack.sha256))
+            gates.append(VersionGates.trunk(found: UmbrellaPack.fingerprint(of: context.model), expected: pack.seamSHA256))
         }
         let fraction = context.index.info.evalMemorisedFraction
         if let gate = VersionGates.memorised(fraction, kind: kind, floor: settings.memorisedFloor) { gates.append(gate) }

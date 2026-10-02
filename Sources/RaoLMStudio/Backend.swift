@@ -28,7 +28,8 @@ public struct StudioOptions: Sendable {
     public var owner: String
     /// The raolm executable a braid's node processes run (default: this process's).
     public var executable: URL?
-    public var initialScreen: Screen = .home
+    /// The braid catalog: braids are what RaoLM is.
+    public var initialScreen: Screen = .braid
     /// Start the braid's nodes as the studio opens (`raolm braid`).
     public var braidAutoStart = false
     public var braidOffline = false
@@ -279,6 +280,7 @@ public final class LiveBackend: StudioBackend, @unchecked Sendable {
             case .cancel(let node): return "cancelling \(node)'s update"
             case .start: return "starting the braid"
             case .generate: return "asking the umbrella"
+            case .catalog: return "listing the braids"
             }
         default: return job.kind?.rawValue ?? ""
         }
@@ -349,6 +351,8 @@ public final class LiveBackend: StudioBackend, @unchecked Sendable {
             }
             lines.append("\(report.verified)/\(report.checks.count) spans verified against each Thread they cite")
             post(.braidVerified(copy, lines))
+        case .catalog:
+            post(.braidCatalog(BraidCatalog.scan(home: options.root.url, areas: DatasetsRoot.braidAreas)))
         case .start, .generate:
             break
         }

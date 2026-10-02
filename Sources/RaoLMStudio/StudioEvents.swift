@@ -42,7 +42,10 @@ public enum JobKind: String, Sendable, CaseIterable {
 public enum BraidJob: Sendable {
     /// `world`: the nodes and dataset the studio was opened with, or the dataset chosen on the
     /// panel (d). `switching`: nodes fed from another world start over instead of being refused.
-    case start(offline: Bool, fresh: Bool, world: BraidWorldChoice = BraidWorldChoice(), switching: Bool = false)
+    /// `root`: the data root of the braid chosen in the catalog; nil: the studio's own.
+    case start(offline: Bool, fresh: Bool, world: BraidWorldChoice = BraidWorldChoice(), switching: Bool = false, root: URL? = nil)
+    /// Every braid on this machine (`BraidCatalog`).
+    case catalog
     case stop
     /// Checks that a dataset (a name in the datasets root, or a path) is there before the braid
     /// is restarted on it.
@@ -260,4 +263,8 @@ public enum StudioEvent: Sendable {
     case braidDataset(String)
     /// What the braid that just started feeds its nodes from: a dataset, or nil for a generated mock world.
     case braidSource(MockDatasetSource?)
+    /// The pack the braid's commons is, by name; nil for a braid without one.
+    case braidCommons(String?)
+    /// Every braid on this machine, the studio's own first.
+    case braidCatalog([BraidCatalogEntry])
 }

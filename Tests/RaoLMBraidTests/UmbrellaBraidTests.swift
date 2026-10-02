@@ -247,3 +247,225 @@ extension BraidMLXSuites {
         }
     }
 }
+
+extension BraidMLXSuites {
+    @Suite("Pack v2: two hashes, written once, registered with lineage", .serialized)
+    struct PackV2Tests {
+        /// A v2 pack of the rig's cut shape; `bump` adds to one block below the cut.
+        static func pack(_ rig: Rig, seed: UInt64 = 5, bump: Float = 0, parent: String? = nil, name: String = "test") throws -> UmbrellaPack {
+            let source = try RaoTransformer.make(config: Rig.cutConfig, seed: seed)
+            let vocabulary = VocabularyPack.from(model: source, tokenizerSHA256: rig.tokenizer.tokenizerSHA256, originSHA256: "test")
+            var base: [String: MLXArray] = [:]
+            for (key, value) in source.parameters().flattened() where RaoTransformer.blockIndex(ofKey: key) != nil { base[key] = value }
+            let lower = try #require(base.keys.filter { RaoTransformer.blockIndex(ofKey: $0) == 0 }.sorted().first)
+            base[lower] = base[lower]! + bump
+            let anchors = (0..<4).map { i in PackSnippet(source: "test", tokens: rig.tokenizer.encode("Anchor \(i) about the sea.")) }
+            return UmbrellaPack.make(
+                vocabulary: vocabulary, name: name, source: "test", config: Rig.cutConfig, base: base, anchors: anchors,
+                anchorStates: UmbrellaPack.anchorStates(model: source, anchors: anchors.map(\.tokens)),
+                heldOut: [PackSnippet(source: "test", tokens: rig.tokenizer.encode("The tide came in."))], texts: [],
+                tokenizerSHA256: rig.tokenizer.tokenizerSHA256, parent: parent)
+        }
+
+        @Test("the name covers every block and the tokenizer, the seam only what a node holds; both survive a round trip")
+        func hashes() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 1, seed: 3)
+            defer { rig.cleanUp() }
+            let pack = try Self.pack(rig)
+            let info = try #require(pack.info)
+            #expect(info.version == 2 && info.seamSHA256 != nil && info.sha256 != info.seam)
+            #expect(pack.seamSHA256 == pack.computedFingerprint() && pack.sha256 == pack.computedName())
+            // A block below the cut changes the name, not the seam: a node trained under one fits the other's trunk.
+            let lowered = try Self.pack(rig, bump: 0.01)
+            #expect(lowered.sha256 != pack.sha256 && lowered.seamSHA256 == pack.seamSHA256)
+            let directory = rig.root.appendingPathComponent("packs/\(pack.sha256.prefix(12))")
+            try pack.save(to: directory)
+            let loaded = try UmbrellaPack.load(from: directory)
+            #expect(loaded.sha256 == pack.sha256 && loaded.seamSHA256 == pack.seamSHA256 && loaded.info?.version == 2)
+            // A node model built on the pack matches it by its seam.
+            let model = RaoTransformer(Rig.cutConfig)
+            try loaded.install(into: model)
+            #expect(loaded.matches(model) && lowered.matches(model))
+            // Tampering with a lower block is caught by the name.
+            let base = directory.appendingPathComponent(UmbrellaPack.baseFile)
+            var arrays = try loadArrays(url: base)
+            let key = try #require(arrays.keys.filter { RaoTransformer.blockIndex(ofKey: $0) == 0 }.sorted().first)
+            arrays[key] = arrays[key]! + 1
+            try MLX.save(arrays: arrays, url: base)
+            var recorded = try JSONCoding.read(PackInfo.self, from: directory.appendingPathComponent(UmbrellaPack.infoFile))
+            recorded.baseSHA256 = try ContentHash.sha256Hex(fileAt: base)
+            try JSONCoding.write(recorded, to: directory.appendingPathComponent(UmbrellaPack.infoFile))
+            #expect(throws: UmbrellaPackError.self) { try UmbrellaPack.load(from: directory) }
+        }
+
+        @Test("a v1 pack loads with its name as its seam; a directory is written once, never over another pack")
+        func writeOnce() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 1, seed: 3)
+            defer { rig.cleanUp() }
+            let v1 = try rig.pack()
+            #expect(v1.info?.version == 1 && v1.info?.seamSHA256 == nil && v1.seamSHA256 == v1.sha256)
+            let directory = rig.root.appendingPathComponent("packs/v1")
+            try v1.save(to: directory)
+            let loaded = try UmbrellaPack.load(from: directory)
+            #expect(loaded.sha256 == v1.sha256 && loaded.seamSHA256 == v1.sha256)
+            // The same pack again leaves the directory as it is; another pack is refused.
+            try v1.save(to: directory)
+            #expect(throws: UmbrellaPackError.self) { try Self.pack(rig).save(to: directory) }
+            #expect(try UmbrellaPack.load(from: directory).sha256 == v1.sha256)
+            let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.deletingLastPathComponent().path).filter { $0.hasPrefix(".") }
+            #expect(leftovers.isEmpty, "no staging directory is left behind")
+        }
+
+        @Test("the registry folds packs and old pointers in, makes the first of a shape current, and changes it only on use")
+        func registry() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 1, seed: 3)
+            defer { rig.cleanUp() }
+            let layout = rig.layout
+            let parent = try Self.pack(rig, name: "rao-commons-0")
+            // A pack saved before the registry, with its old pointer.
+            try parent.save(to: layout.pack(sha256: parent.sha256))
+            let pointer = UmbrellaPacks.Current(name: "rao-commons-0", source: "test", cut: Rig.cutConfig.cut, sha256: parent.sha256)
+            try JSONCoding.write(pointer, to: layout.packs.appendingPathComponent("rao-commons-0-cut\(Rig.cutConfig.cut).json"))
+            var registry = PackRegistry.load(layout)
+            let slot = PackRegistry.slot(Rig.cutConfig)
+            #expect(registry.packs.map(\.sha256) == [parent.sha256] && registry.current[slot] == parent.sha256)
+            #expect(FileManager.default.fileExists(atPath: layout.packs.appendingPathComponent(PackRegistry.fileName).path))
+            // A child, stored and registered: not current until used.
+            let child = try UmbrellaPacks.store(try Self.pack(rig, bump: 0.02, parent: parent.sha256, name: "rao-commons-1"), layout: layout)
+            registry = PackRegistry.load(layout)
+            #expect(registry.packs.count == 2 && registry.current[slot] == parent.sha256)
+            #expect(registry.resolve("rao-commons-1")?.sha256 == child.sha256)
+            #expect(registry.resolve(String(child.sha256.prefix(8)))?.sha256 == child.sha256)
+            #expect(registry.resolve(slot)?.sha256 == parent.sha256 && registry.resolve("abc") == nil)
+            #expect(registry.lineage(child.sha256).map(\.sha256) == [parent.sha256])
+            try registry.use(child.sha256)
+            try registry.save(layout)
+            #expect(PackRegistry.load(layout).current[slot] == child.sha256)
+            // ensure follows the registry; a named pack of the wrong shape is refused.
+            #expect(try UmbrellaPacks.ensure(layout: layout, config: Rig.cutConfig, tokenizer: rig.tokenizer).sha256 == child.sha256)
+            #expect(try UmbrellaPacks.ensure(layout: layout, config: Rig.cutConfig, tokenizer: rig.tokenizer, pack: "rao-commons-0").sha256 == parent.sha256)
+            #expect(throws: UmbrellaPackError.self) { try UmbrellaPacks.ensure(layout: layout, config: Rig.cutConfig, tokenizer: rig.tokenizer, pack: "nothing") }
+        }
+
+        @Test("rebase, never migrate: a node live on one pack retires that version on another and retrains from its base")
+        func rebase() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 4, seed: 7)
+            defer { rig.cleanUp() }
+            rig.settings.scratchSteps = 32
+            rig.settings.memorisedFloor = 0
+            let first = try UmbrellaPacks.store(try Self.pack(rig, seed: 5, name: "first"), layout: rig.layout)
+            let second = try UmbrellaPacks.store(try Self.pack(rig, seed: 6, name: "second"), layout: rig.layout)
+            _ = try await rig.feed("solo", 2)
+            let before = try rig.hypervisor("solo", pack: first)
+            #expect(try before.sync() == [1])
+            #expect(before.state.rebasedFrom == nil)
+
+            // A braid recorded before packs were keeps the pack its nodes trained on, whatever is current.
+            try MockWorld.Record(names: ["solo"], seed: 7, shape: MockShape(documentsPerNode: 4), preset: "base").save(rig.layout)
+            var registry = PackRegistry.load(rig.layout)
+            try registry.use(second.sha256)
+            try registry.save(rig.layout)
+            #expect(BraidOptions.trainedPack(rig.layout, names: ["solo"]) == first.sha256)
+            // The same braid under a data root, as a session opens it.
+            let dataRoot = rig.root.appendingPathComponent("data-root", isDirectory: true)
+            let braid = BraidLayout(dataRoot: DataRoot(url: dataRoot))
+            try FileManager.default.createDirectory(at: braid.nodes, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: rig.layout.node("solo").directory, to: braid.node("solo").directory)
+            try FileManager.default.copyItem(at: rig.layout.world, to: braid.world)
+            var options = BraidOptions(root: DataRoot(url: dataRoot), executable: URL(fileURLWithPath: "/usr/bin/true"))
+            options.restorePreset()
+            #expect(options.pack == first.sha256 && options.settings.preset == "base")
+
+            // The braid's record moves to the second pack; the node reports v1 as what it retires.
+            let report = try BraidSession.rebase(layout: rig.layout, pack: second.sha256)
+            #expect(report.count == 1 && report[0].version == 1 && report[0].pack == first.sha256)
+            #expect(MockWorld.Record.load(rig.layout)?.packSHA256 == second.sha256)
+
+            let after = try rig.hypervisor("solo", pack: second)
+            #expect(after.live == nil && after.state.stage == .empty && after.state.rebasedFrom == first.sha256)
+            #expect(after.state.stageDetail == "rebased · retraining")
+            #expect(try after.sync() == [2], "the same documents, trained fresh from the new base")
+            let live = try #require(after.live)
+            #expect(second.matches(live.model) && !first.matches(live.model))
+            let version = try JSONCoding.read(NodeVersion.self, from: after.layout.version(2).appendingPathComponent(NodeVersion.fileName))
+            #expect(version.packSHA256 == second.sha256 && version.gates.contains { $0.name == "trunk" && $0.passed })
+            // Started on the pack it was trained under, the node keeps its version.
+            let again = try rig.hypervisor("solo", pack: second)
+            #expect(again.live?.version == 2 && again.state.rebasedFrom == nil)
+        }
+
+        @Test("a trial braid takes the reference's documents and feeds onto the workshop's pack, never its versions, and is made once")
+        func trial() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 4, seed: 7)
+            defer { rig.cleanUp() }
+            rig.settings.scratchSteps = 32
+            rig.settings.memorisedFloor = 0
+            let first = try UmbrellaPacks.store(try Self.pack(rig, seed: 5, name: "first"), layout: rig.layout)
+            _ = try await rig.feed("solo", 2)
+            #expect(try rig.hypervisor("solo", pack: first).sync() == [1])
+            var record = MockWorld.Record(names: ["solo"], seed: 7, shape: MockShape(documentsPerNode: 4), preset: "base")
+            record.packSHA256 = first.sha256
+            try record.save(rig.layout)
+            // The pack under trial lives in a workshop of its own.
+            let workshop = BraidLayout(dataRoot: DataRoot(url: rig.root.appendingPathComponent("workshop", isDirectory: true)))
+            let second = try UmbrellaPacks.store(try Self.pack(rig, seed: 6, name: "second"), layout: workshop)
+            let entry = try #require(PackRegistry.load(workshop).resolve("second"))
+            let root = rig.root.appendingPathComponent("trial", isDirectory: true)
+            let made = try BraidTrial.make(pack: entry, preset: "base", workshop: workshop, reference: rig.layout, into: root)
+            #expect(made.nodes == ["solo"] && made.preset == "base")
+            let trial = BraidLayout(dataRoot: DataRoot(url: root))
+            let world = try #require(MockWorld.Record.load(trial))
+            #expect(world.packSHA256 == second.sha256 && world.preset == "base" && world.names == ["solo"] && world.seed == 7)
+            #expect(PackRegistry.load(trial).current[entry.slot] == second.sha256)
+            #expect(try UmbrellaPack.load(from: trial.pack(sha256: second.sha256)).sha256 == second.sha256)
+            // The documents came; what the reference trained did not, and the reference is as it was.
+            let node = trial.node("solo")
+            let files = FileManager.default
+            #expect(files.fileExists(atPath: node.offlineCorpus.path))
+            #expect(!files.fileExists(atPath: node.versions.path) && !files.fileExists(atPath: node.live.path) && !files.fileExists(atPath: node.snapshots.path))
+            #expect(files.fileExists(atPath: rig.layout.node("solo").live.path) && MockWorld.Record.load(rig.layout)?.packSHA256 == first.sha256)
+            // Made once: the same directory again is refused, and no staging directory is left behind.
+            #expect(throws: BraidSessionError.self) { _ = try BraidTrial.make(pack: entry, preset: "base", workshop: workshop, reference: rig.layout, into: root) }
+            #expect(try files.contentsOfDirectory(atPath: rig.root.path).filter { $0.hasSuffix(".staging") }.isEmpty)
+            // The catalog lists it on the pack under trial, nothing live until a sync trains it.
+            let catalog = try #require(BraidCatalog.entry(root: root, name: "trial", isHome: false))
+            #expect(catalog.commons == "second" && catalog.live.isEmpty)
+        }
+
+        @Test("a commons trained on from a pack becomes its child: every block moved, the parent's samples kept, registered but not current")
+        func continued() async throws {
+            var rig = try await Rig(names: ["solo"], documentsPerNode: 1, seed: 3)
+            defer { rig.cleanUp() }
+            let layout = rig.layout
+            let parent = try UmbrellaPacks.store(try Self.pack(rig, name: "parent"), layout: layout)
+            let model = try parent.baseModel()
+            let documents = (0 ..< 40).map { CommonsDocument(id: "d\($0)", text: "The lighthouse keeper wrote entry \($0) in the log before the storm.") }
+            try CommonsCorpus.write(name: "logs", documents: documents, source: "test", license: "test", provenance: [:], tokenizer: rig.tokenizer, root: layout.corpora)
+            let shard = try CommonsCorpus.shard(layout.corpora, "logs", tokenizer: rig.tokenizer, heldOut: false)
+            let spec = CommonsTrainingSpec(
+                runID: "run", parentSHA256: parent.sha256, tokenizerSHA256: rig.tokenizer.tokenizerSHA256,
+                corpora: [PackRecipe.Corpus(name: "logs", sha256: "x", tokens: shard.count, weight: 1)], tokens: 4 * 2 * 32, seqLen: 32, batch: 2, peakLR: 1e-3)
+            let trainer = CommonsTrainer(
+                model: model, spec: spec, stream: TokenStream(sources: [.init(name: "logs", shard: shard, weight: 1)], seqLen: 32, batchSize: 2, seed: 1, eos: Int32(rig.tokenizer.eosTokenID)),
+                heldOut: ["pack": CommonsTrainer.snippetBatches(parent.heldOut.map(\.tokens))], directory: layout.commonsRuns.appendingPathComponent("run"))
+            let state = try trainer.run()
+            #expect(state.step == 4)
+            let recipe = PackRecipe(corpora: spec.corpora, runID: "run", steps: 4, tokens: spec.tokens, seqLen: 32, batch: 2, peakLR: 1e-3, warmupSteps: spec.warmupSteps,
+                                    annealSteps: spec.annealSteps, weightDecay: spec.weightDecay, seed: spec.seed, heldOut: ["pack": [1, 0.5]])
+            let child = try UmbrellaPacks.continued(model: model, parent: parent, name: "child", recipe: recipe, layout: layout, tokenizer: rig.tokenizer)
+            let info = try #require(child.info)
+            #expect(info.parent == parent.sha256 && info.recipe == recipe && info.source == "pack:\(parent.sha256.prefix(12))+run:run")
+            #expect(child.sha256 != parent.sha256 && child.seamSHA256 != parent.seamSHA256 && child.vocabulary.sha256 != parent.vocabulary.sha256)
+            #expect(child.anchors == parent.anchors && child.heldOut == parent.heldOut)
+            let registry = PackRegistry.load(layout)
+            #expect(registry.current[PackRegistry.slot(Rig.cutConfig)] == parent.sha256)
+            #expect(registry.lineage(child.sha256).map(\.sha256) == [parent.sha256])
+            // Reloaded from disk, the child's base is the trained model.
+            let reloaded = try UmbrellaPack.load(from: layout.pack(sha256: child.sha256)).baseModel()
+            let trained = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+            var worst: Float = 0
+            for (key, value) in reloaded.parameters().flattened() { worst = max(worst, abs(value - trained[key]!).max().item(Float.self)) }
+            #expect(worst == 0)
+        }
+    }
+}

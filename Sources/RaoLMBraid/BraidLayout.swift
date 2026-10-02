@@ -48,6 +48,9 @@ public struct BraidLayout: Sendable, Equatable {
     public func pack(sha256: String) -> URL {
         packs.appendingPathComponent(String(sha256.prefix(12)), isDirectory: true)
     }
+    /// The commons' training corpora, and its training runs.
+    public var corpora: URL { packs.appendingPathComponent("corpora", isDirectory: true) }
+    public var commonsRuns: URL { packs.appendingPathComponent("runs", isDirectory: true) }
     public var nodes: URL { root.appendingPathComponent("nodes", isDirectory: true) }
     public func node(_ name: String) -> NodeLayout { NodeLayout(directory: nodes.appendingPathComponent(name, isDirectory: true)) }
     public var session: URL { root.appendingPathComponent("braid.json") }

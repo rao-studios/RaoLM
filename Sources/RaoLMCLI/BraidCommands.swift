@@ -28,7 +28,7 @@ struct BraidGroup: AsyncParsableCommand {
             asks the open ones for their last hidden state, applies the one shared final norm and tied head, and mixes the \
             Threads' own kNN-LMs. Every token records what each Thread supplied.
             """,
-        subcommands: [Panel.self, Demo.self, Ask.self, Status.self, Down.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self, BenchQuestion.self],
+        subcommands: [Panel.self, Demo.self, Ask.self, List.self, Status.self, Down.self, Rebase.self, Sync.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self, BenchQuestion.self, BenchCommons.self],
         defaultSubcommand: Panel.self
     )
 
@@ -93,6 +93,9 @@ struct BraidGroup: AsyncParsableCommand {
         @Option(help: "A training arm: passage-break (paragraph breaks in the stream, attention kept inside a document); canon, gated-attention, muon or wsd (the same, plus Canon layers, a gate on each attention head, the Muon optimizer, or a warmup-stable-decay schedule). Default: the braid's own, and passage-break for a new base braid.")
         var arm: String?
 
+        @Option(help: "The umbrella pack to run on (a name or hash prefix from raolm umbrella list; default: the braid's own, else the current one).")
+        var pack: String?
+
         @Option(help: "Documents a feed deposits.")
         var batch = 8
 
@@ -108,6 +111,7 @@ struct BraidGroup: AsyncParsableCommand {
             options.threadBinary = threadBinary
             options.batch = batch
             options.fresh = fresh
+            options.pack = pack
             if let preset {
                 options.settings.preset = preset
                 options.presetRequested = true
@@ -168,7 +172,7 @@ struct BraidGroup: AsyncParsableCommand {
                 try Preflight.requireMetallib()
                 let options = try braid.options(root: global.root)
                 let tokenizer = try await RaoTokenizer.load()
-                let pack = try UmbrellaPacks.ensure(layout: options.layout, config: try options.settings.modelConfig(), tokenizer: tokenizer) {
+                let pack = try UmbrellaPacks.ensure(layout: options.layout, config: try options.settings.modelConfig(), tokenizer: tokenizer, pack: options.pack) {
                     print("umbrella pack: \($0)")
                 }
                 let recorder = try record.map { try BraidRecorder(directory: URL(fileURLWithPath: $0)) }
@@ -391,11 +395,102 @@ struct BraidGroup: AsyncParsableCommand {
                 let generation = try generator.generate(BraidRequest(
                     promptTokens: stemTokens, promptText: rewrite.stem, params: params, stopAtSentenceEnd: true, question: rewrite,
                     context: context, subject: QuestionAdapter.subjectTokens(stem: rewrite.stem, tokens: stemTokens, question: question, tokenizer: tokenizer)))
-                print(BraidTables.answer(generation, names: generator.names))
+                let alone = umbrella.commons.map { commons in
+                    (name: commons.packName, text: commons.complete(stemTokens, maxTokens: maxTokens, tokenizer: tokenizer, stopAtSentenceEnd: true))
+                }
+                print(BraidTables.answer(generation, names: generator.names, commons: alone))
                 if let out {
                     try JSONCoding.write(generation, to: URL(fileURLWithPath: (out as NSString).expandingTildeInPath))
                     print("record: \(out)")
                 }
+            }
+        }
+    }
+
+    struct Sync: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Start the nodes, bring every node without a live version up to date (a rebased node retrains from the new base), and stop.",
+            discussion: "Nothing is fed and nothing is withdrawn: each node trains on the documents its Thread already holds.")
+
+        @OptionGroup var global: GlobalOptions
+        @OptionGroup var braid: BraidOptionGroup
+
+        func run() async throws {
+            try await guarded {
+                try Preflight.requireMetallib()
+                let options = try braid.options(root: global.root)
+                let tokenizer = try await RaoTokenizer.load()
+                let pack = try UmbrellaPacks.ensure(layout: options.layout, config: try options.settings.modelConfig(), tokenizer: tokenizer, pack: options.pack) {
+                    print("umbrella pack: \($0)")
+                }
+                let session = try BraidSession(options: options, vocabularySHA256: pack.vocabulary.sha256, packSHA256: pack.hasBase ? pack.sha256 : nil) { _ in }
+                let stop = StopSignal()
+                do {
+                    try await session.start()
+                    print("umbrella pack \(Format.short(pack.sha256)) (\(pack.name))")
+                    print(Format.table(BraidTables.nodes(session.states, session: session)))
+                    let stale = session.names.filter { session.state($0)?.liveVersion == nil }
+                    if stale.isEmpty {
+                        print("every node is live on this pack: nothing to do")
+                    } else {
+                        for name in stale {
+                            if let from = session.state(name)?.rebasedFrom { print("\(name): rebased from \(from.prefix(12)), retraining") }
+                        }
+                        let before = Dictionary(uniqueKeysWithValues: stale.map { ($0, session.state($0)?.versions ?? 0) })
+                        for name in stale { try session.sync(name) }
+                        try await BraidWait.settled(session, after: before, stop: stop)
+                        print(Format.table(BraidTables.nodes(session.states, session: session)))
+                    }
+                } catch {
+                    await session.stop()
+                    throw error
+                }
+                await session.stop()
+            }
+        }
+    }
+
+    struct Rebase: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Move the braid onto another umbrella pack; its nodes retrain from the new base when it next starts.",
+            discussion: """
+                Rebase, never migrate: a node's blocks run under the pack's trunk, so a node trained under one pack does not serve \
+                under another. The braid's documents, feeds and history stay; each node's live version is retired when the braid \
+                starts on the new pack, and the node trains fresh blocks from the new base. The pack must fit the braid's shape \
+                (raolm umbrella list). Refused while the braid runs.
+                """)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "The pack to run on: a name or hash prefix from raolm umbrella list.")
+        var pack: String
+
+        func run() async throws {
+            try await guarded {
+                let layout = BraidLayout(dataRoot: global.root)
+                guard let record = MockWorld.Record.load(layout) else {
+                    throw RaoLMFailure("no braid under \(layout.root.path)", hint: "raolm braid demo starts one", code: 66)
+                }
+                var settings = HypervisorSettings()
+                settings.preset = record.preset ?? "tiny"
+                let config = try settings.modelConfig()
+                guard config.hasTrunk else { throw RaoLMFailure("the braid's preset (\(settings.preset)) has no trunk, so no pack to rebase onto", code: 64) }
+                guard let entry = PackRegistry.load(layout).resolve(pack) else {
+                    throw RaoLMFailure("no pack '\(pack)' under \(layout.packs.path)", hint: "raolm umbrella list", code: 66)
+                }
+                guard entry.slot == PackRegistry.slot(config) else {
+                    throw RaoLMFailure("pack \(entry.sha256.prefix(12)) is \(entry.slot); the braid is \(PackRegistry.slot(config))", code: 64)
+                }
+                let previous = record.packSHA256
+                let nodes = try BraidSession.rebase(layout: layout, pack: entry.sha256)
+                print("braid \(layout.root.path): pack \(previous.map { String($0.prefix(12)) } ?? "unrecorded") → \(entry.sha256.prefix(12)) (\(entry.name))")
+                for node in nodes {
+                    let retired = node.version.map { version in
+                        node.pack == entry.sha256 ? "v\(version) stays (already on it)" : "v\(version) retires (trained on \(node.pack.map { String($0.prefix(12)) } ?? "?"))"
+                    } ?? "no live version"
+                    print("  \(node.node.padding(toLength: 10, withPad: " ", startingAt: 0)) \(retired)")
+                }
+                print("\nraolm braid sync --data-dir \(global.root.url.path) (with the braid's --offline and --dataset) retrains every node from the new base.")
             }
         }
     }
@@ -430,6 +525,29 @@ struct BraidGroup: AsyncParsableCommand {
                     ])
                 }
                 print(Format.table(["node", "process", "thread pid", "ports", "live", "versions", "docs", "memorised", "thread id"], rows))
+            }
+        }
+    }
+
+    struct List: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Every braid on this machine: the data root's, then each one in the T9 work area, as the studio lists them.")
+
+        @OptionGroup var global: GlobalOptions
+
+        func run() async throws {
+            try await guarded {
+                let entries = BraidCatalog.scan(home: global.root.url, areas: DatasetsRoot.braidAreas)
+                guard !entries.isEmpty else {
+                    print("no braid under \(global.root.url.path) or \(DatasetsRoot.workArea) (raolm braid demo starts one)")
+                    return
+                }
+                let date = DateFormatter()
+                date.dateFormat = "yyyy-MM-dd HH:mm"
+                print(Format.table(["braid", "Threads", "model", "commons", "fed from", "mode", "last live", "where"], entries.map { entry in
+                    [entry.name, entry.threads, entry.model, entry.commons ?? "—", entry.dataset ?? "mock world", entry.offline ? "offline" : "Threads",
+                     entry.updated.map { date.string(from: $0) } ?? "—", entry.root.path]
+                }))
             }
         }
     }
@@ -909,7 +1027,84 @@ extension BraidGroup {
     }
 }
 
+extension BraidGroup {
+    struct BenchCommons: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-commons",
+            abstract: "Whether a new commons is fit for the braid: a child pack's braid against its parent's, on the same documents.",
+            discussion: """
+                --data-dir is the braid on the child pack (a rebased copy of the parent's, retrained); --reference is the braid on \
+                the parent pack. Rules C1 to C4 were fixed before any numbers (Docs/ARCHITECTURE.md, "bench-commons").
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "The braid on the parent pack.")
+        var reference: String?
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(help: "Print a saved report, scored again under the rules, instead of running.")
+        var report: String?
+
+        func run() async throws {
+            try await guarded {
+                if let report {
+                    var loaded = try JSONCoding.read(CommonsReport.self, from: URL(fileURLWithPath: (report as NSString).expandingTildeInPath))
+                    loaded.evaluation = CommonsBench.evaluate(heldOut: loaded.heldOut, arms: loaded.arms, facts: loaded.facts)
+                    print(BraidTables.commons(loaded))
+                    return
+                }
+                guard let reference else { throw RaoLMFailure("bench-commons needs --reference, the braid on the parent pack", code: 64) }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                let result = try CommonsBench.run(
+                    child: BraidLayout(dataRoot: global.root), parent: BraidLayout(dataRoot: DataRoot.resolve(argument: reference)), tokenizer: tokenizer
+                ) { line in Console.error(line) }
+                print(BraidTables.commons(result))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
 extension BraidTables {
+    static func commons(_ report: CommonsReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        func num(_ value: Float?) -> String { value.map { String(format: "%.3f", $0) } ?? "—" }
+        var lines = ["child \(report.child.prefix(12)) against parent \(report.parent.prefix(12))" + (report.lineage.isEmpty ? "" : " · lineage " + report.lineage.joined(separator: " ← ")), ""]
+        lines.append(Format.table(
+            ["commons", "facts exact", "citation@1", "lift positive", "commons leads", "largest Thread gate", "Threads' share", "unknown: commons largest"],
+            ["parent", "child"].compactMap { name -> [String]? in
+                guard let arm = report.arms.first(where: { $0.arm == name }), let facts = report.facts.first(where: { $0.arm == name }) else { return nil }
+                return [name, "\(facts.factsExact)/\(facts.facts) (\(pct(facts.factsExactRate)))", pct(facts.citation), pct(facts.liftPositive),
+                        pct(arm.commonsLeads), num(arm.commonsThreadGate), num(arm.commonsThreadShare), pct(arm.unknownLargest)]
+            }))
+        lines.append("")
+        if let byNode = report.factsByNode, let parent = byNode["parent"], let child = byNode["child"] {
+            for node in parent.keys.sorted() {
+                guard let p = parent[node], let c = child[node], p.count == 2, c.count == 2 else { continue }
+                lines.append("facts held by \(node): parent \(p[0])/\(p[1]) · child \(c[0])/\(c[1]) (\(c[0] - p[0] >= 0 ? "+" : "")\(c[0] - p[0]))")
+            }
+            lines.append("")
+        }
+        for (set, losses) in report.heldOut.sorted(by: { $0.key < $1.key }) where losses.count == 2 {
+            lines.append(String(format: "held-out %@: %.4f → %.4f (%+.4f)", set, losses[0], losses[1], losses[1] - losses[0]))
+        }
+        lines.append("")
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append("")
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
+
     static func question(_ report: QuestionReport) -> String {
         func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
         func num(_ value: Float?) -> String { value.map { String(format: "%.3f", $0) } ?? "—" }
@@ -1213,7 +1408,7 @@ enum BraidTables {
     }
 
     /// A question's answer: how it was rewritten, what the braid said, who earned it, and where it is cited.
-    static func answer(_ generation: CitedGeneration, names: [String]) -> String {
+    static func answer(_ generation: CitedGeneration, names: [String], commons: (name: String, text: String)? = nil) -> String {
         var lines: [String] = []
         if let question = generation.prompt.question {
             lines.append("question  \(question.question)")
@@ -1225,6 +1420,7 @@ enum BraidTables {
             if let context = strand.context { lines.append(String(format: "context   %@: “%@” (%.2f)", strand.name, context.text.trimmingCharacters(in: .whitespaces), context.score)) }
         }
         lines.append("answer    \(generation.text.trimmingCharacters(in: .whitespaces))")
+        if let commons { lines.append("alone     commons (\(commons.name)): \(commons.text.trimmingCharacters(in: .whitespacesAndNewlines))") }
         let generated = generation.traces.filter { !$0.isPrompt }
         // Credit over the answer's tokens, weighted by bits, as the blend weighs it.
         var credit: [String: Double] = [:]
@@ -1236,7 +1432,8 @@ enum BraidTables {
         }
         if bits > 0 {
             let order = names.filter { credit[$0] != nil } + credit.keys.filter { !names.contains($0) }.sorted()
-            lines.append("credit    " + order.map { String(format: "%@ %.0f%%", $0, 100 * credit[$0]! / bits) }.joined(separator: " · "))
+            func shown(_ name: String) -> String { name == BraidStrandRef.commonsName ? commons.map { "commons (\($0.name))" } ?? name : name }
+            lines.append("credit    " + order.map { String(format: "%@ %.0f%%", shown($0), 100 * credit[$0]! / bits) }.joined(separator: " · "))
         }
         if let followed = generated.compactMap(\.followed).first { lines.append("followed  \(followed)'s document") }
         var cited: [String] = []

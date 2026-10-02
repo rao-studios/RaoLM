@@ -50,22 +50,34 @@ public struct PackSource: Sendable, Equatable {
             Book(id: 1228, title: "On the Origin of Species"),
         ])
 
+    /// SmolLM2-360M, pinned, cut after block 22.
+    public static let smolLM2_360M = PackSource(
+        name: "smollm2-360m", repo: "HuggingFaceTB/SmolLM2-360M", revision: "f8027fd0eaeea54caa13c31d31b9fdc459c38b49", cut: 22,
+        books: smolLM2_135M.books)
+
     /// The source a preset's shape is cut from, if it has a trunk.
     public static func source(for config: RaoLMConfig) throws -> PackSource {
-        var source = smolLM2_135M
-        let base = RaoLMConfig.smolLM2_135M
-        guard config.hiddenSize == base.hiddenSize, config.numHiddenLayers == base.numHiddenLayers,
-              config.intermediateSize == base.intermediateSize, config.numAttentionHeads == base.numAttentionHeads
-        else {
-            throw UmbrellaPackError.shape("only SmolLM2-135M's shape (30 × 576) has a pack; this config is \(config.numHiddenLayers) × \(config.hiddenSize)")
+        for (candidate, shape) in [(smolLM2_135M, RaoLMConfig.smolLM2_135M), (smolLM2_360M, RaoLMConfig.smolLM2_360M)] {
+            guard config.hiddenSize == shape.hiddenSize, config.numHiddenLayers == shape.numHiddenLayers,
+                  config.intermediateSize == shape.intermediateSize, config.numAttentionHeads == shape.numAttentionHeads else { continue }
+            var source = candidate
+            source.cut = config.cut
+            return source
         }
-        source.cut = config.cut
-        return source
+        throw UmbrellaPackError.shape(
+            "no pack source for \(config.numHiddenLayers) × \(config.hiddenSize); SmolLM2-135M (30 × 576) and SmolLM2-360M (32 × 960) have one, and raolm umbrella import makes others")
+    }
+
+    /// A source for any repository on the hub, at a revision, cut where asked; its anchors from the same books.
+    public static func hub(repo: String, revision: String, cut: Int, name: String? = nil) -> PackSource {
+        PackSource(name: name ?? repo.split(separator: "/").last.map { String($0).lowercased() } ?? repo, repo: repo, revision: revision, cut: cut,
+                   books: smolLM2_135M.books)
     }
 }
 
 public enum UmbrellaPacks {
-    /// <braid>/umbrella/<name>-cut<cut>.json: the pack a source names.
+    /// <braid>/umbrella/<name>-cut<cut>.json: the pack a source named before the registry
+    /// (`PackRegistry` folds these in and no longer writes them).
     public struct Current: Codable, Sendable, Equatable {
         public var name: String
         public var source: String
@@ -73,30 +85,74 @@ public enum UmbrellaPacks {
         public var sha256: String
     }
 
-    static func pointer(_ layout: BraidLayout, _ source: PackSource) -> URL {
-        layout.packs.appendingPathComponent("\(source.name)-cut\(source.cut).json")
-    }
-
     /// The pack a braid of `config`'s shape uses. With no trunk: the seeded vocabulary. With one:
-    /// the pack built before, or one built now (it downloads the base model and the books once).
+    /// `pack` when named (a registered name or hash prefix), else the registry's current pack for
+    /// the shape, else one built now from the hub (it downloads the base model and the books once).
     public static func ensure(
-        layout: BraidLayout, config: RaoLMConfig, tokenizer: RaoTokenizer, progress: ((String) -> Void)? = nil
+        layout: BraidLayout, config: RaoLMConfig, tokenizer: RaoTokenizer, pack reference: String? = nil, progress: ((String) -> Void)? = nil
     ) throws -> UmbrellaPack {
         guard config.hasTrunk else {
             return UmbrellaPack(vocabulary: try BraidVocabulary.ensure(layout: layout, config: config, tokenizer: tokenizer))
         }
-        let source = try PackSource.source(for: config)
-        if let current = try? JSONCoding.read(Current.self, from: pointer(layout, source)), current.source == source.hubSource,
-           let pack = try? UmbrellaPack.load(from: layout.pack(sha256: current.sha256)),
-           pack.info?.tokenizerSHA256 == tokenizer.tokenizerSHA256 {
+        let registry = PackRegistry.load(layout)
+        if let reference {
+            guard let entry = registry.resolve(reference) else { throw UmbrellaPackError.missing("no pack '\(reference)' under \(layout.packs.path)") }
+            guard entry.slot == PackRegistry.slot(config) else {
+                throw UmbrellaPackError.shape("pack \(entry.sha256.prefix(12)) is \(entry.slot), the braid's shape is \(PackRegistry.slot(config))")
+            }
+            return try load(entry.sha256, layout: layout, tokenizer: tokenizer)
+        }
+        if let sha = registry.current[PackRegistry.slot(config)], let pack = try? load(sha, layout: layout, tokenizer: tokenizer) {
             return pack
         }
+        let source = try PackSource.source(for: config)
         do {
             return try build(source: source, layout: layout, tokenizer: tokenizer, progress: progress)
         } catch {
             throw UmbrellaPackError.missing(
                 "the \(source.name) pack could not be built (\(error)); build it once while online: raolm umbrella build --data-dir \(layout.root.deletingLastPathComponent().path)")
         }
+    }
+
+    /// A registered pack, refused when its tokenizer is not the one in use.
+    public static func load(_ sha256: String, layout: BraidLayout, tokenizer: RaoTokenizer) throws -> UmbrellaPack {
+        let pack = try UmbrellaPack.load(from: layout.pack(sha256: sha256))
+        guard pack.sha256 == sha256 else { throw UmbrellaPackError.fingerprint(expected: sha256, found: pack.sha256, what: "pack") }
+        if let found = pack.info?.tokenizerSHA256, found != tokenizer.tokenizerSHA256 {
+            throw UmbrellaPackError.fingerprint(expected: tokenizer.tokenizerSHA256, found: found, what: "tokenizer")
+        }
+        return pack
+    }
+
+    /// Saves a pack under the braid's data root and registers it.
+    @discardableResult
+    public static func store(_ pack: UmbrellaPack, layout: BraidLayout) throws -> UmbrellaPack {
+        guard let info = pack.info else { throw UmbrellaPackError.noBase }
+        let directory = layout.pack(sha256: info.sha256)
+        try pack.save(to: directory)
+        var registry = PackRegistry.load(layout)
+        registry.register(info)
+        try registry.save(layout)
+        return try UmbrellaPack.load(from: directory)
+    }
+
+    /// A pack from a model trained on from `parent`: every block and the vocabulary as trained, the
+    /// parent's anchors and held-out snippets (the same tokens, since the tokenizer is the same)
+    /// with the anchors' cut states read under the new model, the parent and the recipe recorded.
+    /// Registered, not made current.
+    public static func continued(
+        model: RaoTransformer, parent: UmbrellaPack, name: String, recipe: PackRecipe, layout: BraidLayout, tokenizer: RaoTokenizer
+    ) throws -> UmbrellaPack {
+        guard let info = parent.info else { throw UmbrellaPackError.noBase }
+        let vocabulary = VocabularyPack.from(model: model, tokenizerSHA256: tokenizer.tokenizerSHA256, originSHA256: parent.sha256)
+        var base: [String: MLXArray] = [:]
+        for (key, value) in model.parameters().flattened() where RaoTransformer.blockIndex(ofKey: key) != nil { base[key] = value.asType(.float32) }
+        let anchorStates = UmbrellaPack.anchorStates(model: model, anchors: parent.anchors.map(\.tokens))
+        let pack = UmbrellaPack.make(
+            vocabulary: vocabulary, name: name, source: "pack:\(parent.sha256.prefix(12))+run:\(recipe.runID)", config: info.config, base: base,
+            anchors: parent.anchors, anchorStates: anchorStates, heldOut: parent.heldOut, texts: info.texts, tokenizerSHA256: tokenizer.tokenizerSHA256,
+            parent: parent.sha256, recipe: recipe)
+        return try store(pack, layout: layout)
     }
 
     /// Downloads the base model and the books, cuts the pack and saves it under the braid.
@@ -107,9 +163,10 @@ public enum UmbrellaPacks {
         let repo = source.repo
         let revision = source.revision
         let folder = try Blocking.run {
-            try await HubApi().snapshot(from: repo, revision: revision, matching: ["config.json", "model.safetensors", "tokenizer.json"])
+            try await HubApi().snapshot(from: repo, revision: revision, matching: ["config.json", "*.safetensors", "model.safetensors.index.json", "tokenizer.json"])
         }
         let tokenizerSHA = try ContentHash.sha256Hex(fileAt: folder.appendingPathComponent("tokenizer.json"))
+        // Sharded checkpoints are read through their index; Checkpoint.loadWeights merges the shards.
         guard tokenizerSHA == tokenizer.tokenizerSHA256 else {
             throw UmbrellaPackError.fingerprint(expected: tokenizer.tokenizerSHA256, found: tokenizerSHA, what: "tokenizer (a pack must use RaoLM's own)")
         }
@@ -120,6 +177,13 @@ public enum UmbrellaPacks {
         progress?("loading the base model (\(config.numHiddenLayers) × \(config.hiddenSize), cut at \(config.cut))")
         let model = RaoTransformer(config)
         try Checkpoint.loadWeights(into: model, from: folder)
+        // C0: RaoLM's transformer reads the weights as Frigate's own Llama does.
+        let check = try ReferenceCheck.llama(folder: folder, model: model, prompts: [tokenizer.encode("It is a truth universally acknowledged, that a single man in possession of a good fortune"),
+                                                                                       tokenizer.encode("The river ran north past the mill, and the miller counted the sacks twice.")])
+        progress?(String(format: "reference check: largest logit difference from Frigate's Llama %.2e", check))
+        guard check < ReferenceCheck.tolerance else {
+            throw UmbrellaPackError.shape(String(format: "RaoLM's transformer and Frigate's Llama disagree on %@ by %.2e (tolerance %.0e)", repo, check, ReferenceCheck.tolerance))
+        }
         let originSHA = try ContentHash.sha256Hex(fileAt: folder.appendingPathComponent(Checkpoint.weightsFile))
         let vocabulary = VocabularyPack.from(model: model, tokenizerSHA256: tokenizer.tokenizerSHA256, originSHA256: originSHA)
         var base: [String: MLXArray] = [:]
@@ -128,20 +192,12 @@ public enum UmbrellaPacks {
         let samples = try commonsSamples(source: source, layout: layout, tokenizer: tokenizer, progress: progress)
         progress?("reading the base model's cut states on \(samples.anchors.count) anchors")
         let anchorStates = UmbrellaPack.anchorStates(model: model, anchors: samples.anchors.map(\.tokens))
-        let trunk = base.filter { (RaoTransformer.blockIndex(ofKey: $0.key) ?? -1) >= config.cut }.map { (key: $0.key, value: $0.value) }
-        let sha = UmbrellaPack.fingerprint(embedding: vocabulary.embedding, norm: vocabulary.norm, trunk: trunk)
-        let info = PackInfo(
-            name: source.name, source: source.hubSource, config: config, sha256: sha, vocabularySHA256: vocabulary.sha256,
-            anchorCount: samples.anchors.count, heldOutCount: samples.heldOut.count, texts: samples.texts,
-            tokenizerSHA256: tokenizer.tokenizerSHA256)
-        let pack = UmbrellaPack(vocabulary: vocabulary, info: info, base: base, anchors: samples.anchors, anchorStates: anchorStates,
-                                heldOut: samples.heldOut)
-        progress?("saving pack \(sha.prefix(12))…")
-        let directory = layout.pack(sha256: sha)
-        try? FileManager.default.removeItem(at: directory)
-        try pack.save(to: directory)
-        try JSONCoding.write(Current(name: source.name, source: source.hubSource, cut: source.cut, sha256: sha), to: pointer(layout, source))
-        return try UmbrellaPack.load(from: directory)
+        let pack = UmbrellaPack.make(
+            vocabulary: vocabulary, name: source.name, source: source.hubSource, config: config, base: base, anchors: samples.anchors,
+            anchorStates: anchorStates, heldOut: samples.heldOut, texts: samples.texts, tokenizerSHA256: tokenizer.tokenizerSHA256,
+            referenceMaxDifference: check)
+        progress?("saving pack \(pack.sha256.prefix(12))…")
+        return try store(pack, layout: layout)
     }
 
     // MARK: - Commons text
@@ -203,31 +259,8 @@ public enum UmbrellaPacks {
         total / max(1, count) + (index < total % max(1, count) ? 1 : 0)
     }
 
-    /// A book's body without the distributor's header and footer, lines within a paragraph joined.
+    /// A book's body, from the cache under the braid's packs (Project Gutenberg on first use).
     static func text(of book: PackSource.Book, layout: BraidLayout) throws -> String {
-        let directory = layout.packs.appendingPathComponent("texts", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let file = directory.appendingPathComponent("pg\(book.id).txt")
-        var raw: String
-        if let cached = try? String(contentsOf: file, encoding: .utf8) {
-            raw = cached
-        } else {
-            guard let url = URL(string: "https://www.gutenberg.org/cache/epub/\(book.id)/pg\(book.id).txt") else {
-                throw UmbrellaPackError.missing("book \(book.id)")
-            }
-            let data = try Blocking.run { try await URLSession.shared.data(from: url).0 }
-            raw = String(decoding: data, as: UTF8.self)
-            try data.write(to: file, options: .atomic)
-        }
-        raw = raw.replacingOccurrences(of: "\r\n", with: "\n")
-        if let start = raw.range(of: "*** START OF") {
-            raw = String(raw[start.upperBound...])
-            if let line = raw.firstIndex(of: "\n") { raw = String(raw[raw.index(after: line)...]) }
-        }
-        if let end = raw.range(of: "*** END OF") { raw = String(raw[..<end.lowerBound]) }
-        return raw.components(separatedBy: "\n\n")
-            .map { $0.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: " ") }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
+        try GutenbergText.body(id: book.id, cache: layout.packs.appendingPathComponent("texts", isDirectory: true))
     }
 }

@@ -157,6 +157,11 @@ public final class FixtureBackend: StudioBackend, @unchecked Sendable {
 
     /// A recorded `raolm braid demo --record <fixtures>/braid` stands in for the nodes.
     func braid(_ job: BraidJob) async throws {
+        if case .catalog = job {
+            // A recording is not a braid: the catalog is empty, and S replays it.
+            post(.braidCatalog([]))
+            return
+        }
         let recording = directory.appendingPathComponent("braid", isDirectory: true)
         let entries = (try? BraidRecorder.load(recording)) ?? []
         guard !entries.isEmpty else {
@@ -202,6 +207,8 @@ public final class FixtureBackend: StudioBackend, @unchecked Sendable {
             post(.log("fixture mode replays a recorded braid; it does not feed nodes"))
         case .stop:
             post(.braid(.stopped))
+        case .catalog:
+            break
         }
     }
 

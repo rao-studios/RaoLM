@@ -248,8 +248,15 @@ public struct BraidScreenState: Sendable {
     public var fresh = false
     public var autoStart = false
     /// The nodes and dataset a start asks for: what the studio was opened with, until a dataset
-    /// is chosen on the panel (d).
+    /// is chosen on the panel (d) or another braid in the catalog.
     public var world = BraidWorldChoice()
+    /// What the studio was opened with, for its own braid when it is chosen again.
+    public var launchWorld = BraidWorldChoice()
+    /// Every braid on this machine, the studio's own first; the selected one is what a start loads.
+    public var catalog: [BraidCatalogEntry] = []
+    public var catalogTable = TableState(selected: 0)
+    /// The braid running, or last started (nil before the first start).
+    public var loaded: BraidCatalogEntry?
     /// The dataset the running braid feeds its nodes from; nil: a generated mock world.
     public var source: MockDatasetSource?
     /// The braid is stopping to start again on the dataset just chosen.
@@ -286,6 +293,8 @@ public struct BraidScreenState: Sendable {
     public var askAlone = false
     /// Each Thread's own answer to the current generation's prompt.
     public var alone: [String: String] = [:]
+    /// The commons' pack by name ("rao-commons-1"); nil when the braid runs none.
+    public var commonsPack: String?
     public var verification: [String] = []
     public var verifiedAll: Bool?
     public var events = LogState(capacity: 400)

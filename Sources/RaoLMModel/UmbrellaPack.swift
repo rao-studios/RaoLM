@@ -51,16 +51,79 @@ public struct PackText: Codable, Sendable, Equatable {
 }
 
 /// pack.json.
+/// How a continued-pretrained pack was made from its parent: enough to make it again.
+public struct PackRecipe: Codable, Sendable, Equatable {
+    public struct Corpus: Codable, Sendable, Equatable {
+        public var name: String
+        /// SHA-256 of the corpus's documents as stored.
+        public var sha256: String
+        public var tokens: Int
+        public var weight: Double
+
+        public init(name: String, sha256: String, tokens: Int, weight: Double) {
+            self.name = name
+            self.sha256 = sha256
+            self.tokens = tokens
+            self.weight = weight
+        }
+    }
+
+    public var corpora: [Corpus]
+    public var runID: String
+    public var steps: Int
+    public var tokens: Int
+    public var seqLen: Int
+    public var batch: Int
+    public var peakLR: Float
+    public var warmupSteps: Int
+    public var annealSteps: Int
+    public var weightDecay: Float
+    public var seed: UInt64
+    /// Held-out loss per set ("pack", or a corpus's name): the parent's, then the child's.
+    public var heldOut: [String: [Float]]
+
+    public init(
+        corpora: [Corpus], runID: String, steps: Int, tokens: Int, seqLen: Int, batch: Int, peakLR: Float, warmupSteps: Int,
+        annealSteps: Int, weightDecay: Float, seed: UInt64, heldOut: [String: [Float]] = [:]
+    ) {
+        self.corpora = corpora
+        self.runID = runID
+        self.steps = steps
+        self.tokens = tokens
+        self.seqLen = seqLen
+        self.batch = batch
+        self.peakLR = peakLR
+        self.warmupSteps = warmupSteps
+        self.annealSteps = annealSteps
+        self.weightDecay = weightDecay
+        self.seed = seed
+        self.heldOut = heldOut
+    }
+}
+
 public struct PackInfo: Codable, Sendable, Equatable {
+    /// 1: named by the seam (vocabulary and trunk). 2: named by the whole base and its tokenizer,
+    /// the seam kept beside it.
     public var version: Int
     /// A short name, e.g. "smollm2-135m".
     public var name: String
-    /// Where the weights came from, e.g. "hub:HuggingFaceTB/SmolLM2-135M@93efa2f0…".
+    /// Where the weights came from, e.g. "hub:HuggingFaceTB/SmolLM2-135M@93efa2f0…", or
+    /// "pack:<parent>+run:<run>" for a continued-pretrained pack.
     public var source: String
     /// The base model's shape; its `cut` is the first block of the trunk.
     public var config: RaoLMConfig
-    /// The pack's name: SHA-256 of the vocabulary's bytes and the trunk's.
+    /// The pack's name. v2: SHA-256 of the norm, the embedding, every block's key and bytes and
+    /// the tokenizer's hash. v1: the seam's hash.
     public var sha256: String
+    /// What a node trained under the pack must hold: SHA-256 of the vocabulary's bytes and the
+    /// trunk's. Nil in a v1 pack, whose name is its seam.
+    public var seamSHA256: String?
+    /// The pack this one was trained from.
+    public var parent: String?
+    public var recipe: PackRecipe?
+    /// For a pack built from open weights: the largest logit difference between RaoLM's
+    /// transformer and Frigate's own Llama on the same weights and text (C0).
+    public var referenceMaxDifference: Float?
     public var vocabularySHA256: String
     /// SHA-256 of base.safetensors and anchors.safetensors as written.
     public var baseSHA256: String?
@@ -89,6 +152,9 @@ public struct PackInfo: Codable, Sendable, Equatable {
         self.tokenizerSHA256 = tokenizerSHA256
         self.createdAt = createdAt
     }
+
+    /// The seam a node must match: the name itself in a v1 pack.
+    public var seam: String { seamSHA256 ?? sha256 }
 }
 
 public enum UmbrellaPackError: Error, CustomStringConvertible {
@@ -96,6 +162,7 @@ public enum UmbrellaPackError: Error, CustomStringConvertible {
     case fingerprint(expected: String, found: String, what: String)
     case shape(String)
     case noBase
+    case occupied(String)
 
     public var description: String {
         switch self {
@@ -104,6 +171,7 @@ public enum UmbrellaPackError: Error, CustomStringConvertible {
             return "the pack's \(what) should hash to \(expected.prefix(12))… but hashes to \(found.prefix(12))…"
         case .shape(let what): return "the pack does not fit the model: \(what)"
         case .noBase: return "the pack holds a vocabulary only, no base model"
+        case .occupied(let path): return "\(path) holds another pack; a pack directory is written once"
         }
     }
 }
@@ -149,6 +217,8 @@ public final class UmbrellaPack {
 
     /// What names the pack: the vocabulary's fingerprint when there is no trunk.
     public var sha256: String { info?.sha256 ?? vocabulary.sha256 }
+    /// What a node trained under the pack holds of it (the vocabulary and the trunk).
+    public var seamSHA256: String { info?.seam ?? vocabulary.sha256 }
     public var hasBase: Bool { !base.isEmpty }
     /// The first block of the trunk; nil without one.
     public var cut: Int? {
@@ -186,15 +256,55 @@ public final class UmbrellaPack {
         return fingerprint(embedding: model.model.embedTokens.weight, norm: model.model.norm.weight, trunk: trunk)
     }
 
-    /// Recomputes the pack's name from its arrays.
+    /// Recomputes the pack's seam from its arrays.
     public func computedFingerprint() -> String {
         Self.fingerprint(embedding: vocabulary.embedding, norm: vocabulary.norm, trunk: trunk)
+    }
+
+    /// A v2 pack's name: SHA-256 of the norm's bytes, the embedding's, every block array's key and
+    /// bytes in key order (float32, little-endian), then the tokenizer's hash. Two packs that
+    /// differ in any block, the ones below the cut included, have different names.
+    public static func name(embedding: MLXArray, norm: MLXArray, base: [String: MLXArray], tokenizerSHA256: String) -> String {
+        var parts = [norm.asType(.float32).asData(access: .copy).data, embedding.asType(.float32).asData(access: .copy).data]
+        for (key, value) in base.sorted(by: { $0.key < $1.key }) {
+            parts.append(Data(key.utf8))
+            parts.append(value.asType(.float32).asData(access: .copy).data)
+        }
+        parts.append(Data(tokenizerSHA256.utf8))
+        return ContentHash.sha256Hex(parts: parts)
+    }
+
+    /// Recomputes a v2 pack's name from its arrays.
+    public func computedName() -> String? {
+        guard let info else { return nil }
+        return Self.name(embedding: vocabulary.embedding, norm: vocabulary.norm, base: base, tokenizerSHA256: info.tokenizerSHA256)
+    }
+
+    /// A v2 pack from its parts: both hashes computed, lineage recorded.
+    public static func make(
+        vocabulary: VocabularyPack, name: String, source: String, config: RaoLMConfig, base: [String: MLXArray], anchors: [PackSnippet],
+        anchorStates: MLXArray?, heldOut: [PackSnippet], texts: [PackText], tokenizerSHA256: String, parent: String? = nil,
+        recipe: PackRecipe? = nil, referenceMaxDifference: Float? = nil
+    ) -> UmbrellaPack {
+        let trunk = base.filter { (RaoTransformer.blockIndex(ofKey: $0.key) ?? -1) >= config.cut }.map { (key: $0.key, value: $0.value) }
+        let seam = fingerprint(embedding: vocabulary.embedding, norm: vocabulary.norm, trunk: trunk)
+        var info = PackInfo(
+            name: name, source: source, config: config,
+            sha256: Self.name(embedding: vocabulary.embedding, norm: vocabulary.norm, base: base, tokenizerSHA256: tokenizerSHA256),
+            vocabularySHA256: vocabulary.sha256, anchorCount: anchors.count, heldOutCount: heldOut.count, texts: texts,
+            tokenizerSHA256: tokenizerSHA256)
+        info.version = 2
+        info.seamSHA256 = seam
+        info.parent = parent
+        info.recipe = recipe
+        info.referenceMaxDifference = referenceMaxDifference
+        return UmbrellaPack(vocabulary: vocabulary, info: info, base: base, anchors: anchors, anchorStates: anchorStates, heldOut: heldOut)
     }
 
     /// Whether `model` holds this pack's vocabulary and trunk.
     public func matches(_ model: RaoTransformer) -> Bool {
         if let cut, model.cut != cut { return false }
-        return Self.fingerprint(of: model) == sha256
+        return Self.fingerprint(of: model) == seamSHA256
     }
 
     // MARK: - Models
@@ -278,8 +388,35 @@ public final class UmbrellaPack {
 
     // MARK: - Disk
 
-    /// Writes the pack; a vocabulary alone writes the vocabulary's two files.
+    /// Writes the pack; a vocabulary alone writes the vocabulary's two files. A pack with a base is
+    /// written once: into a temporary directory renamed into place, never over another pack. A
+    /// directory that already holds this pack is left as it is.
     public func save(to directory: URL) throws {
+        guard info != nil else {
+            _ = try vocabulary.save(to: directory)
+            return
+        }
+        let infoURL = directory.appendingPathComponent(Self.infoFile)
+        if FileManager.default.fileExists(atPath: infoURL.path) {
+            let existing = try? JSONCoding.read(PackInfo.self, from: infoURL)
+            guard existing?.sha256 == info?.sha256 else { throw UmbrellaPackError.occupied(directory.path) }
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: directory.path) || (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?.isEmpty == true
+        else { throw UmbrellaPackError.occupied(directory.path) }
+        let staging = directory.deletingLastPathComponent().appendingPathComponent(".\(directory.lastPathComponent).tmp-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        do {
+            try write(to: staging)
+            try? FileManager.default.removeItem(at: directory)
+            try FileManager.default.moveItem(at: staging, to: directory)
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+    }
+
+    private func write(to directory: URL) throws {
         try vocabulary.save(to: directory)
         guard var info else { return }
         if hasBase {
@@ -333,7 +470,10 @@ public final class UmbrellaPack {
         let heldOut = (try? JSONCoding.readLines(PackSnippet.self, from: directory.appendingPathComponent(heldOutFile))) ?? []
         let pack = UmbrellaPack(vocabulary: vocabulary, info: info, base: base, anchors: anchors, anchorStates: anchorStates, heldOut: heldOut)
         let found = pack.computedFingerprint()
-        guard found == info.sha256 else { throw UmbrellaPackError.fingerprint(expected: info.sha256, found: found, what: "vocabulary and trunk") }
+        guard found == info.seam else { throw UmbrellaPackError.fingerprint(expected: info.seam, found: found, what: "vocabulary and trunk") }
+        if info.seamSHA256 != nil, let name = pack.computedName(), name != info.sha256 {
+            throw UmbrellaPackError.fingerprint(expected: info.sha256, found: name, what: "base and tokenizer")
+        }
         return pack
     }
 

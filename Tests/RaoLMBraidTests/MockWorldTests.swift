@@ -247,5 +247,44 @@ struct MockWorldTests {
         #expect(throws: MockWorldError.self) { try session(dataset: second).checkWorld() }
         #expect(throws: MockWorldError.self) { try session(dataset: nil).checkWorld() }
     }
+
+    @Test("the catalog lists the home braid first, then each braid in an area by when it last went live, with its commons and mode")
+    func catalog() throws {
+        let area = temporary()
+        defer { try? FileManager.default.removeItem(at: area) }
+        let home = area.appendingPathComponent("home-root", isDirectory: true)
+        func braid(_ root: URL, names: [String], live: [String: Int], preset: String?, pack: String?, offline: Bool, at seconds: TimeInterval) throws {
+            let layout = BraidLayout(root: root.appendingPathComponent("braid", isDirectory: true))
+            var record = MockWorld.Record(names: names, seed: 42, shape: MockShape(), preset: preset)
+            record.packSHA256 = pack
+            try FileManager.default.createDirectory(at: layout.root, withIntermediateDirectories: true)
+            try record.save(layout)
+            for name in names {
+                let node = layout.node(name)
+                try FileManager.default.createDirectory(at: node.directory, withIntermediateDirectories: true)
+                var settings = HypervisorSettings()
+                settings.preset = preset ?? "tiny"
+                try JSONCoding.write(NodeServerOptions(name: name, label: name.uppercased(), root: layout.root.path, vocabularySHA256: "v", packSHA256: pack,
+                                                       offline: offline, threadBinary: nil, httpPort: nil, grpcPort: nil, owner: "o", settings: settings),
+                                     to: node.directory.appendingPathComponent(NodeServerOptions.fileName))
+                if let version = live[name] {
+                    try JSONCoding.write(LivePointer(version: version, promotedAt: Date(timeIntervalSince1970: seconds)), to: node.live)
+                }
+            }
+        }
+        try braid(home, names: ["ambient", "craft"], live: ["ambient": 7, "craft": 10], preset: nil, pack: nil, offline: false, at: 100)
+        try braid(area.appendingPathComponent("older"), names: ["ambient"], live: ["ambient": 1], preset: "base", pack: String(repeating: "ab", count: 32),
+                  offline: true, at: 200)
+        try braid(area.appendingPathComponent("newer"), names: ["ambient", "veil"], live: ["veil": 2], preset: "base", pack: nil, offline: true, at: 300)
+        try FileManager.default.createDirectory(at: area.appendingPathComponent("datasets"), withIntermediateDirectories: true)
+
+        let entries = BraidCatalog.scan(home: home, areas: [area])
+        #expect(entries.map(\.name) == ["home", "newer", "older"], "the home braid once, not again from the area; no entry for a directory without a braid")
+        let first = try #require(entries.first)
+        #expect(first.isHome && first.preset == "tiny" && first.commons == nil && !first.offline && first.threads == "AMBIENT v7 · CRAFT v10")
+        let older = try #require(entries.last)
+        #expect(older.commons == "abababababab" && older.commonsSHA256 == String(repeating: "ab", count: 32) && older.offline && older.model == "base")
+        #expect(entries[1].threads == "AMBIENT — · VEIL v2" && entries[1].commons == nil, "no pack recorded and no live version to say: none named")
+    }
 }
 

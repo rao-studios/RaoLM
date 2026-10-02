@@ -71,8 +71,10 @@ enum BraidScreen: StudioScreen {
         case .withdrew(let name, let document):
             state.braid.events.append("\(name) ✗ withdrew \(document)")
         case .examples(let examples):
+            // The first examples to arrive fill an empty prompt; later ones never refill one the owner cleared.
+            let first = state.braid.examples.isEmpty
             state.braid.examples = examples
-            if state.braid.exampleLabel == nil, state.braid.prompt.text.isEmpty, !examples.isEmpty, !state.braid.editingPrompt {
+            if first, state.braid.exampleLabel == nil, state.braid.prompt.text.isEmpty, !examples.isEmpty, !state.braid.editingPrompt {
                 choose(example: 0, state: &state)
             } else if let tokens = state.braid.exampleTokens {
                 // The list reorders as documents arrive: keep the chosen example, find its new place.
@@ -116,6 +118,8 @@ enum BraidScreen: StudioScreen {
                 state.braid.restarting = false
                 return [start(&state, switching: true)]
             }
+            // Back to the catalog, with the live versions the run left.
+            return [.braid(.catalog)]
         case .failure(let name, let message):
             state.braid.events.append(Text("\(name ?? "braid"): \(message)", style: .plain))
             state.status.error = RaoLMFailure(message, code: 69)
@@ -162,6 +166,18 @@ enum BraidScreen: StudioScreen {
     // MARK: - Keys
 
     static func handle(_ key: KeyEvent, _ state: inout StudioState) -> [StudioJob]? {
+        if case .ctrl("u") = key.key, state.braid.started {
+            // One key from anywhere: an empty prompt, ready to type (the example goes with it).
+            state.braid.prompt.set("")
+            state.braid.exampleTokens = nil
+            state.braid.exampleSource = nil
+            state.braid.exampleExpected = nil
+            state.braid.exampleLabel = nil
+            state.braid.exampleNode = nil
+            state.braid.exampleIndex = -1
+            state.braid.editingPrompt = true
+            return []
+        }
         if state.braid.editingPrompt {
             switch key.key {
             case .escape:
@@ -181,6 +197,22 @@ enum BraidScreen: StudioScreen {
                     state.braid.exampleIndex = -1
                 }
                 return []
+            }
+        }
+        // Before a start: ↑↓ choose a braid in the catalog, ⏎ loads it.
+        if !state.braid.started, !state.braid.catalog.isEmpty {
+            let selected = state.braid.catalogTable.selected ?? 0
+            switch key.key {
+            case .up, .char("k"):
+                select(braid: selected - 1, state: &state)
+                return []
+            case .down, .char("j"):
+                select(braid: selected + 1, state: &state)
+                return []
+            case .enter:
+                return [start(&state)]
+            default:
+                break
             }
         }
         let nodes = state.braid.nodes
@@ -306,7 +338,51 @@ enum BraidScreen: StudioScreen {
 
     static func start(_ state: inout StudioState, switching: Bool = false) -> StudioJob {
         state.braid.started = true
-        return .braid(.start(offline: state.braid.offline, fresh: state.braid.fresh, world: state.braid.world, switching: switching))
+        let entry = selectedBraid(state)
+        if let entry { state.braid.loaded = entry }
+        return .braid(.start(offline: state.braid.offline, fresh: state.braid.fresh, world: state.braid.world, switching: switching, root: entry?.root))
+    }
+
+    // MARK: - The catalog: every braid on this machine
+
+    static func selectedBraid(_ state: StudioState) -> BraidCatalogEntry? {
+        guard let index = state.braid.catalogTable.selected, index < state.braid.catalog.count else { return nil }
+        return state.braid.catalog[index]
+    }
+
+    /// Chooses a braid: the next start loads it, with its own nodes and mode, and never fresh.
+    static func select(braid index: Int, state: inout StudioState) {
+        let catalog = state.braid.catalog
+        guard !catalog.isEmpty else { return }
+        let i = min(max(0, index), catalog.count - 1)
+        state.braid.catalogTable.selected = i
+        let entry = catalog[i]
+        state.braid.nodes = entry.nodes
+        state.braid.offline = entry.offline
+        state.braid.fresh = false
+        state.braid.focus = 0
+        state.braid.world = entry.isHome ? state.braid.launchWorld : BraidWorldChoice()
+    }
+
+    /// The catalog arrived: the selection stays on the same braid, and the first catalog chooses
+    /// the studio's own unless a braid is already running.
+    static func catalogLoaded(_ entries: [BraidCatalogEntry], state: inout StudioState) {
+        let first = state.braid.catalog.isEmpty
+        let selected = (selectedBraid(state) ?? state.braid.loaded)?.root
+        state.braid.catalog = entries
+        guard !entries.isEmpty else {
+            state.braid.catalogTable = TableState(selected: nil)
+            return
+        }
+        let index = entries.firstIndex { $0.root == selected } ?? 0
+        state.braid.catalogTable = TableState(selected: index)
+        if state.braid.started {
+            // `raolm braid` started the studio's own before any catalog: that is the one loaded.
+            state.braid.loaded = state.braid.loaded.flatMap { loaded in entries.first { $0.root == loaded.root } } ?? entries.first { $0.isHome }
+        } else {
+            if let loaded = state.braid.loaded { state.braid.loaded = entries.first { $0.root == loaded.root } ?? loaded }
+            if first { select(braid: index, state: &state) }
+        }
     }
 
     /// What f and F feed from, in a few words.
@@ -350,12 +426,13 @@ enum BraidScreen: StudioScreen {
     }
 
     static func hints(_ state: StudioState) -> [KeyHint] {
-        if state.braid.editingPrompt { return [KeyHint("⏎", "generate"), KeyHint("esc", "stop editing")] }
+        if state.braid.editingPrompt { return [KeyHint("⏎", "generate"), KeyHint("^U", "clear"), KeyHint("esc", "stop editing")] }
         guard state.braid.started else {
-            return [KeyHint("S", "start"), KeyHint("o", state.braid.offline ? "mode: offline" : "mode: Threads"),
-                    KeyHint("R", state.braid.fresh ? "fresh: on" : "fresh: off"), KeyHint("d", "dataset: \(sourceLabel(state))")]
+            let start = state.braid.catalog.isEmpty ? [KeyHint("S", "start")] : [KeyHint("⏎", "load"), KeyHint("↑↓", "braid")]
+            return start + [KeyHint("o", state.braid.offline ? "mode: offline" : "mode: Threads"),
+                            KeyHint("R", state.braid.fresh ? "fresh: on" : "fresh: off"), KeyHint("d", "dataset: \(sourceLabel(state))")]
         }
-        var hints = [KeyHint("f", "feed"), KeyHint("d", "dataset"), KeyHint("tab", "node"), KeyHint("x", "example"), KeyHint("⏎", "ask"),
+        var hints = [KeyHint("f", "feed"), KeyHint("d", "dataset"), KeyHint("tab", "node"), KeyHint("x", "example"), KeyHint("^U", "clear"), KeyHint("⏎", "ask"),
                      KeyHint("a", "alone"), KeyHint("←→", "token")]
         if state.braid.generation != nil { hints.append(KeyHint("v", "verify")) }
         hints += [KeyHint("g", "gate"), KeyHint("w", "withdraw"), KeyHint("X", "stop")]
@@ -365,6 +442,10 @@ enum BraidScreen: StudioScreen {
     // MARK: - Render
 
     static func render(_ state: StudioState, _ frame: inout Frame, _ rect: Rect) {
+        if !state.braid.started, !state.braid.catalog.isEmpty {
+            renderCatalog(state, &frame, rect)
+            return
+        }
         guard state.braid.started || !state.braid.states.isEmpty else {
             renderIdle(state, &frame, rect)
             return
@@ -422,6 +503,71 @@ enum BraidScreen: StudioScreen {
         return text
     }
 
+    /// The catalog: every braid on this machine, and the selected one's Threads, commons and model.
+    static func renderCatalog(_ state: StudioState, _ frame: inout Frame, _ rect: Rect) {
+        let palette = frame.palette
+        let glyphs = frame.glyphs
+        let catalog = state.braid.catalog
+        let detailHeight = rect.height >= 18 ? 10 : 0
+        let (detailRect, listRect) = rect.bottom(detailHeight)
+        let inner = Theme.panel("Braids · \(catalog.count) · ↑↓ chooses one, ⏎ loads it", focused: true, &frame, listRect)
+        if !inner.isEmpty {
+            let wide = inner.width >= 100
+            var columns = [Column("braid", .flex(1)), Column("commons", .fixed(14)), Column("Threads", .fixed(9)), Column("model", .fixed(22))]
+            if wide { columns += [Column("fed from", .fixed(15)), Column("mode", .fixed(7)), Column("last live", .fixed(9))] }
+            let rows: [[Text]] = catalog.map { entry in
+                let live = entry.nodes.filter { entry.live[$0.name] != nil }.count
+                var row = [
+                    Text(entry.name, style: entry.isHome ? palette.title : palette.text),
+                    entry.commons.map { Text($0, style: palette.gold) } ?? Text(glyphs.dash, style: palette.muted),
+                    Text(live == entry.nodes.count ? "\(live) live" : "\(live)/\(entry.nodes.count) live", style: live == 0 ? palette.muted : palette.text),
+                    Text(entry.model, style: palette.dim),
+                ]
+                if wide {
+                    row += [Text(entry.dataset ?? "mock world", style: palette.dim), Text(entry.offline ? "offline" : "Threads", style: palette.dim),
+                            Text(entry.updated.map { $0.formatted(.dateTime.month(.abbreviated).day()) } ?? glyphs.dash, style: palette.dim)]
+                }
+                return row
+            }
+            var table = state.braid.catalogTable
+            table.clamp(rowCount: rows.count, visible: Table.visibleRows(in: inner, showHeader: true))
+            Table.styled(columns: columns, rows: rows, state: table, palette: palette, glyphs: glyphs).render(in: inner, on: &frame.canvas)
+        }
+        guard detailHeight > 0, let entry = selectedBraid(state) else { return }
+        let detail = Theme.panel(entry.name + (entry.isHome ? " · the data root's own braid" : ""), &frame, detailRect)
+        guard !detail.isEmpty else { return }
+        func key(_ name: String) -> Text { Text(name.padding(toLength: 10, withPad: " ", startingAt: 0), style: palette.muted) }
+        var threads = key("Threads")
+        for (index, node) in entry.nodes.enumerated() {
+            if index > 0 { threads.append(" · ", palette.dim) }
+            threads.append(node.label, Style(foreground: BraidArt.strandColor(index, palette), background: palette.base.background, attributes: .bold))
+            threads.append(entry.live[node.name].map { " v\($0)" } ?? " not live", palette.dim)
+        }
+        var commons = key("commons")
+        if let name = entry.commons {
+            commons.append(name, palette.gold)
+            commons.append((entry.commonsSHA256.map { " " + $0.prefix(12) } ?? "") + " · the base model under every Thread: it answers what no Thread holds, and is never cited", palette.dim)
+        } else {
+            commons.append("none · a \(entry.preset) braid's umbrella is the shared vocabulary alone", palette.muted)
+        }
+        var lines = [
+            key("where") + Text(StudioApp.abbreviate(entry.root.path), style: palette.dim),
+            threads,
+            commons,
+            key("model") + Text(entry.model, style: palette.text)
+                + Text(entry.commons == nil ? "" : " · each Thread trains its lower blocks under the commons' trunk", style: palette.dim),
+            key("fed from") + Text(entry.dataset ?? "a generated mock world", style: palette.text),
+            Text(""),
+            Text("⏎ loads it: \(entry.nodes.count) Thread node\(entry.nodes.count == 1 ? "" : "s"), each on ", style: palette.text)
+                + Text(state.braid.offline ? "an offline corpus" : "a Thread of its own", style: palette.title) + Text(" (o switches)", style: palette.dim),
+        ]
+        if state.braid.fresh { lines.append(Text("fresh: the next start wipes every node's storage and versions", style: palette.red)) }
+        if let failure = state.braid.startFailure { lines.append(Text("\(glyphs.cross) the last start: \(failure)", style: palette.red)) }
+        for (row, line) in lines.prefix(detail.height).enumerated() {
+            frame.canvas.put(line.truncated(to: detail.width), x: detail.minX, y: detail.minY + row, clip: detail)
+        }
+    }
+
     static func renderIdle(_ state: StudioState, _ frame: inout Frame, _ rect: Rect) {
         let palette = frame.palette
         let glyphs = frame.glyphs
@@ -462,7 +608,8 @@ enum BraidScreen: StudioScreen {
         let live = state.braid.states.values.filter(\.isLive).count
         // The gate of the generation shown, and the one the next generation will use when it differs.
         let shownGate = state.braid.generation.map { $0.braid?.gating ?? .posterior }
-        var footer = Text("gate \((shownGate ?? state.braid.gating).rawValue)", style: palette.dim)
+        var footer = Text(state.braid.loaded.map { "\($0.name) · " } ?? "", style: palette.title)
+        footer.append("gate \((shownGate ?? state.braid.gating).rawValue)", palette.dim)
         if let shownGate, shownGate != state.braid.gating { footer.append(" · next \(state.braid.gating.rawValue)", palette.dim.italic()) }
         footer.append(state.braid.temperature > 0 ? " · sampling" : " · likeliest", palette.dim)
         footer.append(String(format: " · λ %.2f", state.braid.lambda), palette.dim)
@@ -664,7 +811,7 @@ enum BraidScreen: StudioScreen {
     }
 
     static func label(_ name: String, _ state: StudioState) -> String {
-        if name == BraidStrandRef.commonsName { return "Commons" }
+        if name == BraidStrandRef.commonsName { return state.braid.commonsPack.map { "Commons · \($0)" } ?? "Commons" }
         return state.braid.nodes.first { $0.name == name }?.label ?? name
     }
 
@@ -964,23 +1111,41 @@ enum BraidScreen: StudioScreen {
                 row += 1
             }
             let shown = state.braid.shownTraces
+            let commons = BraidStrandRef.commonsName
+            let hasCommons = shown.contains { $0.strands?.contains { $0.strand == commons } == true }
             if row + 1 < tokens.maxY, !shown.isEmpty {
-                row += 1
+                // A blank line above the legend, when the legend, the Threads and the commons still fit below it.
+                if row + 2 + state.braid.nodes.count + (hasCommons ? 1 : 0) < tokens.maxY { row += 1 }
                 let legend = state.braid.promptTraces.isEmpty ? "" : " · knew = prompt tokens it predicted"
                 frame.canvas.put(Text("the answer, by Thread" + legend, style: palette.muted).truncated(to: tokens.width), x: tokens.minX, y: row, clip: tokens)
                 row += 1
                 let prompt = state.braid.promptTraces.count
-                for (index, spec) in state.braid.nodes.enumerated() where row < tokens.maxY - 1 {
-                    let shares = shown.compactMap { $0.strands?.first { $0.strand == spec.name } }
+                let width = max(9, ((hasCommons ? [label(commons, state)] : []) + state.braid.nodes.map(\.label)).map(\.count).max() ?? 0) + 1
+                func part(_ strand: String) -> (shares: [StrandShare], mean: Float, led: Int) {
+                    let shares = shown.compactMap { $0.strands?.first { $0.strand == strand } }
                     let mean = shares.isEmpty ? 0 : shares.map(\.share).reduce(0, +) / Float(shares.count)
-                    let led = shown.filter { $0.dominantStrand()?.strand == spec.name }.count
+                    return (shares, mean, shown.filter { $0.dominantStrand()?.strand == strand }.count)
+                }
+                for (index, spec) in state.braid.nodes.enumerated() where row < tokens.maxY - 1 {
+                    let (shares, mean, led) = part(spec.name)
                     let opened = shares.filter(\.open).count
                     let colour = BraidArt.strandColor(index, palette)
-                    var line = Text(spec.label.padding(toLength: 9, withPad: " ", startingAt: 0), style: Style(foreground: colour, background: palette.base.background, attributes: .bold))
+                    var line = Text(spec.label.padding(toLength: width, withPad: " ", startingAt: 0), style: Style(foreground: colour, background: palette.base.background, attributes: .bold))
                     line.append(ShareBar(segments: [(Double(mean), colour)], track: palette.muted, glyphs: glyphs).text(width: 12))
                     line.append(" \(Format.pct(mean))", palette.text)
                     line.append(" · led \(led)/\(shown.count) · asked \(opened)/\(shares.count)", palette.dim)
                     if prompt > 0 { line.append(" · knew \(knew(state, spec.name))/\(prompt)", palette.dim) }
+                    frame.canvas.put(line.truncated(to: tokens.width), x: tokens.minX, y: row, clip: tokens)
+                    row += 1
+                }
+                // The commons' part of the answer: what the base model supplied, no Thread's.
+                if hasCommons, row < tokens.maxY - 1 {
+                    let (_, mean, led) = part(commons)
+                    var line = Text(label(commons, state).padding(toLength: width, withPad: " ", startingAt: 0),
+                                    style: Style(foreground: palette.goldColor, background: palette.base.background, attributes: .bold))
+                    line.append(ShareBar(segments: [(Double(mean), palette.goldColor)], track: palette.muted, glyphs: glyphs).text(width: 12))
+                    line.append(" \(Format.pct(mean))", palette.text)
+                    line.append(" · led \(led)/\(shown.count)", palette.dim)
                     frame.canvas.put(line.truncated(to: tokens.width), x: tokens.minX, y: row, clip: tokens)
                     row += 1
                 }
@@ -993,6 +1158,13 @@ enum BraidScreen: StudioScreen {
                     guard let answer = state.braid.alone[spec.name] else { continue }
                     let colour = BraidArt.strandColor(index, palette)
                     let line = Text("alone    ", style: palette.muted) + Text(spec.label + " ", style: Style(foreground: colour, background: palette.base.background))
+                        + Text(answer.replacingOccurrences(of: "\n", with: glyphs.newline).trimmingCharacters(in: .whitespaces), style: palette.text)
+                    frame.canvas.put(line.truncated(to: tokens.width), x: tokens.minX, y: row, clip: tokens)
+                    row += 1
+                }
+                // The RaoLM base model alone: what the commons says with no Thread asked.
+                if let answer = state.braid.alone[BraidStrandRef.commonsName], row < tokens.maxY - 1 {
+                    let line = Text("alone    ", style: palette.muted) + Text(label(BraidStrandRef.commonsName, state) + " ", style: palette.gold)
                         + Text(answer.replacingOccurrences(of: "\n", with: glyphs.newline).trimmingCharacters(in: .whitespaces), style: palette.text)
                     frame.canvas.put(line.truncated(to: tokens.width), x: tokens.minX, y: row, clip: tokens)
                     row += 1

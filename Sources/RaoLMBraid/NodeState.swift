@@ -115,6 +115,9 @@ public struct StrandState: Codable, Sendable, Equatable {
     /// The umbrella pack the node mirrors, when it has a trunk, and the first block of the trunk.
     public var packSHA256: String?
     public var cut: Int?
+    /// The pack the node's last live version was trained under, when the braid has since been
+    /// rebased onto another: that version is retired and the node retrains from the new base.
+    public var rebasedFrom: String?
     /// The live version's mean loss on unfed documents in the Thread's own voice, and on the
     /// pack's commons sample (nats per token).
     public var heldOutLoss: Float?

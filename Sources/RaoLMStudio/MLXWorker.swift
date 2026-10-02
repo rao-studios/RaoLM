@@ -167,15 +167,16 @@ final class MLXWorker: @unchecked Sendable {
         case .verify(let generation, let run, let live): try verify(generation, run: run, live: live)
         case .eval(let spec): try evaluate(spec)
         case .ground(let spec): try ground(spec)
-        case .braid(.start(let offline, let fresh, let world, let switching)):
-            try startBraid(offline: offline, fresh: fresh, world: world, switching: switching)
+        case .braid(.start(let offline, let fresh, let world, let switching, let root)):
+            try startBraid(offline: offline, fresh: fresh, world: world, switching: switching, root: root)
         case .braid(.generate(let spec)): try braidGenerate(spec)
         default: break
         }
     }
 
     /// Starts the braid's nodes with the shared vocabulary; the umbrella's head stays on this thread.
-    private func startBraid(offline: Bool, fresh: Bool, world: BraidWorldChoice, switching: Bool) throws {
+    /// `root`: the data root of a braid chosen in the catalog; the studio's own takes what it was opened with.
+    private func startBraid(offline: Bool, fresh: Bool, world: BraidWorldChoice, switching: Bool, root: URL?) throws {
         if braid.session != nil {
             post(.log("the braid is already running"))
             return
@@ -183,13 +184,15 @@ final class MLXWorker: @unchecked Sendable {
         guard let executable = options.executable ?? Bundle.main.executableURL?.resolvingSymlinksInPath() else {
             throw BraidSessionError.noExecutable
         }
-        var braidOptions = BraidOptions(root: options.root, executable: executable)
+        let dataRoot = root.map { DataRoot(url: $0) } ?? options.root
+        let own = dataRoot == options.root
+        var braidOptions = BraidOptions(root: dataRoot, executable: executable)
         braidOptions.offline = offline
         braidOptions.fresh = fresh
         braidOptions.freshIfOtherWorld = switching
         braidOptions.threadBinary = options.threadBinary
-        braidOptions.seed = options.braidSeed
-        if let preset = options.braidPreset {
+        if own { braidOptions.seed = options.braidSeed }
+        if own, let preset = options.braidPreset {
             braidOptions.settings.preset = preset
             braidOptions.presetRequested = true
         }
@@ -198,10 +201,11 @@ final class MLXWorker: @unchecked Sendable {
         try Preflight.requireMetallib()
         let tokenizer = try tokenizer()
         let post = self.post
-        let pack = try UmbrellaPacks.ensure(layout: braidOptions.layout, config: try braidOptions.settings.modelConfig(), tokenizer: tokenizer) {
+        let pack = try UmbrellaPacks.ensure(layout: braidOptions.layout, config: try braidOptions.settings.modelConfig(), tokenizer: tokenizer, pack: braidOptions.pack) {
             post(.log("umbrella pack: \($0)"))
         }
         session.umbrella = try BraidUmbrella(pack: pack, tokenizer: tokenizer)
+        post(.braidCommons(session.umbrella?.commons?.packName))
         let started = try BraidSession(
             options: braidOptions, vocabularySHA256: pack.vocabulary.sha256, packSHA256: pack.hasBase ? pack.sha256 : nil
         ) { event in post(.braid(event)) }
@@ -250,13 +254,20 @@ final class MLXWorker: @unchecked Sendable {
             post(.braid(.token(BraidTokenEvent(trace: step.trace, open: step.open))))
         }
         post(.braid(.generated(generation)))
-        guard spec.alone, links.count > 1 else { return }
-        // Each Thread alone: a braid of one, the same prompt and settings.
+        guard spec.alone, links.count > 1 || umbrella.commons != nil else { return }
+        // Each Thread alone: a braid of one, the same prompt and settings; and the commons alone,
+        // the RaoLM base model with no Thread asked.
         var answers: [String: String] = [:]
-        for link in links {
-            if flag.isCancelled { throw CancellationError() }
-            let own = try umbrella.generate(links: [link], request: request)
-            answers[link.descriptor.name] = own.text
+        if links.count > 1 {
+            for link in links {
+                if flag.isCancelled { throw CancellationError() }
+                let own = try umbrella.generate(links: [link], request: request)
+                answers[link.descriptor.name] = own.text
+            }
+        }
+        if let commons = umbrella.commons {
+            answers[BraidStrandRef.commonsName] = commons.complete(
+                tokens, maxTokens: spec.maxTokens, tokenizer: umbrella.tokenizer, stopAtSentenceEnd: rewrite != nil)
         }
         post(.braidAlone(prompt: tokens, answers: answers))
     }

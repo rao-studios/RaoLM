@@ -73,6 +73,9 @@ public struct BraidOptions: Sendable {
     public var presetRequested = false
     /// Whether the caller named the training arm; if not, a braid keeps the one world.json records.
     public var armRequested = false
+    /// The umbrella pack to run on (a registered name or hash prefix); nil: the one world.json
+    /// records, else the registry's current pack for the braid's shape.
+    public var pack: String?
 
     public init(root: DataRoot, executable: URL) {
         self.root = root
@@ -81,6 +84,18 @@ public struct BraidOptions: Sendable {
 
     public var layout: BraidLayout { BraidLayout(dataRoot: root) }
 
+    /// The pack every node's live version was trained on, when they agree.
+    static func trainedPack(_ layout: BraidLayout, names: [String]) -> String? {
+        let packs = Set(names.compactMap { name -> String? in
+            let node = layout.node(name)
+            guard let pointer = try? JSONCoding.read(LivePointer.self, from: node.live),
+                  let version = try? JSONCoding.read(NodeVersion.self, from: node.version(pointer.version).appendingPathComponent(NodeVersion.fileName))
+            else { return nil }
+            return version.packSHA256
+        })
+        return packs.count == 1 ? packs.first : nil
+    }
+
     /// The preset and the training arm world.json records, unless the caller named them; a
     /// recorded braid keeps its arm, none included. A new braid (no world.json, or fresh) of the
     /// base preset trains `HypervisorSettings.baseArm` unless the caller named an arm.
@@ -88,6 +103,11 @@ public struct BraidOptions: Sendable {
         if !fresh, let record = MockWorld.Record.load(layout) {
             if !presetRequested, let preset = record.preset { settings.preset = preset }
             if !armRequested { settings.arm = record.arm }
+            if pack == nil, presetRequested == false || record.preset == settings.preset {
+                // A braid recorded before packs were: the pack its nodes' live versions were trained on,
+                // so making another pack current never rebases it unasked.
+                pack = record.packSHA256 ?? Self.trainedPack(layout, names: record.names)
+            }
         } else if !armRequested, settings.preset == "base" {
             settings.arm = HypervisorSettings.baseArm
         }
@@ -202,6 +222,7 @@ public final class BraidSession: @unchecked Sendable {
         var record = world.record
         record.preset = options.settings.preset == "tiny" ? nil : options.settings.preset
         record.arm = options.settings.arm
+        record.packSHA256 = packSHA256
         return record
     }
 
@@ -428,6 +449,35 @@ public final class BraidSession: @unchecked Sendable {
         while kill(record.pid, 0) == 0, Date() < deadline { usleep(100_000) }
         if kill(record.pid, 0) == 0 { kill(record.pid, SIGKILL) }
         try? FileManager.default.removeItem(at: node.record)
+    }
+
+    /// Nodes of the braid whose process is running.
+    public static func runningNodes(_ layout: BraidLayout) -> [String] {
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: layout.nodes.path)) ?? []).filter(BraidLayout.isValidName).sorted()
+        return names.filter { name in
+            guard let record = NodeRecord.load(layout.node(name)) else { return false }
+            return kill(record.pid, 0) == 0 && isRaoLM(record.pid)
+        }
+    }
+
+    /// Moves a braid onto another pack: world.json records it, and each node's live version,
+    /// trained under the old pack, is retired when the braid next starts (the nodes retrain from
+    /// the new base). Returns each node's live version and the pack it was trained under.
+    public static func rebase(layout: BraidLayout, pack sha256: String) throws -> [(node: String, version: Int?, pack: String?)] {
+        guard var record = MockWorld.Record.load(layout) else {
+            throw BraidSessionError.io("no world.json under \(layout.root.path): start the braid once (raolm braid demo) before rebasing it")
+        }
+        let running = runningNodes(layout)
+        guard running.isEmpty else { throw BraidSessionError.io("the braid is running (\(running.joined(separator: ", "))): stop it first (raolm braid down)") }
+        record.packSHA256 = sha256
+        try record.save(layout)
+        return record.names.map { name in
+            let node = layout.node(name)
+            guard let pointer = try? JSONCoding.read(LivePointer.self, from: node.live),
+                  let version = try? JSONCoding.read(NodeVersion.self, from: node.version(pointer.version).appendingPathComponent(NodeVersion.fileName))
+            else { return (name, nil, nil) }
+            return (name, version.version, version.packSHA256)
+        }
     }
 
     static func isRaoLM(_ pid: Int32) -> Bool {

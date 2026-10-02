@@ -233,7 +233,22 @@ public struct RaoLMConfig: Codable, Sendable, Equatable {
         return config
     }()
 
-    public static let presetNames = ["tiny", "small", "smollm2-135m", "base"]
+    /// SmolLM2-360M (HuggingFaceTB/SmolLM2-360M config.json): RaoLM's tokenizer, 32 blocks × 960.
+    public static let smolLM2_360M = RaoLMConfig(
+        hiddenSize: 960, intermediateSize: 2560, numHiddenLayers: 32,
+        numAttentionHeads: 15, numKeyValueHeads: 5, maxPositionEmbeddings: 8192,
+        ropeTheta: 100_000, rmsNormEps: 1e-5, tieWordEmbeddings: true,
+        initializerRange: 0.02, torchDtype: "bfloat16")
+
+    /// SmolLM2-360M cut after block 22: a node trains blocks 0 to 21 (≈ 216M parameters), the
+    /// umbrella's trunk is blocks 22 to 31. The commons bench decides whether the cut stays.
+    public static let base360m: RaoLMConfig = {
+        var config = smolLM2_360M
+        config.cut = 22
+        return config
+    }()
+
+    public static let presetNames = ["tiny", "small", "smollm2-135m", "base", "smollm2-360m", "base-360m"]
 
     public static func preset(_ name: String) throws -> RaoLMConfig {
         switch name.lowercased() {
@@ -241,6 +256,8 @@ public struct RaoLMConfig: Codable, Sendable, Equatable {
         case "small": return .small
         case "smollm2-135m", "smollm2_135m", "135m": return .smolLM2_135M
         case "base": return .base
+        case "smollm2-360m", "smollm2_360m", "360m": return .smolLM2_360M
+        case "base-360m": return .base360m
         default:
             throw RaoLMConfigError.unknownPreset(name, known: presetNames)
         }
