@@ -2,8 +2,8 @@
 //  DatasetCommands.swift
 //  RaoLMCLI
 //
-//  WHAT: raolm dataset generate | verify | show — the braid datasets: three Threads' corpora in
-//        three voices, with entities retold across Threads (BraidDataset).
+//  WHAT: raolm dataset generate | verify | show — the braid datasets: N Threads' corpora, each a
+//        persona's voice about one of three worlds, with entities retold across Threads (BraidDataset).
 //  IN:   Datasets live in the datasets root (`DatasetsRoot`): $RAOLM_DATASETS_DIR, else the T9
 //        work area's datasets/ (/Volumes/T9/rao/projects/raolm/datasets) when that drive is
 //        mounted. With neither, pass --out or a path.
@@ -17,13 +17,14 @@ import RaoLMWorkflows
 struct DatasetGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dataset",
-        abstract: "Generate, check and inspect braid datasets: three Threads' corpora, with entities retold across them.",
+        abstract: "Generate, check and inspect braid datasets: N Threads' corpora, with entities retold across them.",
         discussion: """
             Ambient's world (towns, researchers, festivals) as reading notes and conversations; Craft's (libraries, services, \
             incidents) as session logs, release notes and postmortems; Veil's (artworks, artists, collections) as catalogue \
             entries, attribution reports and wall text. Some entities cross to another Thread in its own words: paraphrased, \
             summarised, quoted with an edit, or with one fact changed; some names are reused by a different entity. Nothing \
-            crosses verbatim. Datasets live in $\(DatasetsRoot.environmentKey), else \(DatasetsRoot.workArea)/datasets.
+            crosses verbatim. --nodes adds personas beyond those three (club minutes, runbooks, lot notes, …), eight per \
+            world, up to 24; each node retells entities of its --peers next nodes. Datasets live in $\(DatasetsRoot.environmentKey), else \(DatasetsRoot.workArea)/datasets.
             """,
         subcommands: [Generate.self, Verify.self, Show.self]
     )
@@ -37,10 +38,19 @@ struct DatasetGroup: AsyncParsableCommand {
         @Option(help: "Generator seed.")
         var seed: UInt64 = 42
 
-        @Option(help: "Documents per entity type of each Thread's own world (three types per Thread).")
-        var perType = DatasetSpec().perType
+        @Option(help: "Threads, each a persona of its own: the first three are ambient, craft and veil (at most 24).")
+        var nodes = 3
 
-        @Option(help: "Per ordered pair of Threads: entities retold with every fact.")
+        @Option(help: "Each node retells entities of its next N nodes in a ring (default: every other node, at most 6).")
+        var peers: Int?
+
+        @Option(help: "Subject worlds, comma-separated (writing, coding, biology): one node each, named ambient, craft and veil. Without it, the founding worlds.")
+        var worlds: String?
+
+        @Option(help: "Documents per entity type of each Thread's own world (three types per Thread; default 180 for three nodes, else 30).")
+        var perType: Int?
+
+        @Option(help: "Per ordered pair of peers: entities retold with every fact.")
         var paraphrase = DatasetSpec().paraphrase
 
         @Option(help: "Per ordered pair: entities quoted with an edit.")
@@ -67,8 +77,18 @@ struct DatasetGroup: AsyncParsableCommand {
                 if BraidDataset.exists(at: directory), !force {
                     throw RaoLMFailure("a dataset already exists at \(directory.path)", hint: "pass --force to overwrite", code: 73)
                 }
-                let spec = DatasetSpec(name: name, seed: seed, perType: perType, paraphrase: paraphrase, excerpt: excerpt, summary: summary,
-                                       variant: variant, homonym: homonym)
+                let subjects = try worlds.map { list in
+                    try list.split(separator: ",").map { name -> DatasetWorld in
+                        let raw = name.trimmingCharacters(in: .whitespaces)
+                        guard let world = DatasetWorld(rawValue: raw), world.subject else {
+                            throw RaoLMFailure("unknown subject world '\(raw)'", hint: "--worlds takes writing, coding and biology", code: 64)
+                        }
+                        return world
+                    }
+                }
+                let spec = DatasetSpec(name: name, seed: seed, perType: perType ?? (nodes <= 3 && subjects == nil ? DatasetSpec().perType : 30),
+                                       paraphrase: paraphrase, excerpt: excerpt, summary: summary, variant: variant, homonym: homonym,
+                                       nodes: nodes, peers: peers, worlds: subjects)
                 let started = Date()
                 Console.error("generating \(name) from seed \(seed)")
                 let dataset = try BraidDataset.generate(spec)
@@ -143,11 +163,12 @@ struct DatasetGroup: AsyncParsableCommand {
 
 enum DatasetTables {
     static func summary(_ manifest: DatasetManifest) -> String {
-        var lines = ["\(manifest.spec.name) · seed \(manifest.spec.seed) · \(manifest.spec.perType) per type · hash \(Format.short(manifest.datasetHash))"]
+        var lines = ["\(manifest.spec.name) · seed \(manifest.spec.seed) · \(manifest.spec.nodes) nodes, \(manifest.spec.peers) peers · "
+                     + "\(manifest.spec.perType) per type · hash \(Format.short(manifest.datasetHash))"]
         lines.append(Format.table(
-            ["node", "documents", "own", "crossed in", "homonyms", "partitions", "facts", "words", "simulated origins"],
+            ["node", "world", "documents", "own", "crossed in", "homonyms", "partitions", "facts", "words", "simulated origins"],
             manifest.nodes.map { node in
-                [node.name, String(node.documents), String(node.home), String(node.crossed), String(node.homonyms), String(node.partitions),
+                [node.name, node.world ?? "", String(node.documents), String(node.home), String(node.crossed), String(node.homonyms), String(node.partitions),
                  String(node.facts), String(node.words),
                  node.origins.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: " · ")]
             }))

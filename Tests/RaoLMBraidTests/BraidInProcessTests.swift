@@ -210,6 +210,27 @@ extension BraidMLXSuites {
             #expect(Float(owned) / Float(total) >= 0.75, "\(owned)/\(total) answers came from their own Thread")
             #expect(Float(answered) / Float(total) >= 0.5, "\(answered)/\(total) answered")
 
+            // Routing before asking: the owner is a candidate, and a routed generation is the braid of its candidates alone.
+            #expect(generator.links.allSatisfy { ($0.descriptor.sketch?.count ?? 0) > 0 }, "every Thread's descriptor carries its sketch")
+            for example in rig.examples(hypervisors).filter({ $0.resolvedKind == .fact }).prefix(4) {
+                let route = generator.router.route(example.promptTokens)
+                let owner = try #require(names.firstIndex(of: example.node ?? ""))
+                #expect(route.candidates[owner], "\(example.label)")
+                var params = GenerationParameters(tapLayer: 1, alpha: 0.5)
+                params.maxTokens = 6
+                let request = BraidRequest(promptTokens: example.promptTokens, promptText: example.promptText, params: params, routing: true)
+                let routed = try generator.generate(request)
+                var plain = request
+                plain.routing = false
+                let direct = try BraidedGenerator(links: generator.links.indices.filter { route.candidates[$0] }.map { generator.links[$0] },
+                                                  head: generator.head, tokenizer: rig.tokenizer).generate(plain)
+                #expect(routed.tokens == direct.tokens)
+                #expect(routed.braid?.strands.map(\.name) == direct.braid?.strands.map(\.name))
+                for (a, b) in zip(routed.traces, direct.traces) {
+                    #expect(zip(a.strands ?? [], b.strands ?? []).allSatisfy { abs($0.share - $1.share) < 1e-6 })
+                }
+            }
+
             // The braided gate: owners still lead their answers; a subject no Thread holds, or text
             // about nothing either holds, leaves both Threads asked; a prompt that moves to the other
             // Thread's fact moves the lead.

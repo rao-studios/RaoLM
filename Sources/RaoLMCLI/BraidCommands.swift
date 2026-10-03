@@ -28,7 +28,7 @@ struct BraidGroup: AsyncParsableCommand {
             asks the open ones for their last hidden state, applies the one shared final norm and tied head, and mixes the \
             Threads' own kNN-LMs. Every token records what each Thread supplied.
             """,
-        subcommands: [Panel.self, Demo.self, Ask.self, List.self, Status.self, Down.self, Rebase.self, Sync.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self, BenchQuestion.self, BenchCommons.self],
+        subcommands: [Panel.self, Demo.self, Ask.self, List.self, Status.self, Down.self, Rebase.self, Sync.self, BenchVocabulary.self, BenchGate.self, BenchTrajectory.self, BenchUmbrella.self, BenchArchitecture.self, BenchThought.self, BenchQuestion.self, BenchCommons.self, BenchScale.self, BenchHosted.self, BenchRoute.self, Profile.self, BenchProfile.self],
         defaultSubcommand: Panel.self
     )
 
@@ -410,36 +410,73 @@ struct BraidGroup: AsyncParsableCommand {
     struct Sync: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Start the nodes, bring every node without a live version up to date (a rebased node retrains from the new base), and stop.",
-            discussion: "Nothing is fed and nothing is withdrawn: each node trains on the documents its Thread already holds.")
+            discussion: """
+                Without --feed nothing is fed and nothing is withdrawn: each node trains on the documents its Thread already holds. \
+                --feed n first deposits each node's next n documents of its world (a fresh braid built from a dataset, with no \
+                demo's later changes). --at-once caps how many nodes train at a time, so a braid of many Threads fits in memory; \
+                the peak memory of every node process is written to <data root>/braid/sync-footprint.json.
+                """)
 
         @OptionGroup var global: GlobalOptions
         @OptionGroup var braid: BraidOptionGroup
 
+        @Option(help: "Deposit each node's next N documents of its world before training (0: none).")
+        var feed = 0
+
+        @Option(help: "Nodes training at once (0: all).")
+        var atOnce = 3
+
         func run() async throws {
             try await guarded {
                 try Preflight.requireMetallib()
-                let options = try braid.options(root: global.root)
+                var options = try braid.options(root: global.root)
+                options.syncOnStart = false
                 let tokenizer = try await RaoTokenizer.load()
                 let pack = try UmbrellaPacks.ensure(layout: options.layout, config: try options.settings.modelConfig(), tokenizer: tokenizer, pack: options.pack) {
                     print("umbrella pack: \($0)")
                 }
                 let session = try BraidSession(options: options, vocabularySHA256: pack.vocabulary.sha256, packSHA256: pack.hasBase ? pack.sha256 : nil) { _ in }
                 let stop = StopSignal()
+                let started = Date()
                 do {
                     try await session.start()
-                    print("umbrella pack \(Format.short(pack.sha256)) (\(pack.name))")
-                    print(Format.table(BraidTables.nodes(session.states, session: session)))
-                    let stale = session.names.filter { session.state($0)?.liveVersion == nil }
-                    if stale.isEmpty {
+                    print("umbrella pack \(Format.short(pack.sha256)) (\(pack.name)) · \(session.names.count) nodes")
+                    var fed: [String] = []
+                    if feed > 0 {
+                        for name in session.names {
+                            let documents = try await session.feed(name, count: feed, sync: false)
+                            if !documents.isEmpty { fed.append(name) }
+                        }
+                        print("fed \(fed.count) nodes \(feed) documents each")
+                    }
+                    let targets = session.names.filter { fed.contains($0) || session.state($0)?.liveVersion == nil }
+                    if targets.isEmpty {
                         print("every node is live on this pack: nothing to do")
                     } else {
-                        for name in stale {
+                        for name in targets {
                             if let from = session.state(name)?.rebasedFrom { print("\(name): rebased from \(from.prefix(12)), retraining") }
                         }
-                        let before = Dictionary(uniqueKeysWithValues: stale.map { ($0, session.state($0)?.versions ?? 0) })
-                        for name in stale { try session.sync(name) }
-                        try await BraidWait.settled(session, after: before, stop: stop)
-                        print(Format.table(BraidTables.nodes(session.states, session: session)))
+                        var reported: [String: String] = [:]
+                        try await session.sync(targets, atOnce: atOnce, cancelled: { stop.isSet }, sent: { name, number, inFlight in
+                            print("\(name): sync \(number) of \(targets.count), \(inFlight) in flight")
+                        }, progress: { state in
+                            let line = BraidPrinter.progress(state)
+                            if reported[state.name] != line {
+                                reported[state.name] = line
+                                print("  \(line)")
+                            }
+                        })
+                    }
+                    print(Format.table(BraidTables.nodes(session.states, session: session)))
+                    var footprint: [String: Int] = [:]
+                    for state in session.states {
+                        if let pid = state.pid, let bytes = BraidSession.peakFootprint(pid: pid) { footprint[state.name] = bytes }
+                    }
+                    if !footprint.isEmpty {
+                        try JSONCoding.write(footprint, to: options.layout.root.appendingPathComponent("sync-footprint.json"))
+                        let gb = footprint.values.map { Double($0) / 1e9 }
+                        print(String(format: "peak memory per node process: %.1f–%.1f GB (sum %.0f GB) · %@", gb.min() ?? 0, gb.max() ?? 0,
+                                     gb.reduce(0, +), Format.duration(Date().timeIntervalSince(started))))
                     }
                 } catch {
                     await session.stop()
@@ -1073,6 +1110,206 @@ extension BraidGroup {
             }
         }
     }
+
+    struct BenchScale: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-scale",
+            abstract: "Whether the gate still finds the right Thread as Threads are added: one braid per N, judged against the smallest.",
+            discussion: """
+                --data-dir is a braid built from an N-node dataset (raolm braid sync --dataset braid-nN --feed 80). The run is in \
+                process and writes one point; --reference adds a saved point (the smallest N) to judge it against; --report re-scores \
+                saved points together and fits the cost per token against N. Rules N1 and N2 were fixed before any numbers \
+                (Docs/ARCHITECTURE.md, "bench-scale").
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "A saved report whose points this run is judged with (the smallest N's).")
+        var reference: String?
+
+        @Option(help: "Facts per node (ignored with --every-fact).")
+        var factsPerNode = 10
+
+        @Option(help: "Two-fact prompts in all, spread over the ordered pairs of nodes.")
+        var pairs = 60
+
+        @Flag(help: "Ask every fact of every node (the second reading).")
+        var everyFact = false
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(parsing: .upToNextOption, help: "Saved reports to score together instead of running.")
+        var report: [String] = []
+
+        func run() async throws {
+            try await guarded {
+                func load(_ path: String) throws -> ScaleReport {
+                    try JSONCoding.read(ScaleReport.self, from: URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+                }
+                if !report.isEmpty {
+                    var points: [Int: ScalePoint] = [:]
+                    for path in report { for point in try load(path).points { points[point.nodes] = point } }
+                    print(BraidTables.scale(ScaleBench.report(Array(points.values))))
+                    return
+                }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                let point = try ScaleBench.run(layout: BraidLayout(dataRoot: global.root), tokenizer: tokenizer, everyFact: everyFact,
+                                               factsPerNode: factsPerNode, pairs: pairs) { line in Console.error(line) }
+                var points = [point]
+                if let reference { points += try load(reference).points.filter { $0.nodes != point.nodes } }
+                let result = ScaleBench.report(points)
+                print(BraidTables.scale(result))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    // The file holds this run's point alone, so reports combine by N.
+                    var own = result
+                    own.points = [point]
+                    own.evaluation = ScaleBench.evaluate(points: points)
+                    try JSONCoding.write(own, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+
+    struct BenchHosted: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-hosted",
+            abstract: "Whether nodes that dial the umbrella over TCP answer as child processes over pipes do, and at what cost.",
+            discussion: """
+                --data-dir is a built braid with every node live. It is started twice, offline, nothing fed or trained: its nodes \
+                as child processes over pipes, then as processes that dial a listener on 127.0.0.1. Rules H1 and H3 were fixed \
+                before any numbers (Docs/ARCHITECTURE.md, "Step 2"); H2 is a process test.
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Facts per node.")
+        var factsPerNode = 10
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        func run() async throws {
+            try await guarded {
+                try Preflight.requireMetallib()
+                guard let executable = Bundle.main.executableURL?.resolvingSymlinksInPath() else { throw BraidSessionError.noExecutable }
+                let tokenizer = try await RaoTokenizer.load()
+                let started = Date()
+                let report = try await HostedBench.run(root: global.root, executable: executable, tokenizer: tokenizer,
+                                                       factsPerNode: factsPerNode) { line in Console.error(line) }
+                print(BraidTables.hosted(report))
+                print(String(format: "\n%.0f s", Date().timeIntervalSince(started)))
+                if let out {
+                    try JSONCoding.write(report, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
+extension BraidGroup {
+    struct BenchRoute: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-route",
+            abstract: "Whether routing before asking keeps the answers and cuts the cost: a built braid asked unrouted, then routed.",
+            discussion: """
+                --data-dir is a braid built from an N-node dataset, every node live. In process, the same sets as bench-scale; \
+                --report re-scores saved points together. Rules R1 to R3 were fixed before any numbers (Docs/ARCHITECTURE.md, "Step 1").
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Facts per node.")
+        var factsPerNode = 10
+
+        @Option(help: "Two-fact prompts in all, spread over the ordered pairs of nodes.")
+        var pairs = 60
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(parsing: .upToNextOption, help: "Saved reports to score together instead of running.")
+        var report: [String] = []
+
+        func run() async throws {
+            try await guarded {
+                if !report.isEmpty {
+                    var points: [Int: RoutePoint] = [:]
+                    for path in report {
+                        let saved = try JSONCoding.read(RouteReport.self, from: URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+                        for point in saved.points { points[point.nodes] = point }
+                    }
+                    print(BraidTables.route(RouteBench.report(Array(points.values))))
+                    return
+                }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let point = try RouteBench.run(layout: BraidLayout(dataRoot: global.root), tokenizer: tokenizer, factsPerNode: factsPerNode,
+                                               pairs: pairs) { line in Console.error(line) }
+                let result = RouteBench.report([point])
+                print(BraidTables.route(result))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
+extension BraidTables {
+    static func route(_ report: RouteReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        func rate(_ a: Int, _ b: Int) -> String { b > 0 ? String(format: "%.0f%%", Double(a) / Double(b) * 100) : "—" }
+        var lines: [String] = []
+        for point in report.points {
+            let sketch = point.sketchBigrams.values
+            lines.append("\(point.braid): N = \(point.nodes), a bigram is distinctive when at most \(point.bound) Threads hold it; "
+                         + "sketches \(sketch.min() ?? 0)–\(sketch.max() ?? 0) bigrams (\((sketch.max() ?? 0) * 8 / 1024) KB at most)")
+            lines.append("route: owner a candidate on \(point.factsFound)/\(point.facts) facts, both owners on \(point.pairsFound)/\(point.pairs) pairs")
+            lines.append(Format.table(["set", "prompts", "no distinctive bigram", "Threads opened (mean)", "max"], point.sets.map { set in
+                [set.set, "\(set.prompts)", "\(set.unmatched)", String(format: "%.1f", set.meanOpened), "\(set.maxOpened)"]
+            }))
+            lines.append("")
+            lines.append(Format.table(
+                ["", "facts exact", "led + cited", "cit@1", "pairs moved", "commons leads", "Threads take", "s/token facts", "s/token generic", "s/prompt facts"],
+                [("unrouted", point.unrouted), ("routed", point.routed)].map { name, side in
+                    [name, "\(side.facts.factsExact)/\(side.facts.facts) (\(pct(side.facts.factsExactRate)))", pct(side.facts.factsOwnedRate),
+                     pct(side.facts.citation), "\(side.prompts.pairsMoved)/\(side.prompts.pairs)", pct(side.prompts.commonsLeads),
+                     side.prompts.commonsThreadShare.map { String(format: "%.3f", $0) } ?? "—",
+                     String(format: "%.4f", side.factCost.secondsPerToken), String(format: "%.4f", side.genericCost.secondsPerToken),
+                     String(format: "%.3f", side.factCost.secondsPerPrompt)]
+                }))
+            if !point.missed.isEmpty { lines.append("missed: " + point.missed.prefix(5).joined(separator: "; ")) }
+            lines.append("")
+        }
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
+
+    static func hosted(_ report: HostedReport) -> String {
+        var lines = ["\(report.braid): \(report.nodes) nodes, \(report.prompts) fact prompts each way", ""]
+        lines.append(Format.table(
+            ["transport", "s/token", "s/prompt", "asked/token", "all asked"],
+            [("pipes", report.pipes), ("TCP", report.tcp)].map { name, cost in
+                [name, String(format: "%.4f", cost.secondsPerToken), String(format: "%.3f", cost.secondsPerPrompt),
+                 String(format: "%.2f", cost.askedPerToken), String(format: "%.0f%%", cost.allAskedRate * 100)]
+            }))
+        lines.append("")
+        if let first = report.firstDifference { lines.append("first difference: \(first)") }
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
 }
 
 extension BraidTables {
@@ -1100,6 +1337,39 @@ extension BraidTables {
         }
         lines.append("")
         for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append("")
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
+    }
+
+    static func scale(_ report: ScaleReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        func num(_ value: Float?) -> String { value.map { String(format: "%.3f", $0) } ?? "—" }
+        var lines = [Format.table(
+            ["N", "facts exact", "led+cited", "cit@1", "pairs moved", "commons leads", "Threads take", "unknown: commons leads",
+             "asked/token (facts, generic)", "s/token", "s/prompt"],
+            report.points.map { p in
+                ["\(p.nodes)", "\(p.facts.factsExact)/\(p.facts.facts) (\(pct(p.facts.factsExactRate)))", pct(p.facts.factsOwnedRate), pct(p.facts.citation),
+                 "\(p.prompts.pairsMoved)/\(p.prompts.pairs)", pct(p.prompts.commonsLeads), num(p.prompts.commonsThreadShare), pct(p.unknownCommonsLeads),
+                 String(format: "%.1f, %.1f", p.askedPerFactToken ?? 0, p.tokenCost.askedPerToken),
+                 String(format: "%.3f", p.tokenCost.secondsPerToken), String(format: "%.2f", p.tokenCost.secondsPerPrompt)]
+            })]
+        for p in report.points where !p.factsByNode.isEmpty {
+            let nodes = p.factsByNode.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value.first ?? 0)/\($0.value.last ?? 0)" }
+            lines.append("N = \(p.nodes): " + nodes.joined(separator: " · "))
+            if let footprint = p.peakFootprintBytes, !footprint.isEmpty {
+                let gb = footprint.values.map { Double($0) / 1e9 }
+                lines.append(String(format: "  peak memory per node process while training: %.1f–%.1f GB", gb.min() ?? 0, gb.max() ?? 0))
+            }
+        }
+        lines.append("")
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        if let fit = report.evaluation.secondsFit {
+            lines.append(String(format: "\nseconds per token ≈ %.4f + %.4f × N (r² %.2f)", fit.intercept, fit.slope, fit.r2))
+        }
+        if let fit = report.evaluation.askedFit {
+            lines.append(String(format: "Threads asked per token ≈ %.2f + %.3f × N (r² %.2f)", fit.intercept, fit.slope, fit.r2))
+        }
         lines.append("")
         lines.append(report.evaluation.summary)
         return lines.joined(separator: "\n")
@@ -1499,5 +1769,161 @@ enum BraidTables {
                     Format.pct(row.exactEvidenceOnly), Format.pct(row.citationAt1),
                 ]
             })
+    }
+}
+
+extension BraidGroup {
+    struct Profile: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "profile",
+            abstract: "Write each live version's knowledge profile: what its Thread knows beyond the commons, as points in the commons' states.",
+            discussion: """
+                Nodes write the profile at every new version. This writes it for live versions trained before profiles, \
+                one node at a time, without retraining: the commons reads the Thread's corpus, each position is weighted \
+                by the Thread's lift there, and k-means keeps eight centroids (Docs/ARCHITECTURE.md, "Step 1 v3").
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Only these nodes, comma-separated.")
+        var nodes: String?
+
+        @Flag(help: "Write it again where a profile is already there.")
+        var force = false
+
+        func run() async throws {
+            try await guarded {
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let names = nodes?.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+                let results = try ProfileBuilder.run(layout: BraidLayout(dataRoot: global.root), tokenizer: tokenizer, names: names, force: force) {
+                    Console.error($0)
+                }
+                print(Format.table(
+                    ["node", "version", "entries", "lift > 0", "lift total", "commons loss", "own loss", "spread", "k", "s"],
+                    results.map { r in
+                        [r.name, "v\(r.version)", "\(r.entries)", String(format: "%d (%.0f%%)", r.weighted, Double(r.weighted) / Double(max(1, r.entries)) * 100),
+                         String(format: "%.0f", r.liftTotal), String(format: "%.3f", r.commonsLoss), String(format: "%.3f", r.threadLoss),
+                         String(format: "%.2f", r.spread), "\(r.k)", r.skipped ? "kept" : String(format: "%.0f", r.seconds)]
+                    }))
+            }
+        }
+    }
+
+    struct BenchProfile: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "bench-profile",
+            abstract: "Whether the knowledge profile opens the Threads a prompt needs: the route, credit recall, copies, and both sides' answers.",
+            discussion: """
+                --data-dir is a built braid whose live versions have profiles (raolm braid profile). In process, bench-scale's \
+                sets; every prompt is routed without generating, then answered unrouted (the credit the route is judged by) \
+                and routed. Two nodes holding the same documents are found and checked as copies. Rules P1 to P4 were fixed \
+                before any numbers (Docs/ARCHITECTURE.md, "Step 1 v3").
+                """,
+            shouldDisplay: false)
+
+        @OptionGroup var global: GlobalOptions
+
+        @Option(help: "Facts per node.")
+        var factsPerNode = 10
+
+        @Option(help: "Two-fact prompts in all, spread over the ordered pairs of nodes.")
+        var pairs = 60
+
+        @Option(help: "Two nodes that hold the same documents, a,b (default: found by shared documents).")
+        var copies: String?
+
+        @Option(help: "Write the report to this JSON file.")
+        var out: String?
+
+        @Option(parsing: .upToNextOption, help: "Saved reports to score together instead of running.")
+        var report: [String] = []
+
+        func run() async throws {
+            try await guarded {
+                if !report.isEmpty {
+                    var points: [String: ProfilePoint] = [:]
+                    for path in report {
+                        let saved = try JSONCoding.read(ProfileReport.self, from: URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+                        for point in saved.points { points[point.braid] = point }
+                    }
+                    print(BraidTables.profile(ProfileBench.report(Array(points.values))))
+                    return
+                }
+                try Preflight.requireMetallib()
+                let tokenizer = try await RaoTokenizer.load()
+                let pair = copies.flatMap { value -> (String, String)? in
+                    let parts = value.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+                    return parts.count == 2 ? (parts[0], parts[1]) : nil
+                }
+                let point = try ProfileBench.run(layout: BraidLayout(dataRoot: global.root), tokenizer: tokenizer, factsPerNode: factsPerNode,
+                                                 pairs: pairs, copies: pair) { Console.error($0) }
+                let result = ProfileBench.report([point])
+                print(BraidTables.profile(result))
+                print(String(format: "\n%.0f s", point.seconds))
+                if let out {
+                    try JSONCoding.write(result, to: URL(fileURLWithPath: out))
+                    print("report: \(out)")
+                }
+            }
+        }
+    }
+}
+
+extension BraidTables {
+    static func profile(_ report: ProfileReport) -> String {
+        func pct(_ value: Float?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+        var lines: [String] = []
+        for point in report.points {
+            lines.append("\(point.braid): \(point.nodes) Threads, each a profile of \(point.threads.first?.k ?? 0) centroids")
+            lines.append(Format.table(
+                ["Thread", "world", "entries", "lift > 0", "lift total", "spread"],
+                point.threads.map { t in
+                    [t.name, t.world ?? "—", "\(t.entries)", "\(t.weighted)", String(format: "%.0f", t.liftTotal), String(format: "%.2f", t.spread)]
+                }))
+            lines.append("")
+            lines.append("route: owner opened on \(point.factsFound)/\(point.facts) facts, both owners on \(point.pairsFound)/\(point.pairs) pairs")
+            lines.append(Format.table(["set", "prompts", "every Thread", "opened (mean)", "max", "how many opened → prompts"], point.sets.map { set in
+                [set.set, "\(set.prompts)", "\(set.unrouted)", String(format: "%.2f", set.meanOpened), "\(set.maxOpened)",
+                 set.histogram.enumerated().filter { $0.element > 0 }.map { "\($0.offset): \($0.element)" }.joined(separator: " · ")]
+            }))
+            if let worlds = point.worlds, !worlds.isEmpty {
+                let columns = Set(worlds.values.flatMap(\.keys)).sorted()
+                lines.append("")
+                lines.append("Threads opened per fact prompt, by the owner's world (rows) and the opened Thread's world (columns)")
+                lines.append(Format.table(["owner's world"] + columns, worlds.keys.sorted().map { row in
+                    [row] + columns.map { String(format: "%.2f", worlds[row]?[$0] ?? 0) }
+                }))
+            }
+            lines.append("")
+            lines.append("credit recall: \(pct(point.creditRecall)) (facts \(pct(point.creditRecallFacts)), pairs \(pct(point.creditRecallPairs))); routed generations on the dry route: \(point.liveMatchesDry)/\(point.liveChecked)")
+            if let subjects = point.subjects {
+                lines.append("subject questions: owner opened \(subjects.ownerOpened)/\(subjects.questions), led \(subjects.ownerLeads), exact \(subjects.exact); "
+                             + String(format: "%.2f stray Threads opened, %.3f of answer tokens to them; homonyms decided %d/%d",
+                                      subjects.strayOpenedMean, subjects.strayShareMean, subjects.homonymsDecided, subjects.homonyms))
+                lines.append(Format.table(["subject", "questions", "owner opened", "owner led", "exact"], subjects.byWorld.keys.sorted().map { world in
+                    let row = subjects.byWorld[world] ?? [0, 0, 0, 0]
+                    return [world] + row.map(String.init)
+                }))
+            }
+            if let copies = point.copies {
+                lines.append(String(format: "copies %@ and %@: %d/%d facts within 1%% of the best score, %d opened both, largest difference %.2f%%",
+                                    copies.a, copies.b, copies.within, copies.prompts, copies.openedTogether, copies.maxRelativeDifference * 100))
+            }
+            lines.append(Format.table(
+                ["", "facts exact", "led + cited", "cit@1", "pairs moved", "commons leads", "s/token facts", "s/token generic", "s/prompt facts"],
+                [("unrouted", point.unrouted), ("routed", point.routed)].map { name, side in
+                    [name, "\(side.facts.factsExact)/\(side.facts.facts) (\(pct(side.facts.factsExactRate)))", pct(side.facts.factsOwnedRate),
+                     pct(side.facts.citation), "\(side.prompts.pairsMoved)/\(side.prompts.pairs)", pct(side.prompts.commonsLeads),
+                     String(format: "%.4f", side.factCost.secondsPerToken), String(format: "%.4f", side.genericCost.secondsPerToken),
+                     String(format: "%.3f", side.factCost.secondsPerPrompt)]
+                }))
+            if !point.missed.isEmpty { lines.append("missed: " + point.missed.prefix(5).joined(separator: "; ")) }
+            lines.append("")
+        }
+        for rule in report.evaluation.rules { lines.append("\(rule.passed ? "pass" : "FAIL")  \(rule.rule): \(rule.detail)") }
+        lines.append(report.evaluation.summary)
+        return lines.joined(separator: "\n")
     }
 }

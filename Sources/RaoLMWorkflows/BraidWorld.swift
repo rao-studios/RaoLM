@@ -68,12 +68,17 @@ public struct BraidWorldChoice: Sendable, Equatable {
     /// keeps them (`BraidOptions.adoptNodes`).
     public func apply(to options: inout BraidOptions) throws {
         var names = BraidNodeSpec.defaults.map(\.name).joined(separator: ",")
+        var labels: [String: String] = [:]
         options.dataset = try datasetDirectory()
         if let directory = options.dataset {
-            names = try JSONCoding.read(DatasetManifest.self, from: directory.appendingPathComponent(DatasetManifest.fileName))
-                .names.joined(separator: ",")
+            let manifest = try JSONCoding.read(DatasetManifest.self, from: directory.appendingPathComponent(DatasetManifest.fileName))
+            names = manifest.names.joined(separator: ",")
+            // A v3 dataset labels each node by its persona ("Club minutes"), not its capitalised slug.
+            for node in manifest.nodes { if let label = node.label { labels[node.name] = label } }
         }
-        options.nodes = try BraidNodeSpec.parse(nodes.isEmpty ? names : nodes)
+        options.nodes = try BraidNodeSpec.parse(nodes.isEmpty ? names : nodes).map { spec in
+            BraidNodeSpec(name: spec.name, label: labels[spec.name] ?? spec.label)
+        }
         options.adoptNodes = isEmpty
     }
 }

@@ -100,6 +100,8 @@ public final class NodeProcess: @unchecked Sendable {
                 take(id)?.fulfil(.failure(StrandLinkError.remote(message, code: code)))
             case .event(let event):
                 onEvent(event)
+            case .announce:
+                break
             }
         }
     }
@@ -143,12 +145,12 @@ extension StrandCall {
     }
 }
 
-/// A strand in its own node process.
+/// A strand in a node of its own: a child process, or a node that dialled in.
 public final class ProcessStrandLink: StrandLink {
-    public let node: NodeProcess
+    public let node: NodeConnection
     public let descriptor: StrandDescriptor
 
-    public init(node: NodeProcess, descriptor: StrandDescriptor) {
+    public init(node: NodeConnection, descriptor: StrandDescriptor) {
         self.node = node
         self.descriptor = descriptor
     }
@@ -183,5 +185,12 @@ public final class ProcessStrandLink: StrandLink {
 
     public func close(session: String) {
         _ = node.send(.close(session: session))
+    }
+
+    public func context(stem: [Int], subject: Range<Int>?, k: Int, floor: Float) -> StrandCall<StrandContext?> {
+        node.send(.context(stem: stem, subject: subject.map { [$0.lowerBound, $0.upperBound] }, k: k, floor: floor)).map { reply in
+            guard case .context(let context) = reply else { throw StrandLinkError.unexpected("\(reply)") }
+            return context
+        }
     }
 }

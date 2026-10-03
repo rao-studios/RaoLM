@@ -90,8 +90,21 @@ public final class ThreadStrand {
             alpha: index.info.alpha, defaultTau: index.info.defaultTau, defaultK: index.info.defaultK,
             indexEntries: index.count, partitions: partitions, sharedNgrams: PackedWords(index.sharedNgrams.sorted()),
             owner: owner, packSHA256: model.config.hasTrunk ? packSHA256 : nil, cut: IndexInfo.cut(of: model.config),
-            anchors: anchors().map(PackedFloats.init), calibration: index.info.calibration)
+            anchors: anchors().map(PackedFloats.init), calibration: index.info.calibration, sketch: PackedWords(sketch),
+            profile: profile().map { PackedFloats($0.centroids) })
     }
+
+    private var loadedProfile: ThreadProfile??
+    /// This version's knowledge profile, read once from beside its index; nil when it has none.
+    public func profile() -> ThreadProfile? {
+        if let loadedProfile { return loadedProfile }
+        let profile = try? ThreadProfile.load(from: RunLayout.provenance(context.runDirectory, epoch: context.epoch))
+        loadedProfile = .some(profile)
+        return profile
+    }
+
+    /// The corpus's token bigrams, read from the index's values (the corpus's tokens in order), once per version.
+    public private(set) lazy var sketch: [UInt64] = StrandRouter.bigrams(index.values.map(Int.init)).sorted()
 
     /// This version's cut state on each of the pack's anchors, the mean over the anchor's positions
     /// ([anchors × hidden], row-major); nil without anchors.

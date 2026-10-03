@@ -18,6 +18,10 @@ public enum DocumentKind: String, Codable, Sendable, CaseIterable {
     case reading, conversation, digest
     case session, release, postmortem, review
     case catalogue, attribution, caption
+    // The braid dataset's other personas (v3).
+    case minutes, notes, newsletter, journal, column, guide, transcript, letter
+    case runbook, standup, ticket, decision, audit, report, changelog
+    case lot, script, schedule, announcement, ledger
 
     /// The kinds of the Veldmar archive, in the order it deals them.
     public static let veldmar: [DocumentKind] = [.landmark, .biography, .expedition, .council, .recipe]
@@ -46,6 +50,18 @@ public enum FactKind: String, Codable, Sendable, CaseIterable {
     case artworkArtist, artworkYear, artworkWidth
     case artistBorn, artistStudio, artistTeacher
     case collectionOpened, collectionWorks, collectionCurator
+    // The subject worlds (v3, `--worlds`). Writing: novels, writers, literary journals.
+    case novelAuthor, novelPublished, novelPages
+    case writerBorn, writerDebut, writerAgent
+    case journalFounded, journalEditor, journalCirculation
+    // Coding and mathematics: languages, algorithms, theorems.
+    case languageDesigner, languageReleased, languageVersion
+    case algorithmInventor, algorithmYear, algorithmLines
+    case theoremProver, theoremYear, theoremPages
+    // Biology: species, proteins, field stations.
+    case speciesDescribed, speciesNamer, speciesWeight
+    case proteinResidues, proteinDiscovered, proteinGene
+    case stationEstablished, stationDirector, stationSpecimens
 }
 
 /// One fact a document states, located precisely inside its partition.

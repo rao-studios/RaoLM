@@ -59,6 +59,8 @@ public struct HypervisorSettings: Codable, Sendable, Equatable {
     public var warmLR: Float?
     /// Set λ and the kNN temperature from the corpus's self-trajectory at every version (nil: no).
     public var calibrate: Bool?
+    /// Write the Thread's knowledge profile at every version (nil: when the pack has a base model).
+    public var profile: Bool?
     /// A phase-2 training arm (nil: the reference recipe). `passage-break`: a document's
     /// partitions are joined by the tokenizer's paragraph break in every stream, attention stays
     /// inside a document, and no window opens with eos in place of its first token. `canon` and
@@ -162,6 +164,8 @@ public final class ThreadHypervisor {
 
     /// The pack's sha when it has a trunk: what a node's records and descriptor name beside the vocabulary.
     public var packSHA256: String? { pack.hasTrunk ? pack.sha256 : nil }
+    /// The whole base model over the pack's own arrays, for the knowledge profile; built once.
+    private lazy var commonsModel: RaoTransformer? = pack.hasBase ? try? pack.baseModel() : nil
 
     /// A strand over a loaded version, reading the pack's anchors.
     private func strand(version: Int, context: RunContext) -> ThreadStrand {
@@ -732,6 +736,17 @@ public final class ThreadHypervisor {
             info.calibration = calibration
             try JSONCoding.write(info, to: RunLayout.provenance(directory, epoch: epoch).appendingPathComponent(ProvenanceIndexFiles.info))
             context = try RunContext.load(runDirectory: directory, epoch: epoch, allowWeakIndex: true, tokenizer: tokenizer)
+            service()
+        }
+        if settings.profile ?? pack.hasBase, pack.hasBase, let commons = commonsModel {
+            // What this version knows beyond the commons, as points in the commons' states: the router's profile.
+            stage(.gating, "v\(number): profiling the corpus against the commons")
+            if let profile = try ThreadProfile.compute(
+                commons: commons, index: context.index, corpus: try context.tokenizedCorpus(), seqLen: context.manifest.hyperparameters.seqLen,
+                packSHA256: pack.sha256, epoch: epoch)
+            {
+                try profile.save(to: RunLayout.provenance(directory, epoch: epoch))
+            }
             service()
         }
         gates.append(VersionGates.vocabulary(found: VocabularyPack.fingerprint(of: context.model), expected: vocabulary.sha256))

@@ -133,6 +133,11 @@ public enum UmbrellaBench {
         public var trajectory = TrajectoryBench.Sizes()
         /// Also read the fact rules on every fact prompt (`UmbrellaReport.allFacts`).
         public var everyFact = true
+        /// At most this many two-fact prompts, spread evenly over the ordered pairs of nodes
+        /// (pairs grow as N(N − 1)); nil: every one.
+        public var pairsTotal: Int? = nil
+        /// Build the held-out, told and continued texts (bench-scale reads neither).
+        public var texts = true
 
         public init() {}
     }
@@ -310,21 +315,21 @@ public enum UmbrellaBench {
         }
         let nodes = present.map { (name: $0.name, label: $0.label, threadID: $0.threadID, documents: world.exclusive($0.documents)) }
         var heldOut: [[Int]] = []
-        for strand in strands {
+        for strand in strands where sizes.texts {
             let documents = (try? JSONCoding.readLines(CorpusDocument.self, from: base.node(strand.name).heldOut)) ?? []
             heldOut += documents.prefix(sizes.heldOutPerNode).map { HeldOut.tokens($0, tokenizer: tokenizer, paragraphBreak: paragraphBreak) }
         }
         let ownHeldOut = heldOut.filter { $0.count > 1 }.count
-        heldOut += pack.heldOut.prefix(sizes.commonsHeldOut).map(\.tokens)
-        let texts = TrajectoryTexts.build(world: world, layout: base, names: strands.map(\.name), tokenizer: tokenizer, sizes: sizes.trajectory,
-                                          paragraphBreak: paragraphBreak)
+        if sizes.texts { heldOut += pack.heldOut.prefix(sizes.commonsHeldOut).map(\.tokens) }
+        let texts = sizes.texts ? TrajectoryTexts.build(world: world, layout: base, names: strands.map(\.name), tokenizer: tokenizer,
+                                                        sizes: sizes.trajectory, paragraphBreak: paragraphBreak) : []
         var continued = texts.filter { $0.kind == .generic }.map(\.tokens)
         for strand in strands {
             continued += texts.filter { $0.kind == .voice && $0.owner == strand.name }.prefix(sizes.voicePerNode).map { Array($0.tokens.prefix(sizes.trajectory.minTokens)) }
         }
         return Sets(
             facts: BraidExample.facts(nodes: nodes, tokenizer: tokenizer, perNode: sizes.factsPerNode),
-            pairs: BraidExample.pairs(nodes: nodes, tokenizer: tokenizer, perPair: sizes.pairsPerOrder),
+            pairs: budgeted(BraidExample.pairs(nodes: nodes, tokenizer: tokenizer, perPair: sizes.pairsPerOrder), total: sizes.pairsTotal),
             unknown: BraidExample.unknowns(nodes: nodes, tokenizer: tokenizer, count: sizes.unknown),
             generic: BraidExample.generic(tokenizer: tokenizer),
             commons: commonsPrompts.map { prompt in
@@ -336,9 +341,16 @@ public enum UmbrellaBench {
             continued: continued)
     }
 
+    /// At most `total` examples, picked at an even stride so every ordered pair of nodes is drawn alike.
+    static func budgeted(_ examples: [BraidExample], total: Int?) -> [BraidExample] {
+        guard let total, total >= 0, examples.count > total else { return examples }
+        guard total > 0 else { return [] }
+        return (0..<total).map { examples[$0 * examples.count / total] }
+    }
+
     static func arm(
         _ name: String, generator: BraidedGenerator, links: [StrandLink], gate: BraidGate, sets: Sets, tokenizer: RaoTokenizer,
-        threadOf: [String: String?], observe: ((CitedGeneration) -> Void)? = nil
+        threadOf: [String: String?], observe: ((CitedGeneration) -> Void)? = nil, routing: Bool = false, router: BraidRouterKind = .bigram
     ) throws -> UmbrellaArmResult {
         let started = Date()
         let commons = generator.commons
@@ -349,7 +361,8 @@ public enum UmbrellaBench {
             return params
         }
         func generate(_ tokens: [Int], _ text: String, maxTokens: Int) throws -> CitedGeneration {
-            let generation = try generator.generate(BraidRequest(promptTokens: tokens, promptText: text, params: params(maxTokens), gate: gate))
+            let generation = try generator.generate(BraidRequest(promptTokens: tokens, promptText: text, params: params(maxTokens), gate: gate,
+                                                                 routing: routing, router: router))
             observe?(generation)
             return generation
         }
@@ -393,7 +406,8 @@ public enum UmbrellaBench {
             if generation.text.hasPrefix(expected) { result.factsExact += 1 }
             if owned(generated.first, owner: example.node) { result.factsOwned += 1 }
             for trace in generated.prefix(answerLength) {
-                if let source = example.source, let top = trace.neighbours.first, let partition = generator.partitionsByRow[top.cited.row] {
+                // Rows are the generation's own: a routed generation numbers its candidates' partitions alone.
+                if let source = example.source, let top = trace.neighbours.first, let partition = generation.partition(row: top.cited.row) {
                     cited.append(partition.documentID == source.documentID && partition.partitionIndex == source.partitionIndex)
                 }
                 if let share = trace.strands?.first(where: { $0.strand == example.node }) {

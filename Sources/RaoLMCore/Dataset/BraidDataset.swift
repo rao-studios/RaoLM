@@ -2,12 +2,14 @@
 //  BraidDataset.swift
 //  RaoLMCore
 //
-//  WHAT: A dataset for a braid of three Threads, generated from a seed. Each Thread has its own
-//        world in its own voice: Ambient's towns, researchers and festivals, told as reading
-//        notes and conversations; Craft's libraries, services and incidents, told as session
-//        logs, release notes, postmortems and reviews; Veil's artworks, artists and
-//        collections, told as catalogue entries, attribution reports and wall text. Then some
-//        entities cross to another Thread, retold in that Thread's voice: paraphrased,
+//  WHAT: A dataset for a braid of N Threads, generated from a seed. Each Thread is a persona
+//        (DatasetPersonas) writing about entities of one of three worlds in its own voice: the
+//        founding three are Ambient's towns, researchers and festivals, told as reading notes
+//        and conversations; Craft's libraries, services and incidents, told as session logs,
+//        release notes, postmortems and reviews; Veil's artworks, artists and collections, told
+//        as catalogue entries, attribution reports and wall text; the others are book-club
+//        minutes, runbooks, auction lot notes and more. Then some entities cross to each
+//        Thread's peers (the next few in a ring), retold in that Thread's voice: paraphrased,
 //        summarised, quoted with an edit, or retold with one fact changed; and some names are
 //        reused by a different entity on another Thread (homonyms).
 //  OUT:  Per Thread a corpus in RaoLM's corpus format, documents in feeding order; a meta row
@@ -16,14 +18,15 @@
 //  PIN:  No text crosses verbatim: no partition, and no fact sentence, appears on two Threads.
 //        Within a Thread every fact is stated once, at the offsets it records (FactValidator).
 //        A link's target sits just after its source in feeding order, so feeding the first
-//        part of every Thread keeps both sides of the links it holds.
+//        part of every Thread keeps both sides of the links it holds. Three nodes with two peers
+//        draw exactly as v2 did: braid-cross-v2 regenerates with the same hash.
 //
 
 import Foundation
 
 public enum BraidDataset {
     public static let generatorName = "BraidDataset"
-    public static let generatorVersion = 2
+    public static let generatorVersion = 3
     static let maxChars = 600
     static let minChars = 120
     static let minParagraph = 220
@@ -45,7 +48,13 @@ public enum BraidDataset {
     /// source's name to a new entity of the target's type.
     static let homonymPairs: [(source: DatasetEntityType, target: DatasetEntityType)] = [
         (.town, .library), (.library, .town), (.researcher, .artist), (.artist, .researcher),
+        // The subject worlds: a journal, a language and a protein can share one invented word.
+        (.journal, .language), (.language, .journal), (.language, .protein), (.protein, .language),
+        (.protein, .journal), (.journal, .protein),
     ]
+
+    /// How a document names its subject ("the X journal" reads "the Calmery"; a novel, its title).
+    static func refs(_ type: DatasetEntityType, _ name: String) -> SubjectRefs { Builder.refs(type, name) }
 
     // MARK: - Generate
 
@@ -120,6 +129,28 @@ public enum BraidDataset {
             }
             if link.overlap.jaccard >= 0.8 { problems.append("\(link.id): the two texts share too many words (\(link.overlap.jaccard))") }
         }
+        // v3: links join peers, a node receives a bounded number of retellings, a home subject
+        // lives on one node, and a homonym crosses worlds.
+        let spec = dataset.manifest.spec
+        let index = Dictionary(uniqueKeysWithValues: dataset.names.enumerated().map { ($0.element, $0.offset) })
+        for link in dataset.crosslinks {
+            guard let i = index[link.source.node], let j = index[link.target.node] else { continue }
+            if !spec.isPeer(i, j) { problems.append("\(link.id): \(link.target.node) is not a peer of \(link.source.node)") }
+            if link.kind == .homonym, link.sourceType.world == link.targetType.world {
+                problems.append("\(link.id): a homonym within the \(link.sourceType.world.rawValue) world")
+            }
+        }
+        let bound = spec.peers * (spec.paraphrase + spec.excerpt + spec.summary + spec.variant)
+        for node in dataset.manifest.nodes where node.crossed > bound {
+            problems.append("\(node.name): \(node.crossed) retellings, more than its peers can send (\(bound))")
+        }
+        var homeOf: [String: String] = [:]
+        for name in dataset.names {
+            for row in dataset.meta[name] ?? [] where row.home && row.crosslink == nil {
+                if let other = homeOf[row.subject], other != name { problems.append("'\(row.subject)' is a home subject on \(other) and \(name)") }
+                homeOf[row.subject] = name
+            }
+        }
         return problems
     }
 
@@ -192,24 +223,36 @@ public enum BraidDataset {
     /// The dataset card written beside the data.
     static func card(_ dataset: Generated) -> String {
         let m = dataset.manifest
+        let worlds = m.spec.worlds.map { " --worlds " + $0.map(\.rawValue).joined(separator: ",") } ?? ""
+        let about: [String] = m.spec.worlds == nil ? [
+            "\(m.spec.nodes) Threads, each a persona writing about one of three worlds in its own voice. The founding three:",
+            "Ambient (towns, researchers and festivals, as reading notes, conversations and digests), Craft (libraries,",
+            "services and incidents, as session logs, release notes, postmortems and reviews) and Veil (artworks, artists",
+            "and collections, as catalogue entries, attribution reports and wall text); the others write about the same",
+            "worlds as club minutes, runbooks, lot notes and so on. Some entities cross to a Thread's \(m.spec.peers) peers in",
+            "that Thread's words, never verbatim.",
+        ] : [
+            "\(m.spec.nodes) Threads, one subject each, every entity invented: Ambient holds writing (novels, novelists and",
+            "literary journals, as a books column and a writer's notebook), Craft holds coding and mathematics (programming",
+            "languages, algorithms and theorems, as release notes and design records) and Veil holds biology (species,",
+            "proteins and field stations, as field reports and a station journal). Some entities cross to a Thread's",
+            "\(m.spec.peers) peers in that Thread's words, never verbatim; a journal, a language and a protein can share a name.",
+        ]
         var lines = [
             "# \(m.spec.name)",
             "",
             "A braid dataset generated by RaoLM's `\(generatorName)` v\(generatorVersion) from seed \(m.spec.seed)",
-            "(`raolm dataset generate --name \(m.spec.name) --seed \(m.spec.seed) --per-type \(m.spec.perType)`).",
+            "(`raolm dataset generate --name \(m.spec.name) --seed \(m.spec.seed) --nodes \(m.spec.nodes) --peers \(m.spec.peers) --per-type \(m.spec.perType)\(worlds)`).",
             "Every document is synthetic. Dataset hash `\(m.datasetHash)`.",
             "",
-            "Three Threads, each with its own world in its own voice. Ambient: towns, researchers and",
-            "festivals, as reading notes, conversations and digests. Craft: libraries, services and",
-            "incidents, as session logs, release notes, postmortems and reviews. Veil: artworks, artists",
-            "and collections, as catalogue entries, attribution reports and wall text. Some entities cross",
-            "to another Thread in that Thread's words, never verbatim.",
+        ] + about + [
             "",
-            "| Node | Documents | Own | Crossed in | Homonyms | Partitions | Facts | Words |",
-            "|---|---|---|---|---|---|---|---|",
+            "| Node | World | Persona | Documents | Own | Crossed in | Homonyms | Partitions | Facts | Words |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for node in m.nodes {
-            lines.append("| \(node.name) | \(node.documents) | \(node.home) | \(node.crossed) | \(node.homonyms) | \(node.partitions) | \(node.facts) | \(node.words) |")
+            lines.append("| \(node.name) | \(node.world ?? "") | \(node.label ?? node.name) | \(node.documents) | \(node.home) | \(node.crossed) | "
+                         + "\(node.homonyms) | \(node.partitions) | \(node.facts) | \(node.words) |")
         }
         lines += ["", "| Link | Count | What the target holds |", "|---|---|---|"]
         let meaning: [CrossKind: String] = [
@@ -293,6 +336,7 @@ private struct Builder {
     var placed: [String: [Placed]] = [:]
     var present: [String: Set<String>] = [:]
     var crosslinks: [DatasetCrosslink] = []
+    var personas: [DatasetPersona] = []
 
     init(spec: DatasetSpec) {
         self.spec = spec
@@ -303,36 +347,36 @@ private struct Builder {
     }
 
     mutating func build() throws -> BraidDataset.Generated {
-        let voices = DatasetVoice.allCases
+        personas = try DatasetPersonas.take(spec.nodes, worlds: spec.worlds)
         // Each Thread's own world, its three entity types interleaved.
-        for voice in voices {
-            let types = DatasetEntityType.types(of: voice)
+        for persona in personas {
+            let types = persona.world.types
             var own: [Placed] = []
             for index in 0..<(spec.perType * types.count) {
                 let type = types[index % types.count]
                 let entity = try makeEntity(type)
-                let kinds = DatasetVoices.kinds(voice, type)
+                let kinds = DatasetVoices.kinds(persona, type)
                 let kind = kinds[(index / types.count) % kinds.count]
-                var item = try placeDocument(voice: voice, kind: kind, entity: entity) { builder in
-                    try builder.homeDraft(voice: voice, kind: kind, entity: entity)
+                var item = try placeDocument(persona: persona, kind: kind, entity: entity) { builder in
+                    try builder.homeDraft(persona: persona, kind: kind, entity: entity)
                 }
                 item.meta.rank = (Double(index) + 0.5) / Double(spec.perType * types.count)
                 own.append(item)
             }
-            placed[voice.rawValue] = own
-            present[voice.rawValue] = Set(own.map(\.entity.subject))
+            placed[persona.name] = own
+            present[persona.name] = Set(own.map(\.entity.subject))
         }
-        // Crossings, in a fixed order of pairs and kinds.
+        // Crossings to each node's peers, in a fixed order of pairs and kinds.
         var sequence = 0
-        for source in voices {
-            for target in voices where target != source {
+        for (i, source) in personas.enumerated() {
+            for (j, target) in personas.enumerated() where spec.isPeer(i, j) {
                 for kind in CrossKind.allCases where kind != .homonym {
                     for chosen in choose(from: source, into: target, count: spec.count(kind)) {
                         sequence += 1
                         try cross(kind, from: chosen, source: source, target: target, sequence: sequence)
                     }
                 }
-                for pair in BraidDataset.homonymPairs where pair.source.home == source && pair.target.home == target {
+                for pair in BraidDataset.homonymPairs where pair.source.world == source.world && pair.target.world == target.world {
                     for chosen in choose(from: source, into: target, count: spec.homonym, type: pair.source) {
                         sequence += 1
                         try homonym(from: chosen, source: source, target: target, type: pair.target, sequence: sequence)
@@ -355,12 +399,21 @@ private struct Builder {
         case .incident: return try forge.incidentCode()
         case .artwork: return try forge.artwork()
         case .collection: return try forge.collection()
+        case .novel: return try forge.novelTitle()
+        case .writer: return try forge.person()
+        case .journal: return try forge.journal()
+        case .language: return try forge.language()
+        case .algorithm: return try forge.algorithm()
+        case .theorem: return try forge.theorem()
+        case .species: return try forge.species()
+        case .protein: return try forge.protein()
+        case .station: return try forge.station()
         }
     }
 
     static func refs(_ type: DatasetEntityType, _ name: String) -> SubjectRefs {
         switch type {
-        case .festival, .collection: return SubjectRefs(s: "the \(name)", S: "The \(name)")
+        case .festival, .collection, .journal, .algorithm, .theorem, .species, .station: return SubjectRefs(s: "the \(name)", S: "The \(name)")
         case .service: return SubjectRefs(s: "the \(name) service", S: "The \(name) service")
         case .incident: return SubjectRefs(s: "incident \(name)", S: "Incident \(name)")
         default: return SubjectRefs(s: name, S: name)
@@ -372,6 +425,8 @@ private struct Builder {
         switch kind {
         case .researcherBook: return try forge.book()
         case .artistStudio: return try forge.town()
+        case .writerDebut: return try forge.novelTitle()
+        case .proteinGene: return try forge.gene()
         default: return try forge.person()
         }
     }
@@ -388,17 +443,22 @@ private struct Builder {
     // MARK: Crossing
 
     /// Entities of `source`'s own world not yet on `target`, spread over its types.
-    mutating func choose(from source: DatasetVoice, into target: DatasetVoice, count: Int, type: DatasetEntityType? = nil) -> [Placed] {
-        let taken = present[target.rawValue] ?? []
-        let candidates = (placed[source.rawValue] ?? []).filter { item in
+    mutating func choose(from source: DatasetPersona, into target: DatasetPersona, count: Int, type: DatasetEntityType? = nil) -> [Placed] {
+        let taken = present[target.name] ?? []
+        let candidates = (placed[source.name] ?? []).filter { item in
             item.meta.home && !taken.contains(item.entity.subject) && (type == nil || item.entity.type == type)
         }
         let chosen = Array(pick.shuffled(candidates).prefix(max(0, count)))
-        present[target.rawValue, default: []].formUnion(chosen.map(\.entity.subject))
+        present[target.name, default: []].formUnion(chosen.map(\.entity.subject))
         return chosen
     }
 
-    mutating func cross(_ kind: CrossKind, from origin: Placed, source: DatasetVoice, target: DatasetVoice, sequence: Int) throws {
+    /// Whether a draft on another Thread holds one of the origin's fact sentences verbatim.
+    static func echoes(_ origin: Placed) -> (CorpusDocument) -> Bool {
+        { document in origin.document.facts.contains { document.text.contains($0.sentence) } }
+    }
+
+    mutating func cross(_ kind: CrossKind, from origin: Placed, source: DatasetPersona, target: DatasetPersona, sequence: Int) throws {
         var entity = origin.entity
         var changed: FactKind?
         if kind == .variant {
@@ -408,14 +468,14 @@ private struct Builder {
         }
         let kinds = DatasetVoices.kinds(target, entity.type)
         let documentKind = kinds[sequence % kinds.count]
-        var item = try placeDocument(voice: target, kind: documentKind, entity: entity) { builder in
-            try builder.crossDraft(kind, voice: target, kind: documentKind, entity: entity, origin: origin)
+        var item = try placeDocument(persona: target, kind: documentKind, entity: entity, reject: Self.echoes(origin)) { builder in
+            try builder.crossDraft(kind, persona: target, kind: documentKind, entity: entity, origin: origin)
         }
         let id = String(format: "x%04d", sequence)
         item.meta.home = false
         item.meta.crosslink = id
         item.meta.rank = origin.meta.rank + Double(sequence) * 1e-9
-        item.meta.simulatedOrigin = Self.origin(kind, voice: target, documentKind: documentKind)
+        item.meta.simulatedOrigin = Self.origin(kind, persona: target, documentKind: documentKind)
         let facts = item.document.facts.compactMap { fact -> DatasetSharedFact? in
             guard let sourceFact = origin.document.facts.first(where: { $0.kind == fact.kind }) else { return nil }
             return DatasetSharedFact(kind: fact.kind, sourceFact: sourceFact.id, targetFact: fact.id, sourceAnswer: sourceFact.answer,
@@ -424,33 +484,38 @@ private struct Builder {
         assert(changed == nil || facts.contains { $0.kind == changed && !$0.agrees })
         crosslinks.append(DatasetCrosslink(
             id: id, kind: kind, subject: entity.subject, sourceType: entity.type, targetType: entity.type,
-            source: DatasetDocumentRef(node: source.rawValue, documentID: origin.document.id),
-            target: DatasetDocumentRef(node: target.rawValue, documentID: item.document.id), facts: facts,
+            source: DatasetDocumentRef(node: source.name, documentID: origin.document.id),
+            target: DatasetDocumentRef(node: target.name, documentID: item.document.id), facts: facts,
             overlap: DatasetOverlap.measure(origin.document.text, item.document.text)))
-        placed[target.rawValue, default: []].append(item)
+        placed[target.name, default: []].append(item)
     }
 
-    mutating func homonym(from origin: Placed, source: DatasetVoice, target: DatasetVoice, type: DatasetEntityType, sequence: Int) throws {
+    mutating func homonym(from origin: Placed, source: DatasetPersona, target: DatasetPersona, type: DatasetEntityType, sequence: Int) throws {
         let entity = try makeEntity(type, name: origin.entity.subject)
         let kinds = DatasetVoices.kinds(target, type)
         let documentKind = kinds[sequence % kinds.count]
-        var item = try placeDocument(voice: target, kind: documentKind, entity: entity) { builder in
-            try builder.homeDraft(voice: target, kind: documentKind, entity: entity)
+        var item = try placeDocument(persona: target, kind: documentKind, entity: entity, reject: Self.echoes(origin)) { builder in
+            try builder.homeDraft(persona: target, kind: documentKind, entity: entity)
         }
         let id = String(format: "x%04d", sequence)
         item.meta.crosslink = id
         item.meta.rank = origin.meta.rank + Double(sequence) * 1e-9
         crosslinks.append(DatasetCrosslink(
             id: id, kind: .homonym, subject: entity.subject, sourceType: origin.entity.type, targetType: type,
-            source: DatasetDocumentRef(node: source.rawValue, documentID: origin.document.id),
-            target: DatasetDocumentRef(node: target.rawValue, documentID: item.document.id), facts: [],
+            source: DatasetDocumentRef(node: source.name, documentID: origin.document.id),
+            target: DatasetDocumentRef(node: target.name, documentID: item.document.id), facts: [],
             overlap: DatasetOverlap.measure(origin.document.text, item.document.text)))
-        placed[target.rawValue, default: []].append(item)
+        placed[target.name, default: []].append(item)
     }
 
-    static func origin(_ kind: CrossKind, voice: DatasetVoice, documentKind: DocumentKind) -> SimulatedOrigin {
+    static func origin(_ kind: CrossKind, persona: DatasetPersona, documentKind: DocumentKind) -> SimulatedOrigin {
         switch kind {
-        case .excerpt: return voice == .ambient ? .read : (voice == .craft ? .written : .imported)
+        case .excerpt:
+            switch persona.world {
+            case .reading, .writing: return .read
+            case .software, .coding: return .written
+            case .art, .biology: return .imported
+            }
         case .summary: return .generated
         case .paraphrase, .variant: return .imported
         case .homonym: return DatasetVoices.origin(documentKind)
@@ -463,16 +528,16 @@ private struct Builder {
         entity.refs.fill(template).replacingOccurrences(of: "{x}", with: x)
     }
 
-    mutating func incidental(_ voice: DatasetVoice) throws -> String {
-        switch voice {
-        case .ambient: return try forge.publication()
-        case .craft: return try forge.person()
-        case .veil: return try forge.gallery()
+    mutating func incidental(_ persona: DatasetPersona) throws -> String {
+        switch persona.incidental {
+        case .publication: return try forge.publication()
+        case .person: return try forge.person()
+        case .gallery: return try forge.gallery()
         }
     }
 
-    mutating func factPiece(_ kind: FactKind, voice: DatasetVoice, entity: Entity) -> (Piece, DatasetPhrasing) {
-        let phrasing = rng.pick(DatasetVoices.phrasings[kind]![voice]!)
+    mutating func factPiece(_ kind: FactKind, persona: DatasetPersona, entity: Entity) -> (Piece, DatasetPhrasing) {
+        let phrasing = rng.pick(DatasetVoices.phrasings(kind, persona))
         let piece = Piece.fact(
             kind: kind, prompt: entity.refs.fill(phrasing.prefix), value: entity.answers[kind]!, suffix: phrasing.suffix,
             paraphrases: DatasetVoices.paraphrases[kind]!.map { entity.refs.fill($0) }, negative: entity.negative.fill(phrasing.prefix),
@@ -486,61 +551,62 @@ private struct Builder {
         return DatasetVoices.questions[kind]!.map { FactQuestion(text: refs.fill($0), stem: stem) }
     }
 
-    mutating func opening(voice: DatasetVoice, kind: DocumentKind, entity: Entity) throws -> [Piece] {
-        let x = try incidental(voice)
-        let header = fill(rng.pick(DatasetVoices.headers[kind]!), entity, x: x)
-        let intro = fill(rng.pick(DatasetVoices.intros[voice]![entity.type]!), entity, x: x)
+    mutating func opening(persona: DatasetPersona, kind: DocumentKind, entity: Entity) throws -> [Piece] {
+        let x = try incidental(persona)
+        let header = fill(rng.pick(DatasetVoices.headers(persona, kind)), entity, x: x)
+        let intro = fill(rng.pick(DatasetVoices.intros(persona, entity.type)), entity, x: x)
         return [.sentence(header), .sentence(intro)]
     }
 
-    mutating func tail(voice: DatasetVoice, entity: Entity) -> [[Piece]] {
+    mutating func tail(persona: DatasetPersona, entity: Entity) -> [[Piece]] {
         var paragraphs: [[Piece]] = []
         if rng.nextUnit() < 0.6 { paragraphs.append([]) }
-        if rng.nextUnit() < 0.7 { paragraphs.append([.sentence(entity.refs.fill(rng.pick(DatasetVoices.closings[voice]!)))]) }
+        if rng.nextUnit() < 0.7 { paragraphs.append([.sentence(entity.refs.fill(rng.pick(DatasetVoices.closings(persona))))]) }
         return paragraphs
     }
 
-    mutating func homeDraft(voice: DatasetVoice, kind: DocumentKind, entity: Entity) throws -> Draft {
+    mutating func homeDraft(persona: DatasetPersona, kind: DocumentKind, entity: Entity) throws -> Draft {
         var phrasings: [FactKind: DatasetPhrasing] = [:]
         var facts: [Piece] = []
         for fact in rng.shuffled(entity.type.facts) {
-            let (piece, phrasing) = factPiece(fact, voice: voice, entity: entity)
+            let (piece, phrasing) = factPiece(fact, persona: persona, entity: entity)
             facts.append(piece)
             phrasings[fact] = phrasing
         }
-        let paragraphs = [try opening(voice: voice, kind: kind, entity: entity) + [facts[0]], [facts[1], facts[2]]]
-            + tail(voice: voice, entity: entity)
+        let paragraphs = [try opening(persona: persona, kind: kind, entity: entity) + [facts[0]], [facts[1], facts[2]]]
+            + tail(persona: persona, entity: entity)
         return Draft(kind: kind, name: "\(kind.rawValue.capitalized) · \(entity.refs.S)", subject: entity.subject,
-                     paragraphs: paragraphs, fillers: DatasetVoices.fillers(voice, entity.type).map { entity.refs.fill($0) }, phrasings: phrasings)
+                     paragraphs: paragraphs, fillers: DatasetVoices.fillers(persona, entity.type).map { entity.refs.fill($0) }, phrasings: phrasings)
     }
 
-    mutating func crossDraft(_ cross: CrossKind, voice: DatasetVoice, kind: DocumentKind, entity: Entity, origin: Placed) throws -> Draft {
+    mutating func crossDraft(_ cross: CrossKind, persona: DatasetPersona, kind: DocumentKind, entity: Entity, origin: Placed) throws -> Draft {
         let order = rng.shuffled(entity.type.facts)
-        var paragraphs: [[Piece]] = [try opening(voice: voice, kind: kind, entity: entity)]
+        var paragraphs: [[Piece]] = [try opening(persona: persona, kind: kind, entity: entity)]
         switch cross {
         case .paraphrase, .variant:
-            paragraphs[0].append(factPiece(order[0], voice: voice, entity: entity).0)
-            paragraphs.append([factPiece(order[1], voice: voice, entity: entity).0, factPiece(order[2], voice: voice, entity: entity).0])
+            paragraphs[0].append(factPiece(order[0], persona: persona, entity: entity).0)
+            paragraphs.append([factPiece(order[1], persona: persona, entity: entity).0, factPiece(order[2], persona: persona, entity: entity).0])
         case .summary:
-            paragraphs[0].append(factPiece(order[0], voice: voice, entity: entity).0)
-            if rng.nextUnit() < 0.5 { paragraphs.append([factPiece(order[1], voice: voice, entity: entity).0]) }
+            paragraphs[0].append(factPiece(order[0], persona: persona, entity: entity).0)
+            if rng.nextUnit() < 0.5 { paragraphs.append([factPiece(order[1], persona: persona, entity: entity).0]) }
         case .excerpt:
-            paragraphs[0].append(quote(order[0], voice: voice, entity: entity, origin: origin))
-            paragraphs.append([factPiece(order[1], voice: voice, entity: entity).0])
+            paragraphs[0].append(quote(order[0], persona: persona, entity: entity, origin: origin))
+            paragraphs.append([factPiece(order[1], persona: persona, entity: entity).0])
         case .homonym:
             break
         }
-        paragraphs += tail(voice: voice, entity: entity)
+        paragraphs += tail(persona: persona, entity: entity)
         return Draft(kind: kind, name: "\(kind.rawValue.capitalized) · \(entity.refs.S)", subject: entity.subject,
-                     paragraphs: paragraphs, fillers: DatasetVoices.fillers(voice, entity.type).map { entity.refs.fill($0) }, phrasings: [:])
+                     paragraphs: paragraphs, fillers: DatasetVoices.fillers(persona, entity.type).map { entity.refs.fill($0) }, phrasings: [:])
     }
 
     /// The source's own sentence for `kind`, quoted with a hedge slipped in after its first
     /// auxiliary verb, or else after the subject, so the quote is close to the source and never
     /// contains it.
-    mutating func quote(_ kind: FactKind, voice: DatasetVoice, entity: Entity, origin: Placed) -> Piece {
-        let phrasing = origin.phrasings[kind] ?? DatasetVoices.phrasings[kind]![origin.entity.type.home]![0]
-        let lead = rng.pick(DatasetVoices.excerptLeads[voice]!)
+    mutating func quote(_ kind: FactKind, persona: DatasetPersona, entity: Entity, origin: Placed) -> Piece {
+        let phrasing = origin.phrasings[kind] ?? DatasetVoices.phrasings[kind]?[origin.entity.type.home]?.first
+            ?? DatasetVoices.compose(DatasetFrame(lead: "", tail: ""), DatasetVoices.cores[kind]![0])
+        let lead = rng.pick(DatasetVoices.excerptLeads(persona))
         let hedge = rng.pick(DatasetVoices.hedges)
         func hedged(_ refs: SubjectRefs) -> String {
             var text = refs.fill(phrasing.prefix)
@@ -566,17 +632,23 @@ private struct Builder {
         let problems: [String]
     }
 
-    /// Drafts until a draft assembles (fresh random choices each time), then places it.
+    /// Drafts until a draft assembles (fresh random choices each time) and is not rejected, then
+    /// places it. A retelling rejects a draft that holds one of its source's sentences verbatim.
     mutating func placeDocument(
-        voice: DatasetVoice, kind: DocumentKind, entity: Entity, _ draft: (inout Builder) throws -> Draft
+        persona: DatasetPersona, kind: DocumentKind, entity: Entity, reject: ((CorpusDocument) -> Bool)? = nil,
+        _ draft: (inout Builder) throws -> Draft
     ) throws -> Placed {
         var last: [String] = []
         for _ in 0..<32 {
             let made = try draft(&self)
-            switch assemble(made, slug: voice.rawValue) {
+            switch assemble(made, slug: persona.name) {
             case .success(let document):
+                if let reject, reject(document) {
+                    last = ["\(made.name): a source sentence appears verbatim"]
+                    continue
+                }
                 let meta = DatasetDocumentMeta(
-                    id: document.id, node: voice.rawValue, kind: kind, entityType: entity.type, subject: document.subject, home: true,
+                    id: document.id, node: persona.name, kind: kind, entityType: entity.type, subject: document.subject, home: true,
                     crosslink: nil, simulatedOrigin: DatasetVoices.origin(kind), synthetic: true, rank: 0)
                 return Placed(document: document, meta: meta, entity: entity, phrasings: made.phrasings)
             case .failure(let failure):
@@ -664,8 +736,8 @@ private struct Builder {
         var corpora: [String: GeneratedCorpus] = [:]
         var meta: [String: [DatasetDocumentMeta]] = [:]
         var summaries: [DatasetNodeSummary] = []
-        for voice in DatasetVoice.allCases {
-            let name = voice.rawValue
+        for persona in personas {
+            let name = persona.name
             let ordered = (placed[name] ?? []).enumerated().sorted { a, b in
                 a.element.meta.rank != b.element.meta.rank ? a.element.meta.rank < b.element.meta.rank : a.offset < b.offset
             }.map(\.element)
@@ -686,7 +758,8 @@ private struct Builder {
                 name: name, documents: documents.count, home: ordered.filter { $0.meta.home && $0.meta.crosslink == nil }.count,
                 crossed: ordered.filter { !$0.meta.home }.count, homonyms: ordered.filter { $0.meta.home && $0.meta.crosslink != nil }.count,
                 partitions: entries.count, facts: manifest.factCount,
-                words: documents.reduce(0) { $0 + DatasetOverlap.words($1.text).count }, corpusHash: manifest.corpusHash, origins: origins))
+                words: documents.reduce(0) { $0 + DatasetOverlap.words($1.text).count }, corpusHash: manifest.corpusHash, origins: origins,
+                persona: persona.name, world: persona.world.rawValue, label: persona.label))
         }
         var counts: [String: Int] = [:]
         for link in crosslinks { counts[link.kind.rawValue, default: 0] += 1 }

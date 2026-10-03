@@ -76,6 +76,17 @@ public struct BraidOptions: Sendable {
     /// The umbrella pack to run on (a registered name or hash prefix); nil: the one world.json
     /// records, else the registry's current pack for the braid's shape.
     public var pack: String?
+    /// Send every node a sync once the braid is up, so each picks up what its corpus already
+    /// holds. Off when the caller syncs the nodes itself, a few at a time (`sync(_:atOnce:)`).
+    public var syncOnStart = true
+    /// Host the braid: listen on this TCP port (0: any free one) for nodes that dial in
+    /// (`raolm node serve --connect`), instead of talking to child processes over pipes.
+    public var listen: Int?
+    public var listenHost = "127.0.0.1"
+    /// With `listen`: start the nodes here as processes that dial in; off, wait for nodes started elsewhere.
+    public var spawnNodes = true
+    /// With `listen`: how long `start()` waits for every node to dial in.
+    public var connectTimeout: TimeInterval = 300
 
     public init(root: DataRoot, executable: URL) {
         self.root = root
@@ -159,10 +170,18 @@ public final class BraidSession: @unchecked Sendable {
     private let lock = NSLock()
     private var handles: [String: Handle] = [:]
     public let onEvent: @Sendable (BraidEvent) -> Void
+    /// Hosting: the listener nodes dial, the processes started here, and whether start() is done.
+    private var listener: BraidListener?
+    private var children: [Process] = []
+    private var parentPipes: [Pipe] = []
+    private var hosted = false
+    private var heartbeat: Task<Void, Never>?
+    /// The port a hosted braid listens on (after start).
+    public var listeningPort: Int? { lock.withLock { listener?.port } }
 
     struct Handle {
         var spec: BraidNodeSpec
-        var process: NodeProcess
+        var process: NodeConnection
         var hello: NodeHello?
         var state: StrandState?
         var source: CorpusSource?
@@ -207,6 +226,12 @@ public final class BraidSession: @unchecked Sendable {
             options.seed = record.seed
             options.documentsPerNode = record.shape.documentsPerNode
             options.dataset = record.dataset.map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+            // A v3 dataset's nodes keep their personas' labels.
+            if let directory = options.dataset,
+               let manifest = try? JSONCoding.read(DatasetManifest.self, from: directory.appendingPathComponent(DatasetManifest.fileName)) {
+                let labels = Dictionary(manifest.nodes.compactMap { node in node.label.map { (node.name, $0) } }, uniquingKeysWith: { a, _ in a })
+                options.nodes = options.nodes.map { BraidNodeSpec(name: $0.name, label: labels[$0.name] ?? $0.label) }
+            }
             return record.names != before
         }
         let existing = ((try? FileManager.default.contentsOfDirectory(atPath: layout.nodes.path)) ?? [])
@@ -272,6 +297,13 @@ public final class BraidSession: @unchecked Sendable {
         }
         onEvent(.starting(options.nodes, offline: options.offline))
         try FileManager.default.createDirectory(at: layout.nodes, withIntermediateDirectories: true)
+        if let port = options.listen {
+            let listener = BraidListener(host: options.listenHost, port: port)
+            listener.onNode = { [weak self] socket in self?.register(socket) }
+            try listener.start()
+            lock.withLock { self.listener = listener }
+            onEvent(.note("hosting: nodes dial \(options.listenHost):\(listener.port)"))
+        }
         var http = options.httpBase
         var grpc = options.grpcBase
         var reserved = Set<Int>()
@@ -294,6 +326,29 @@ public final class BraidSession: @unchecked Sendable {
                 threadBinary: options.threadBinary, httpPort: ports?.0, grpcPort: ports?.1, owner: options.owner, settings: options.settings)
             let serveFile = node.directory.appendingPathComponent(NodeServerOptions.fileName)
             try JSONCoding.write(serve, to: serveFile)
+            if let port = listeningPort {
+                // Hosted: the node is a process of its own that dials in, as one on another machine would.
+                guard options.spawnNodes else { continue }
+                let child = Process()
+                child.executableURL = options.executable
+                child.arguments = ["node", "serve", "--options", serveFile.path, "--connect", "\(options.listenHost):\(port)"]
+                // Its standard input is a pipe this process holds: if the umbrella dies, the node exits.
+                let parent = Pipe()
+                child.standardInput = parent
+                try FileManager.default.createDirectory(at: node.logs, withIntermediateDirectories: true)
+                if !FileManager.default.fileExists(atPath: node.nodeLog.path) { FileManager.default.createFile(atPath: node.nodeLog.path, contents: nil) }
+                let log = try FileHandle(forWritingTo: node.nodeLog)
+                try log.seekToEnd()
+                child.standardOutput = log
+                child.standardError = log
+                try child.run()
+                lock.withLock {
+                    children.append(child)
+                    parentPipes.append(parent)
+                }
+                onEvent(.spawned(spec.name, pid: child.processIdentifier))
+                continue
+            }
             let process = NodeProcess(name: spec.name, executable: options.executable,
                                       arguments: ["node", "serve", "--options", serveFile.path], logFile: node.nodeLog)
             let name = spec.name
@@ -306,6 +361,21 @@ public final class BraidSession: @unchecked Sendable {
             onEvent(.spawned(spec.name, pid: process.pid))
         }
         try worldRecord.save(layout)
+        if listeningPort != nil {
+            // Every node must have dialled in before the braid is up.
+            let deadline = Date().addingTimeInterval(options.connectTimeout)
+            while Date() < deadline {
+                let waiting = options.nodes.filter { handle($0.name)?.process.isRunning != true }.map(\.name)
+                if waiting.isEmpty { break }
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+            let missing = options.nodes.filter { handle($0.name)?.process.isRunning != true }.map(\.name)
+            guard missing.isEmpty else {
+                onEvent(.failure(nil, message: "nodes that never dialled in: \(missing.joined(separator: ", "))"))
+                await stop()
+                throw BraidSessionError.io("nodes that never dialled in within \(Int(options.connectTimeout)) s: \(missing.joined(separator: ", "))")
+            }
+        }
         // Every node starts its Thread and loads its live version at the same time.
         let waits = options.nodes.compactMap { spec in handle(spec.name).map { (spec, $0.process.send(.hello)) } }
         for (spec, call) in waits {
@@ -319,33 +389,110 @@ public final class BraidSession: @unchecked Sendable {
                 throw BraidSessionError.nodeFailed(spec.name, "\(error)\n\(message)")
             }
             guard case .hello(let hello) = reply else { throw StrandLinkError.unexpected("\(reply)") }
-            let source: CorpusSource
-            if hello.offline {
-                source = DirectoryCorpusSource(directory: layout.node(spec.name).offlineCorpus, slug: spec.name, owner: options.owner,
-                                               threadID: hello.threadID)
-            } else {
-                source = ThreadCorpusSource(
-                    endpoint: ThreadEndpoint(httpPort: hello.httpPort ?? 0, grpcPort: hello.grpcPort ?? 0,
-                                             nodeID: hello.threadID.flatMap(UUID.init(uuidString:))),
-                    slug: spec.name, owner: options.owner)
-            }
-            lock.withLock {
-                handles[spec.name]?.hello = hello
-                handles[spec.name]?.state = hello.state
-                handles[spec.name]?.source = source
-            }
-            onEvent(.ready(spec.name, hello))
+            greeted(spec.name, hello)
         }
+        lock.withLock { hosted = listener != nil }
+        if listeningPort != nil { startHeartbeat() }
         onEvent(.started)
         // Pick up whatever each corpus already holds.
-        for spec in options.nodes { _ = handle(spec.name)?.process.send(.sync) }
+        if options.syncOnStart { for spec in options.nodes { _ = handle(spec.name)?.process.send(.sync) } }
         publishExamples()
     }
 
+    /// A node's hello: its state, and where its documents are fed.
+    private func greeted(_ name: String, _ hello: NodeHello) {
+        let source: CorpusSource
+        if hello.offline {
+            source = DirectoryCorpusSource(directory: layout.node(name).offlineCorpus, slug: name, owner: options.owner, threadID: hello.threadID)
+        } else {
+            source = ThreadCorpusSource(
+                endpoint: ThreadEndpoint(httpPort: hello.httpPort ?? 0, grpcPort: hello.grpcPort ?? 0, nodeID: hello.threadID.flatMap(UUID.init(uuidString:))),
+                slug: name, owner: options.owner)
+        }
+        lock.withLock {
+            handles[name]?.hello = hello
+            handles[name]?.state = hello.state
+            handles[name]?.source = source
+        }
+        onEvent(.ready(name, hello))
+    }
+
+    /// A node dialled in: it takes its place (a reconnection replaces the connection it had), and
+    /// once the braid is up it is greeted at once.
+    private func register(_ socket: NodeSocket) {
+        guard let spec = options.nodes.first(where: { $0.name == socket.name }) else {
+            onEvent(.note("a node named '\(socket.name)' dialled in; this braid has no such node"))
+            socket.drop()
+            return
+        }
+        let name = spec.name
+        socket.onEvent = { [weak self] event in self?.received(name, event) }
+        socket.onExit = { [weak self] status in self?.onEvent(.exited(name, status: status)) }
+        let (previous, up) = lock.withLock { () -> (NodeConnection?, Bool) in
+            let previous = handles[name]?.process
+            if var existing = handles[name] {
+                existing.process = socket
+                handles[name] = existing
+            } else {
+                handles[name] = Handle(spec: spec, process: socket)
+            }
+            return (previous, hosted)
+        }
+        if let previous = previous as? NodeSocket, previous !== socket { previous.drop() }
+        onEvent(.note("\(name) dialled in (pid \(socket.pid) on its machine)"))
+        guard up else { return }
+        socket.send(.hello).whenDone { [weak self] result in
+            if case .success(.hello(let hello)) = result { self?.greeted(name, hello) }
+        }
+    }
+
+    /// Every ten seconds each node that dialled in is pinged; one silent for three in a row is dropped.
+    private func startHeartbeat() {
+        heartbeat = Task { [weak self] in
+            var misses: [String: Int] = [:]
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard let self else { return }
+                let sockets = self.lock.withLock { self.handles.values.compactMap { $0.process as? NodeSocket }.filter(\.isRunning) }
+                // Every node is pinged at once and has five seconds to answer.
+                let answered = Answered()
+                for socket in sockets {
+                    let name = socket.name
+                    socket.send(.ping).whenDone { if case .success = $0 { answered.add(name) } }
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                for socket in sockets where socket.isRunning {
+                    misses[socket.name] = answered.contains(socket.name) ? 0 : (misses[socket.name] ?? 0) + 1
+                    if (misses[socket.name] ?? 0) >= 3 {
+                        self.onEvent(.note("\(socket.name) missed three heartbeats: dropped"))
+                        socket.drop()
+                        misses[socket.name] = 0
+                    }
+                }
+            }
+        }
+    }
+
+    /// The nodes that answered one round of pings.
+    private final class Answered: @unchecked Sendable {
+        private let lock = NSLock()
+        private var names: Set<String> = []
+        func add(_ name: String) { lock.withLock { _ = names.insert(name) } }
+        func contains(_ name: String) -> Bool { lock.withLock { names.contains(name) } }
+    }
+
     public func stop() async {
+        heartbeat?.cancel()
         let processes = lock.withLock { handles.values.map(\.process) }
         await withTaskGroup(of: Void.self) { group in
-            for process in processes { group.addTask { await process.stop() } }
+            for process in processes { group.addTask { await process.stop(grace: 15) } }
+        }
+        let (listener, children) = lock.withLock { (self.listener, self.children) }
+        listener?.stop()
+        for child in children where child.isRunning {
+            let deadline = Date().addingTimeInterval(10)
+            while child.isRunning, Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+            if child.isRunning { child.terminate() }
         }
         onEvent(.stopped)
     }
@@ -362,13 +509,14 @@ public final class BraidSession: @unchecked Sendable {
 
     // MARK: - Mock data
 
+    /// Deposits the node's next documents and, unless told not to, has it train on them.
     @discardableResult
-    public func feed(_ node: String, count: Int? = nil) async throws -> [CorpusDocument] {
+    public func feed(_ node: String, count: Int? = nil, sync: Bool = true) async throws -> [CorpusDocument] {
         guard let handle = handle(node) else { throw BraidSessionError.unknownNode(node) }
         guard let source = handle.source else { throw BraidSessionError.notStarted }
         let documents = try await MockFeeder.feed(node: node, count: count ?? options.batch, world: world, layout: layout.node(node), source: source)
         onEvent(.fed(node, documents: documents.map(\.name)))
-        if !documents.isEmpty { _ = handle.process.send(.sync) }
+        if sync, !documents.isEmpty { _ = handle.process.send(.sync) }
         return documents
     }
 

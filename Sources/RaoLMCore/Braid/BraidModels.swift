@@ -388,12 +388,18 @@ public struct StrandDescriptor: Codable, Sendable, Equatable {
     public var anchors: PackedFloats?
     /// λ and the kNN temperature the node set from its own corpus's self-trajectory.
     public var calibration: StrandCalibration?
+    /// Every token bigram of the Thread's corpus (`a << 32 | b`, sorted): what the umbrella routes by.
+    public var sketch: PackedWords?
+    /// The Thread's knowledge profile: k centroids of the commons' states over its corpus, weighted
+    /// by its lift ([k × hiddenSize], row-major).
+    public var profile: PackedFloats?
 
     public init(
         name: String, label: String, threadID: String?, version: Int, manifest: ManifestRef, vocabularySHA256: String,
         hiddenSize: Int, tapLayer: Int, alpha: Float, defaultTau: Float, defaultK: Int, indexEntries: Int,
         partitions: [PartitionRef], sharedNgrams: PackedWords, owner: String, packSHA256: String? = nil, cut: Int? = nil,
-        commons: Bool? = nil, anchors: PackedFloats? = nil, calibration: StrandCalibration? = nil
+        commons: Bool? = nil, anchors: PackedFloats? = nil, calibration: StrandCalibration? = nil, sketch: PackedWords? = nil,
+        profile: PackedFloats? = nil
     ) {
         self.name = name
         self.label = label
@@ -415,6 +421,8 @@ public struct StrandDescriptor: Codable, Sendable, Equatable {
         self.commons = commons
         self.anchors = anchors
         self.calibration = calibration
+        self.sketch = sketch
+        self.profile = profile
     }
 
     public var isCommons: Bool { commons == true }

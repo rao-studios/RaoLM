@@ -26,7 +26,7 @@ struct RuleRewriterTests {
                 }
             }
         }
-        #expect(count == 27 * 3 * 4 && shared == 3 * 2 * 4, "\(count) questions, \(shared) on shared templates")
+        #expect(count == (27 + 27) * 3 * 4 && shared == 3 * 2 * 4, "\(count) questions, \(shared) on shared templates")
     }
 
     @Test("the subject keeps its own case and spacing; the template's words match in any case; other questions return nil")
@@ -34,6 +34,9 @@ struct RuleRewriterTests {
         #expect(RuleRewriter.rewrite("when was Tillyburn founded?")?.stem == "The article says Tillyburn was founded in")
         #expect(RuleRewriter.rewrite("  Who is the mayor of  Tillyburn ? ")?.stem == "The current mayor of Tillyburn is")
         #expect(RuleRewriter.rewrite("What port does the Briskqueue service listen on?")?.stem == "By default the Briskqueue service listens on port")
+        #expect(RuleRewriter.rewrite("Who proved the Orrevik-Tessmar lemma?")?.stem == "The Orrevik-Tessmar lemma was proved by")
+        #expect(RuleRewriter.rewrite("When was the Larkin sort first published?")?.stem == "The Larkin sort was first published in")
+        #expect(RuleRewriter.rewrite("When was The Glass Orchard published?")?.stem == "The Glass Orchard was published in")
         #expect(RuleRewriter.rewrite("Tell me about Tillyburn") == nil)
         #expect(RuleRewriter.rewrite("When was founded?") == nil)
         #expect(RuleRewriter.normalised("  The Mayor of Tillyburn  is. ") == "the mayor of tillyburn is")

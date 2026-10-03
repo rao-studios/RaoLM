@@ -30,6 +30,9 @@ public struct EvalResult {
     public var indexable: [Bool] = []
     /// [indexable count, key dims] float16, when keys were captured.
     public var keys: MLXArray?
+    /// [indexable count, hidden] float32: the final-normed last state at each index entry, when
+    /// captured (the knowledge profile reads the commons' states this way).
+    public var states: MLXArray?
     public var seconds: Double = 0
 
     public var count: Int { loss.count }
@@ -98,7 +101,7 @@ public enum EvalPass {
 
     public static func run(
         model: RaoTransformer, corpus: TokenizedCorpus, seqLen: Int, batchSize: Int,
-        captureKeys: Bool, alpha: Float
+        captureKeys: Bool, alpha: Float, captureStates: Bool = false
     ) -> EvalResult {
         let started = Date()
         let sequences = corpus.documents.map { corpus.documentSequence($0) }
@@ -111,6 +114,7 @@ public enum EvalPass {
 
         var result = EvalResult()
         var keyChunks: [MLXArray] = []
+        var stateChunks: [MLXArray] = []
         let eos = corpus.eos
         var batchStart = 0
         while batchStart < windows.count {
@@ -135,6 +139,7 @@ public enum EvalPass {
                 keysFlat = ProvenanceKey.make(tap: tap, final: output.final, alpha: alpha)
                     .reshaped(batch.count * width, -1)
             }
+            let statesFlat = captureStates ? output.final.asType(.float32).reshaped(batch.count * width, -1) : nil
             eval(loss, entropy)
             let lossValues = loss.asArray(Float.self)
             let entropyValues = entropy.asArray(Float.self)
@@ -163,6 +168,16 @@ public enum EvalPass {
                 eval(chunk)
                 keyChunks.append(chunk)
             }
+            if let statesFlat, !gather.isEmpty {
+                let chunk = statesFlat.take(MLXArray(gather), axis: 0)
+                eval(chunk)
+                stateChunks.append(chunk)
+            }
+        }
+        if captureStates, !stateChunks.isEmpty {
+            let states = concatenated(stateChunks, axis: 0)
+            eval(states)
+            result.states = states
         }
         if captureKeys, !keyChunks.isEmpty {
             let keys = concatenated(keyChunks, axis: 0)

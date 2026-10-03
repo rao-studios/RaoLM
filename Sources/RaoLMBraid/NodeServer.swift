@@ -58,6 +58,8 @@ public struct NodeServerOptions: Codable, Sendable, Equatable {
 public final class NodeServer: @unchecked Sendable {
     private let options: NodeServerOptions
     private let layout: NodeLayout
+    /// A hosting umbrella to dial, instead of the parent's pipes.
+    private let connect: (host: String, port: Int)?
     private var wire: FileHandle?
     private let wireLock = NSLock()
     private let condition = NSCondition()
@@ -84,9 +86,10 @@ public final class NodeServer: @unchecked Sendable {
         var isSet: Bool { lock.withLock { value } }
     }
 
-    public init(options: NodeServerOptions) {
+    public init(options: NodeServerOptions, connect: (host: String, port: Int)? = nil) {
         self.options = options
         self.layout = BraidLayout(root: URL(fileURLWithPath: options.root)).node(options.name)
+        self.connect = connect
     }
 
     /// Serves until shutdown or end of input; returns the exit status.
@@ -133,9 +136,11 @@ public final class NodeServer: @unchecked Sendable {
 
     private func redirect() throws {
         try FileManager.default.createDirectory(at: layout.logs, withIntermediateDirectories: true)
-        let copy = dup(STDOUT_FILENO)
-        guard copy >= 0 else { throw BraidSessionError.io("cannot duplicate standard output") }
-        wire = FileHandle(fileDescriptor: copy, closeOnDealloc: true)
+        if connect == nil {
+            let copy = dup(STDOUT_FILENO)
+            guard copy >= 0 else { throw BraidSessionError.io("cannot duplicate standard output") }
+            wire = FileHandle(fileDescriptor: copy, closeOnDealloc: true)
+        }
         let fd = open(layout.nodeLog.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
         guard fd >= 0 else { throw BraidSessionError.io("cannot open \(layout.nodeLog.path)") }
         fflush(stdout)
@@ -158,8 +163,8 @@ public final class NodeServer: @unchecked Sendable {
         do {
             try wire?.write(contentsOf: data)
         } catch {
-            // The umbrella is gone.
-            shutdown()
+            // The umbrella is gone: a child exits; a node that dialled in waits to dial again.
+            if connect == nil { shutdown() } else { wire = nil }
         }
     }
 
@@ -181,7 +186,53 @@ public final class NodeServer: @unchecked Sendable {
     // MARK: - Reading
 
     private func readLoop() {
-        let input = FileHandle.standardInput
+        guard let connect else {
+            read(FileHandle.standardInput)
+            log("end of input: the umbrella is gone")
+            shutdown()
+            return
+        }
+        // Started by a hosting umbrella on this machine, whose pipe is its standard input: when that
+        // process is gone, so is the node. Started any other way, it outlives the umbrella.
+        var status = stat()
+        if fstat(STDIN_FILENO, &status) == 0, status.st_mode & S_IFMT == S_IFIFO {
+            let watcher = Thread { [weak self] in
+                while !FileHandle.standardInput.availableData.isEmpty {}
+                self?.log("the umbrella that started this node is gone")
+                self?.shutdown()
+            }
+            watcher.name = "raolm.node.parent"
+            watcher.start()
+        }
+        // Dialled in: the umbrella can go and come back; the node keeps its versions and dials again.
+        var delay: UInt32 = 1
+        while !isStopping {
+            guard let fd = BraidListener.dial(host: connect.host, port: connect.port) else {
+                log("cannot reach the umbrella at \(connect.host):\(connect.port); dialling again in \(delay) s")
+                sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            }
+            delay = 1
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            wireLock.withLock { wire = handle }
+            send(.announce(name: options.name, pid: getpid()))
+            log("connected to the umbrella at \(connect.host):\(connect.port)")
+            read(handle)
+            wireLock.withLock { wire = nil }
+            // Its generations are over: their sessions go.
+            accept(NodeRequest(id: -1, op: .close(session: "*")))
+            if !isStopping { log("the umbrella closed the connection; dialling again") }
+        }
+    }
+
+    private var isStopping: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return stopping
+    }
+
+    private func read(_ input: FileHandle) {
         let splitter = LineSplitter()
         while true {
             let data = input.availableData
@@ -194,8 +245,6 @@ public final class NodeServer: @unchecked Sendable {
                 accept(request)
             }
         }
-        log("end of input: the umbrella is gone")
-        shutdown()
     }
 
     private func accept(_ request: NodeRequest) {
@@ -206,6 +255,8 @@ public final class NodeServer: @unchecked Sendable {
         case .shutdown:
             reply(request.id, .ok)
             shutdown()
+        case .ping:
+            reply(request.id, .ok)
         case .sync:
             condition.lock()
             syncRequested = true
@@ -260,6 +311,12 @@ public final class NodeServer: @unchecked Sendable {
                     log("update failed: \(error)")
                 }
             }
+            // Training leaves its buffers in MLX's cache; an idle node gives them back, so a braid of
+            // many Threads fits (phase 5: idle nodes held 7.5–8 GB each before this).
+            let memory = Memory.snapshot()
+            Memory.clearCache()
+            log(String(format: "memory after the update: %.2f GB active, %.2f GB cached (released), peak %.2f GB",
+                       Double(memory.activeMemory) / 1e9, Double(memory.cacheMemory) / 1e9, Double(memory.peakMemory) / 1e9))
         }
         shutdownAndFinish()
     }
@@ -372,10 +429,17 @@ public final class NodeServer: @unchecked Sendable {
                 guard let strand = sessions[session] else { throw StrandError.noSession(session) }
                 let states = try strand.states(session: session, positions: positions)
                 reply(request.id, .states(last: states.last.map(PackedFloats.init), cut: states.cut.map(PackedFloats.init)))
+            case .close(let session) where session == "*":
+                for (name, strand) in sessions { strand.close(session: name) }
+                sessions.removeAll()
             case .close(let session):
                 sessions.removeValue(forKey: session)?.close(session: session)
                 reply(request.id, .ok)
-            case .sync, .cancel, .shutdown:
+            case .context(let stem, let subject, let k, let floor):
+                guard let strand = hypervisor.live else { throw StrandError.notLive(options.name) }
+                let range = subject.flatMap { $0.count == 2 && $0[0] <= $0[1] ? $0[0]..<$0[1] : nil }
+                reply(request.id, .context(try strand.context(for: stem, subject: range, k: k, floor: floor)))
+            case .sync, .cancel, .shutdown, .ping:
                 reply(request.id, .ok)
             }
         } catch {

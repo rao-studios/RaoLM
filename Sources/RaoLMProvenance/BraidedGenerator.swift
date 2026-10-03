@@ -25,6 +25,11 @@ import MLX
 import RaoLMCore
 import RaoLMModel
 
+/// How a routed request picks its Threads (Docs/ARCHITECTURE.md, "Step 1" and "Step 1 v3").
+public enum BraidRouterKind: String, Codable, Sendable, CaseIterable {
+    case bigram, profile
+}
+
 public struct BraidRequest: Sendable {
     public var promptTokens: [Int]
     public var promptText: String
@@ -47,12 +52,16 @@ public struct BraidRequest: Sendable {
     public var contextFloor: Float
     /// The prompt positions that name the subject (the question's capitalised words); the whole prompt when nil.
     public var subject: Range<Int>?
+    /// Open only the Threads the router picks for this prompt, with the commons.
+    public var routing: Bool
+    /// Which router picks them: the phase 5 bigram sketches, or the knowledge profiles.
+    public var router: BraidRouterKind
 
     public init(
         promptTokens: [Int], promptText: String, promptSource: SourceAddress? = nil, params: GenerationParameters,
         gateFloor: Float = BraidMixer.defaultGateFloor, gating: BraidGating = BraidRequest.defaultGating, gate: BraidGate = BraidRequest.defaultGate,
         stopAtSentenceEnd: Bool = false, question: QuestionRewrite? = nil, context: Bool = false, contextFloor: Float = 0.6,
-        subject: Range<Int>? = nil
+        subject: Range<Int>? = nil, routing: Bool = false, router: BraidRouterKind = .bigram
     ) {
         self.promptTokens = promptTokens
         self.promptText = promptText
@@ -66,6 +75,8 @@ public struct BraidRequest: Sendable {
         self.context = context
         self.contextFloor = contextFloor
         self.subject = subject
+        self.routing = routing
+        self.router = router
     }
 
     /// How Threads are weighed when a request does not say. The gate bench's rule kept the
@@ -95,10 +106,12 @@ public enum BraidError: Error, CustomStringConvertible {
     case vocabulary(strand: String, found: String, expected: String)
     case hiddenSize(strand: String, found: Int, expected: Int)
     case pack(strand: String, found: String?, expected: String?)
+    case noCommons
 
     public var description: String {
         switch self {
         case .noStrands: return "no Thread node has a live version yet"
+        case .noCommons: return "routing by profile needs the commons strand (a pack with a base model)"
         case .vocabulary(let strand, let found, let expected):
             return "\(strand) embeds with vocabulary \(found.prefix(12))…, the umbrella's head is \(expected.prefix(12))…"
         case .hiddenSize(let strand, let found, let expected):
@@ -172,6 +185,31 @@ public final class BraidedGenerator {
 
     public var names: [String] { braid.strands.map(\.name) }
 
+    /// What routing reads: every Thread's sketch, unpacked once.
+    public private(set) lazy var router = StrandRouter(descriptors: links.map(\.descriptor))
+    /// The knowledge profiles' router, and the commons model that reads a prompt for it.
+    public private(set) lazy var profileRouter = ProfileRouter(descriptors: links.map(\.descriptor))
+    public var queryModel: RaoTransformer? { commons.flatMap { links[$0] as? CommonsLink }?.model }
+    private var routedGenerators: [[Bool]: BraidedGenerator] = [:]
+
+    /// The profile route for a prompt, as a generation would take it.
+    public func profileRoute(_ prompt: [Int]) throws -> ProfileRoute {
+        guard let model = queryModel else { throw BraidError.noCommons }
+        return profileRouter.route(query: ThreadProfile.query(model: model, prompt: prompt))
+    }
+
+    /// The braid of the candidate links, built once per set of candidates.
+    func routed(_ candidates: [Bool]) throws -> BraidedGenerator {
+        if let generator = routedGenerators[candidates] { return generator }
+        if routedGenerators.count >= 64 { routedGenerators.removeAll() }
+        let generator = try BraidedGenerator(
+            links: links.indices.filter { candidates[$0] }.map { links[$0] }, head: head, tokenizer: tokenizer, gateFloor: braid.gateFloor,
+            packSHA256: braid.packSHA256)
+        generator.timeout = timeout
+        routedGenerators[candidates] = generator
+        return generator
+    }
+
     /// Strand t's own kNN-LM at one position, under its own τ and λ.
     func expert(_ t: Int, hits: [StrandHit], logits: [Float]?, params: GenerationParameters) -> BraidMixer.Expert {
         BraidMixer.Expert(hits: hits, tau: taus[t] ?? params.tau, logits: logits, lambdaScale: lambdaScales[t])
@@ -228,6 +266,18 @@ public final class BraidedGenerator {
     public func generate(
         _ request: BraidRequest, onPrompt: (([TokenTrace]) throws -> Void)? = nil, onStep: ((BraidStep) throws -> Void)? = nil
     ) throws -> CitedGeneration {
+        if request.routing {
+            // A braid of the candidates alone: the rest are not opened, advanced or asked.
+            var plain = request
+            plain.routing = false
+            let candidates: [Bool]
+            switch request.router {
+            case .bigram: candidates = router.route(request.promptTokens).candidates
+            case .profile: candidates = try profileRoute(request.promptTokens).candidates
+            }
+            guard candidates.contains(false) else { return try generate(plain, onPrompt: onPrompt, onStep: onStep) }
+            return try routed(candidates).generate(plain, onPrompt: onPrompt, onStep: onStep)
+        }
         switch request.gating {
         case .braided: return try generateByGate(request, onPrompt: onPrompt, onStep: onStep)
         case .posterior: return try generateByPosterior(request, onPrompt: onPrompt, onStep: onStep)

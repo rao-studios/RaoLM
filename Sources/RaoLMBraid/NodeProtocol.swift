@@ -3,8 +3,10 @@
 //  RaoLMBraid
 //
 //  WHAT: How the umbrella and a node process talk: one JSON object per line over the node's
-//        standard input and output. The umbrella sends numbered requests; the node answers
-//        each by number and also sends events (its state, log lines, promotions) at any time.
+//        standard input and output, or over a TCP connection the node opened to a hosting
+//        umbrella (`raolm node serve --connect`), whose first line announces the node. The
+//        umbrella sends numbered requests; the node answers each by number and also sends events
+//        (its state, log lines, promotions) at any time.
 //  PIN:  Only retrieval hits, the node's trajectory through its corpus (a few numbers a
 //        position) and hidden states cross for generation — never weights, logits or corpus
 //        text. A cut state (what the umbrella reads of a node's thought) travels only beside the
@@ -13,6 +15,7 @@
 
 import Foundation
 import RaoLMCore
+import RaoLMProvenance
 
 public struct NodeRequest: Codable, Sendable {
     public var id: Int
@@ -34,11 +37,16 @@ public struct NodeRequest: Codable, Sendable {
         /// Stop the running update at its next step.
         case cancel
         case shutdown
+        /// Is the node there? Answered at once, between anything else (a hosting umbrella's heartbeat).
+        case ping
+        /// The sentence the node's own index recognises the stem in, before a question's stem
+        /// (`ThreadStrand.context`): what a question asks of a node in another process.
+        case context(stem: [Int], subject: [Int]?, k: Int, floor: Float)
 
         /// Answered from the live version between training steps rather than queued behind an update.
         public var isServing: Bool {
             switch self {
-            case .describe, .probe, .open, .advance, .hidden, .states, .close: return true
+            case .describe, .probe, .open, .advance, .hidden, .states, .close, .context: return true
             default: return false
             }
         }
@@ -76,12 +84,15 @@ public enum NodeReply: Codable, Sendable {
     case hidden([PackedFloats])
     case states(last: [PackedFloats], cut: [PackedFloats])
     case ok
+    case context(StrandContext?)
 }
 
 public enum NodeOutput: Codable, Sendable {
     case reply(id: Int, reply: NodeReply)
     case failure(id: Int, message: String, code: Int32)
     case event(NodeEvent)
+    /// The first line a node sends over a connection it opened: which node it is.
+    case announce(name: String, pid: Int32)
 }
 
 /// Encodes and decodes one message per line.

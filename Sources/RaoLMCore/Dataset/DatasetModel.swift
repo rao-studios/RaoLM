@@ -2,9 +2,10 @@
 //  DatasetModel.swift
 //  RaoLMCore
 //
-//  WHAT: The records of a braid dataset: three Threads' corpora written in three voices
-//        (Ambient's readings, Craft's work, Veil's archive), the links where one Thread's
-//        entity is retold in another's words, and what each document simulates about its origin.
+//  WHAT: The records of a braid dataset: N Threads' corpora, each written by a persona of its own
+//        (the first three are Ambient's readings, Craft's work and Veil's archive) about the
+//        entities of one of three worlds, the links where one Thread's entity is retold in
+//        another's words, and what each document simulates about its origin.
 //  PIN:  Every document is synthetic. `simulatedOrigin` borrows Rao Verified's vocabulary so
 //        an attestation test can be written against it, but no document carries a Rao Verified
 //        record or a seal: nothing here claims a person read, wrote or said anything.
@@ -24,20 +25,63 @@ public enum DatasetVoice: String, Codable, Sendable, CaseIterable {
     public var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
 }
 
-/// What a document is about. Each type belongs to one voice's world and states three facts.
+/// The worlds a dataset's entities come from. The three founding worlds were the founding voices'
+/// homes; a dataset of N Threads gives each to every third Thread. The three subject worlds
+/// (`--worlds`) each give one Thread one subject: writing, coding and mathematics, biology.
+public enum DatasetWorld: String, Codable, Sendable, CaseIterable {
+    /// Towns, researchers and festivals.
+    case reading
+    /// Libraries, services and incidents.
+    case software
+    /// Artworks, artists and collections.
+    case art
+    /// Novels, writers and literary journals.
+    case writing
+    /// Programming languages, algorithms and theorems.
+    case coding
+    /// Species, proteins and field stations.
+    case biology
+
+    /// The founding voice whose world this was, or whose node holds the subject.
+    public var legacy: DatasetVoice {
+        switch self {
+        case .reading, .writing: return .ambient
+        case .software, .coding: return .craft
+        case .art, .biology: return .veil
+        }
+    }
+
+    /// One of the subject worlds.
+    public var subject: Bool { Self.subjects.contains(self) }
+
+    public static let founding: [DatasetWorld] = [.reading, .software, .art]
+    public static let subjects: [DatasetWorld] = [.writing, .coding, .biology]
+
+    public var types: [DatasetEntityType] { DatasetEntityType.allCases.filter { $0.world == self } }
+}
+
+/// What a document is about. Each type belongs to one world and states three facts.
 public enum DatasetEntityType: String, Codable, Sendable, CaseIterable {
     case town, researcher, festival
     case library, service, incident
     case artwork, artist, collection
+    case novel, writer, journal
+    case language, algorithm, theorem
+    case species, protein, station
 
-    /// The Thread whose own documents describe entities of this type.
-    public var home: DatasetVoice {
+    public var world: DatasetWorld {
         switch self {
-        case .town, .researcher, .festival: return .ambient
-        case .library, .service, .incident: return .craft
-        case .artwork, .artist, .collection: return .veil
+        case .town, .researcher, .festival: return .reading
+        case .library, .service, .incident: return .software
+        case .artwork, .artist, .collection: return .art
+        case .novel, .writer, .journal: return .writing
+        case .language, .algorithm, .theorem: return .coding
+        case .species, .protein, .station: return .biology
         }
     }
+
+    /// The founding voice whose own documents describe entities of this type.
+    public var home: DatasetVoice { world.legacy }
 
     public var facts: [FactKind] {
         switch self {
@@ -50,10 +94,20 @@ public enum DatasetEntityType: String, Codable, Sendable, CaseIterable {
         case .artwork: return [.artworkArtist, .artworkYear, .artworkWidth]
         case .artist: return [.artistBorn, .artistStudio, .artistTeacher]
         case .collection: return [.collectionOpened, .collectionWorks, .collectionCurator]
+        case .novel: return [.novelAuthor, .novelPublished, .novelPages]
+        case .writer: return [.writerBorn, .writerDebut, .writerAgent]
+        case .journal: return [.journalFounded, .journalEditor, .journalCirculation]
+        case .language: return [.languageDesigner, .languageReleased, .languageVersion]
+        case .algorithm: return [.algorithmInventor, .algorithmYear, .algorithmLines]
+        case .theorem: return [.theoremProver, .theoremYear, .theoremPages]
+        case .species: return [.speciesDescribed, .speciesNamer, .speciesWeight]
+        case .protein: return [.proteinResidues, .proteinDiscovered, .proteinGene]
+        case .station: return [.stationEstablished, .stationDirector, .stationSpecimens]
         }
     }
 
-    public static func types(of voice: DatasetVoice) -> [DatasetEntityType] { allCases.filter { $0.home == voice } }
+    /// The founding voice's own types (its founding world's).
+    public static func types(of voice: DatasetVoice) -> [DatasetEntityType] { allCases.filter { $0.home == voice && !$0.world.subject } }
 }
 
 /// Where a document's words would have come from, in Rao Verified's vocabulary. Simulated.
@@ -172,16 +226,27 @@ public struct DatasetSpec: Codable, Sendable, Equatable {
     public var seed: UInt64
     /// Home documents per entity type (three types per Thread).
     public var perType: Int
-    /// Per ordered pair of Threads, how many entities cross in each way.
+    /// Per ordered pair of peers, how many entities cross in each way.
     public var paraphrase: Int
     public var excerpt: Int
     public var summary: Int
     public var variant: Int
-    /// Per ordered pair whose entity types can share a name (ambient ↔ craft, ambient ↔ veil).
+    /// Per ordered pair of peers whose entity types can share a name (reading ↔ software, reading ↔ art;
+    /// among the subject worlds' single-word names).
     public var homonym: Int
+    /// How many Threads, each a persona of its own (`DatasetPersonas`); the first three are
+    /// ambient, craft and veil.
+    public var nodes: Int
+    /// Each node retells entities of the next `peers` nodes in the ring; every ordered pair of
+    /// peers crosses `paraphrase`, `excerpt`, … entities. With three nodes and two peers that is
+    /// every ordered pair, as datasets before v3 crossed.
+    public var peers: Int
+    /// The subject worlds, one node each (writing → ambient, coding → craft, biology → veil); nil
+    /// deals the founding worlds round-robin, as before.
+    public var worlds: [DatasetWorld]?
 
     public init(name: String = "braid-cross-v1", seed: UInt64 = 42, perType: Int = 180, paraphrase: Int = 24, excerpt: Int = 20,
-                summary: Int = 24, variant: Int = 8, homonym: Int = 8) {
+                summary: Int = 24, variant: Int = 8, homonym: Int = 8, nodes: Int = 3, peers: Int? = nil, worlds: [DatasetWorld]? = nil) {
         self.name = name
         self.seed = seed
         self.perType = perType
@@ -190,6 +255,39 @@ public struct DatasetSpec: Codable, Sendable, Equatable {
         self.summary = summary
         self.variant = variant
         self.homonym = homonym
+        self.nodes = nodes
+        self.peers = peers ?? Self.defaultPeers(nodes: nodes)
+        self.worlds = worlds
+    }
+
+    /// Every other node up to six: each node then hears from every world.
+    public static func defaultPeers(nodes: Int) -> Int { max(0, min(nodes - 1, 6)) }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, seed, perType, paraphrase, excerpt, summary, variant, homonym, nodes, peers, worlds
+    }
+
+    /// Manifests written before v3 have no `nodes` or `peers`: three nodes, two peers.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        seed = try c.decode(UInt64.self, forKey: .seed)
+        perType = try c.decode(Int.self, forKey: .perType)
+        paraphrase = try c.decode(Int.self, forKey: .paraphrase)
+        excerpt = try c.decode(Int.self, forKey: .excerpt)
+        summary = try c.decode(Int.self, forKey: .summary)
+        variant = try c.decode(Int.self, forKey: .variant)
+        homonym = try c.decode(Int.self, forKey: .homonym)
+        nodes = try c.decodeIfPresent(Int.self, forKey: .nodes) ?? 3
+        peers = try c.decodeIfPresent(Int.self, forKey: .peers) ?? Self.defaultPeers(nodes: nodes)
+        worlds = try c.decodeIfPresent([DatasetWorld].self, forKey: .worlds)
+    }
+
+    /// Whether node `j` retells entities of node `i` (j is one of i's next `peers` in the ring).
+    public func isPeer(_ i: Int, _ j: Int) -> Bool {
+        guard i != j, nodes > 1, peers > 0 else { return false }
+        let offset = ((j - i) % nodes + nodes) % nodes
+        return (1...peers).contains(offset)
     }
 
     public func count(_ kind: CrossKind) -> Int {
@@ -216,6 +314,10 @@ public struct DatasetNodeSummary: Codable, Sendable, Equatable {
     public var corpusHash: String
     /// Documents per simulated origin.
     public var origins: [String: Int]
+    /// The node's persona and world, and how a panel labels it (v3; nil before).
+    public var persona: String? = nil
+    public var world: String? = nil
+    public var label: String? = nil
 }
 
 public struct DatasetManifest: Codable, Sendable, Equatable {

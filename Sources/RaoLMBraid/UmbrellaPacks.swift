@@ -173,7 +173,11 @@ public enum UmbrellaPacks {
         var config = try JSONCoding.read(RaoLMConfig.self, from: folder.appendingPathComponent(Checkpoint.configFile))
         config.cut = source.cut
         try config.validate()
-        guard config.tieWordEmbeddings else { throw UmbrellaPackError.shape("the base model's head is not tied to its embedding") }
+        // By design (Docs/ARCHITECTURE.md, "The tied head stays"): the umbrella reads every strand out
+        // through the embedding itself, so a commons must tie its head.
+        guard config.tieWordEmbeddings else {
+            throw UmbrellaPackError.shape("the base model's head is not tied to its embedding; the umbrella's readout is the embedding, so a commons must tie (SmolLM2, Llama 3.2 1B/3B, Qwen2.5 ≤ 3B, Gemma do)")
+        }
         progress?("loading the base model (\(config.numHiddenLayers) × \(config.hiddenSize), cut at \(config.cut))")
         let model = RaoTransformer(config)
         try Checkpoint.loadWeights(into: model, from: folder)

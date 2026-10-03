@@ -313,7 +313,7 @@ public enum QuestionBench {
                 }) { result.citedAnswer += 1 }
             }
             for trace in answer {
-                if let top = trace.neighbours.first, let partition = generator.partitionsByRow[top.cited.row] {
+                if let top = trace.neighbours.first, let partition = generation.partition(row: top.cited.row) {
                     cited.append(partition.documentID == question.source.documentID && partition.partitionIndex == question.source.partitionIndex)
                 }
             }

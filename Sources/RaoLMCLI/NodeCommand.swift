@@ -20,10 +20,14 @@ struct NodeGroup: AsyncParsableCommand {
     )
 
     struct Serve: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Serve one Thread node over standard input and output.")
+        static let configuration = CommandConfiguration(
+            abstract: "Serve one Thread node over standard input and output, or to a hosting umbrella it dials (--connect).")
 
         @Option(help: "serve.json written by the braid.")
         var options: String
+
+        @Option(help: "host:port of a hosting umbrella (raolm braid … --listen) to dial instead of the parent's pipes; the node dials again if it goes.")
+        var connect: String?
 
         func run() async throws {
             let options: NodeServerOptions
@@ -35,7 +39,15 @@ struct NodeGroup: AsyncParsableCommand {
                 Console.error("raolm node: \(failure.message)")
                 throw ExitCode(failure.code)
             }
-            let server = NodeServer(options: options)
+            var target: (host: String, port: Int)?
+            if let connect {
+                guard let colon = connect.lastIndex(of: ":"), let port = Int(connect[connect.index(after: colon)...]) else {
+                    Console.error("raolm node: --connect takes host:port")
+                    throw ExitCode(64)
+                }
+                target = (String(connect[..<colon]), port)
+            }
+            let server = NodeServer(options: options, connect: target)
             let code = await Task.detached { server.run() }.value
             if code != 0 { throw ExitCode(code) }
         }

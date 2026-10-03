@@ -110,6 +110,58 @@ extension BraidMLXSuites {
                                                                         packSHA256: other.sha256) }
         }
 
+        @Test("every version writes its knowledge profile beside its index, and a profile-routed generation runs on the route computed beforehand")
+        func profile() async throws {
+            var rig = try await Rig(names: ["ambient", "craft"], documentsPerNode: 6, seed: 7)
+            defer { rig.cleanUp() }
+            rig.settings.scratchSteps = 64
+            rig.settings.memorisedFloor = 0
+            let pack = try rig.pack()
+            var nodes: [ThreadHypervisor] = []
+            for name in ["ambient", "craft"] {
+                _ = try await rig.feed(name, 3)
+                let node = try rig.hypervisor(name, pack: pack)
+                #expect(try node.sync() == [1])
+                nodes.append(node)
+            }
+            let live = try #require(nodes[0].live)
+            let directory = RunLayout.provenance(live.context.runDirectory, epoch: live.context.epoch)
+            #expect(FileManager.default.fileExists(atPath: directory.appendingPathComponent(ThreadProfileFiles.arrays).path))
+            let profile = try #require(live.profile())
+            #expect(profile.hidden == Rig.config.hiddenSize && profile.k >= 1 && profile.k <= ProfileSettings.k)
+            #expect(profile.info.entries == live.index.count && profile.info.weighted > 0)
+            #expect(profile.info.indexSHA256 == live.index.sha256 && profile.info.commonsPackSHA256 == pack.sha256)
+            #expect(try #require(nodes[0].descriptor()).profile?.count == profile.k * profile.hidden)
+            // The same corpus, the same commons: the same centroids.
+            let again = try #require(try ThreadProfile.compute(
+                commons: try pack.baseModel(), index: live.index, corpus: try live.context.tokenizedCorpus(),
+                seqLen: live.context.manifest.hyperparameters.seqLen, packSHA256: pack.sha256, epoch: live.context.epoch))
+            #expect(again.k == profile.k && zip(again.centroids, profile.centroids).allSatisfy { abs($0 - $1) < 1e-3 })
+
+            let umbrella = try BraidUmbrella(pack: pack, tokenizer: rig.tokenizer)
+            let links = nodes.compactMap(\.live).map { LocalStrandLink(strand: $0, vocabularySHA256: pack.vocabulary.sha256, packSHA256: pack.sha256) }
+            let generator = try umbrella.generator(links: links)
+            #expect(generator.profileRouter.profiled == 2)
+            var params = links[0].strand.context.defaultParameters()
+            params.maxTokens = 6
+            for example in rig.examples(nodes).filter({ $0.resolvedKind == .fact }).prefix(3) {
+                let route = try generator.profileRoute(example.promptTokens)
+                #expect(route.candidates.last == true, "the commons always opens")
+                let request = BraidRequest(promptTokens: example.promptTokens, promptText: example.promptText, params: params, routing: true,
+                                           router: .profile)
+                let routed = try generator.generate(request)
+                #expect(routed.braid?.strands.map(\.name) == route.indices.map { generator.names[$0] })
+                var plain = request
+                plain.routing = false
+                let direct = try BraidedGenerator(links: route.indices.map { generator.links[$0] }, head: generator.head, tokenizer: rig.tokenizer,
+                                                  packSHA256: pack.sha256).generate(plain)
+                #expect(routed.tokens == direct.tokens)
+                for (a, b) in zip(routed.traces, direct.traces) {
+                    #expect(zip(a.strands ?? [], b.strands ?? []).allSatisfy { $0.strand == $1.strand && abs($0.share - $1.share) < 1e-6 })
+                }
+            }
+        }
+
         @Test("a braid of one Thread with its own λ and τ reproduces CitedGenerator number for number")
         func calibrated() async throws {
             var rig = try await Rig(names: ["solo"], documentsPerNode: 3, seed: 11)

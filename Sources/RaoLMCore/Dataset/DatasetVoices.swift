@@ -223,6 +223,33 @@ enum DatasetVoices {
         .collectionOpened: ["The year {s} opened is", "{S} began receiving visitors in the year"],
         .collectionWorks: ["The number of works held by {s} is", "Counting every object, {s} holds a total of"],
         .collectionCurator: ["The person who curates {s} is", "Responsibility for the works in {s} rests with"],
+        .novelAuthor: ["The writer responsible for the novel {s} is", "{S} was composed by the novelist"],
+        .novelPublished: ["The year of publication of {s} is", "{S} reached bookshops in the year"],
+        .novelPages: ["The number of pages in {s} is", "Counting every page, {s} comes to"],
+        .writerBorn: ["The year the novelist {s} was born is", "{S} first saw daylight in"],
+        .writerDebut: ["The title of the first novel written by {s} is", "{S} made a debut with the novel"],
+        .writerAgent: ["The agent who represents the writer {s} is", "Representation for {s} is handled by"],
+        .journalFounded: ["The year {s} was founded as a journal is", "{S} began publication in the year"],
+        .journalEditor: ["The person who edits {s} is", "Editorial charge of {s} rests with"],
+        .journalCirculation: ["The number of copies {s} circulates is", "Counting every subscriber, {s} reaches"],
+        .languageDesigner: ["The person who designed the language {s} is", "Design of {s} is credited to"],
+        .languageReleased: ["The date of the first release of {s} is", "{S} made its first public release in"],
+        .languageVersion: ["The version number of the newest release of {s} is", "{S} was most recently released as version"],
+        .algorithmInventor: ["The person credited with devising {s} is", "Invention of {s} is attributed to"],
+        .algorithmYear: ["The year {s} was first set down in print is", "{S} entered the literature in the year"],
+        .algorithmLines: ["The number of lines in the reference implementation of {s} is", "Counting every line, the reference code of {s} comes to"],
+        .theoremProver: ["The mathematician credited with proving {s} is", "The proof of {s} is credited to"],
+        .theoremYear: ["The year in which {s} was proved is", "{S} received its proof in the year"],
+        .theoremPages: ["The number of pages in the proof of {s} is", "Counting every page, the proof of {s} runs to"],
+        .speciesDescribed: ["The year of the first description of {s} is", "{S} was described to science in the year"],
+        .speciesNamer: ["The person who named {s} is", "Naming of {s} is credited to"],
+        .speciesWeight: ["The weight in grams of {s} is", "In grams, {s} weighs about"],
+        .proteinResidues: ["The number of residues in {s} is", "Counting every residue, {s} comes to"],
+        .proteinDiscovered: ["The year {s} was isolated is", "{S} was first obtained in the year"],
+        .proteinGene: ["The gene symbol for {s} is", "{S} is transcribed from the gene"],
+        .stationEstablished: ["The year {s} was set up is", "{S} opened for research in the year"],
+        .stationDirector: ["The person who directs {s} is", "Direction of {s} rests with"],
+        .stationSpecimens: ["The number of specimens held at {s} is", "Counting every specimen, {s} keeps"],
     ]
 
     /// Natural questions about each fact kind, three or more and worded differently, for the
@@ -255,6 +282,37 @@ enum DatasetVoices {
         .collectionOpened: ["When did {s} open?", "In what year did {s} open to the public?", "What year was {s} established?"],
         .collectionWorks: ["How many works does {s} hold?", "How many objects are in {s}?", "What is the size of {s}?"],
         .collectionCurator: ["Who is the curator of {s}?", "Who curates {s}?", "Which person looks after {s}?"],
+        .novelAuthor: ["Who is the novelist behind {s}?", "Whose novel is {s}?", "Which writer is {s} by?"],
+        .novelPublished: ["When was {s} published?", "In what year did {s} come out?", "What year saw the publication of {s}?"],
+        .novelPages: ["How many pages does {s} have?", "How long is {s} in pages?", "What is the page count of {s}?"],
+        .writerBorn: ["Which year was {s} born in?", "When was the novelist {s} born?", "What is the year of birth of {s}?"],
+        .writerDebut: ["What was the debut novel of {s}?", "Which novel did {s} publish first?", "What is the title of the first novel by {s}?"],
+        .writerAgent: ["Who is the literary agent of {s}?", "Which agent represents {s}?", "Who represents {s} as an agent?"],
+        .journalFounded: ["When did {s} print its first issue?", "In what year did {s} first appear?", "Since what year has {s} been published?"],
+        .journalEditor: ["Who edits {s}?", "Who is the editor of {s}?", "Which person holds the editorship of {s}?"],
+        .journalCirculation: ["What is the circulation of {s}?", "How many copies does {s} print?", "How large is the print run of {s}?"],
+        .languageDesigner: ["Who designed {s}?", "Who is the designer of {s}?", "Which person designed the language {s}?"],
+        .languageReleased: ["When was {s} first released?", "When did the first release of {s} come out?",
+                            "In what month and year was {s} first released?"],
+        .languageVersion: ["What is the latest version of {s}?", "Which version of {s} is the newest?",
+                           "What version number does the current release of {s} carry?"],
+        .algorithmInventor: ["Who devised {s}?", "Who is the inventor of {s}?", "Which person came up with {s}?"],
+        .algorithmYear: ["When was {s} first published?", "In what year did the paper on {s} appear?", "What year does {s} date from?"],
+        .algorithmLines: ["How many lines is the reference implementation of {s}?", "How long is the reference code for {s}?",
+                          "What is the line count of {s}?"],
+        .theoremProver: ["Who proved {s}?", "Whose proof established {s}?", "Which mathematician proved {s}?"],
+        .theoremYear: ["When was {s} proved?", "In what year was {s} proved?", "What year was the proof of {s} published?"],
+        .theoremPages: ["How many pages does the proof of {s} take up?", "How long is the published proof of {s}?",
+                        "Over how many pages is {s} proved?"],
+        .speciesDescribed: ["When was {s} first described?", "In what year was {s} first described?", "What year was {s} added to the record?"],
+        .speciesNamer: ["Who named {s}?", "Which naturalist named {s}?", "Who gave {s} its name?"],
+        .speciesWeight: ["How much does {s} weigh?", "What is the body mass of {s}?", "How many grams do adults of {s} weigh?"],
+        .proteinResidues: ["How many residues does {s} have?", "How long is the sequence of {s}?", "What is the residue count of {s}?"],
+        .proteinDiscovered: ["When was {s} isolated?", "In what year was {s} first purified?", "What year was {s} isolated?"],
+        .proteinGene: ["Which gene encodes {s}?", "What is the gene for {s}?", "What gene is {s} the product of?"],
+        .stationEstablished: ["When was {s} set up?", "In what year did work at {s} begin?", "Since what year has {s} been running?"],
+        .stationDirector: ["Who is the director of {s}?", "Who directs {s}?", "Which person runs {s} as director?"],
+        .stationSpecimens: ["How many specimens does {s} hold?", "How large is the specimen collection at {s}?", "What is the specimen count of {s}?"],
     ]
 
     /// The corpus-style stem each kind's questions rewrite to: the shortest phrase the home
@@ -271,6 +329,16 @@ enum DatasetVoices {
         .artworkArtist: "{S} is attributed to", .artworkYear: "{S} is dated", .artworkWidth: "The width of {s} is",
         .artistBorn: "{S} was born in", .artistStudio: "{S} kept a studio in", .artistTeacher: "{S} trained under",
         .collectionOpened: "{S} opened to the public in", .collectionWorks: "{S} holds", .collectionCurator: "The curator of {s} is",
+        .novelAuthor: "{S} is a novel by", .novelPublished: "{S} was published in", .novelPages: "{S} runs to",
+        .writerBorn: "The novelist {s} was born in", .writerDebut: "The debut novel of {s} was", .writerAgent: "{S} is represented by the agent",
+        .journalFounded: "{S} printed its first issue in", .journalEditor: "The editor of {s} is", .journalCirculation: "{S} has a circulation of about",
+        .languageDesigner: "{S} was designed by", .languageReleased: "{S} was first released in", .languageVersion: "The latest version of {s} is",
+        .algorithmInventor: "{S} was devised by", .algorithmYear: "{S} was first published in",
+        .algorithmLines: "The reference implementation of {s} runs to",
+        .theoremProver: "{S} was proved by", .theoremYear: "{S} was proved in", .theoremPages: "The proof of {s} fills",
+        .speciesDescribed: "{S} was first described in", .speciesNamer: "{S} was named by", .speciesWeight: "Adults of {s} weigh about",
+        .proteinResidues: "{S} is a chain of", .proteinDiscovered: "{S} was isolated in", .proteinGene: "{S} is encoded by the gene",
+        .stationEstablished: "{S} was set up in", .stationDirector: "The director of {s} is", .stationSpecimens: "The collection at {s} numbers",
     ]
 
     /// The document kinds a voice writes about an entity of each type.
@@ -301,6 +369,10 @@ enum DatasetVoices {
         case .release: return .imported
         case .catalogue, .caption: return .imported
         case .attribution: return .system
+        case .minutes, .notes, .journal, .letter, .runbook, .ticket, .decision, .audit, .report, .script, .ledger: return .written
+        case .transcript, .standup: return .spoken
+        case .changelog: return .generated
+        case .newsletter, .column, .guide, .lot, .schedule, .announcement: return .imported
         default: return .imported
         }
     }
@@ -539,4 +611,202 @@ enum DatasetVoices {
 
     /// Words a quotation slips in after its first auxiliary verb, so it is not the source verbatim.
     static let hedges = ["reportedly", "apparently", "originally", "by most accounts"]
+
+    // MARK: - Composed personas (v3)
+
+    /// Per fact kind, three ways every composed persona can state it mid-sentence. Core 0 is the
+    /// end of the kind's stem, so a question's stem meets the corpus's own words; it is weighted
+    /// as two of four.
+    static let cores: [FactKind: [DatasetCore]] = [
+        .townFounded: [DatasetCore("{s} was founded in"), DatasetCore("the founding of {s} dates to"), DatasetCore("{s} was first settled in")],
+        .townPopulation: [DatasetCore("{s} has a population of about", " people"), DatasetCore("the population of {s} stands at"),
+                          DatasetCore("{s} counts roughly", " residents")],
+        .townMayor: [DatasetCore("the current mayor of {s} is"), DatasetCore("{s} is led by its mayor,"),
+                     DatasetCore("the office of mayor in {s} is held by")],
+        .researcherBorn: [DatasetCore("{s} was born in"), DatasetCore("the birth year of {s} is"), DatasetCore("{s} entered the world in")],
+        .researcherMentor: [DatasetCore("{s} trained under"), DatasetCore("the mentor of {s} was"), DatasetCore("{s} was apprenticed to")],
+        .researcherBook: [DatasetCore("the best known book by {s} is"), DatasetCore("{s} is remembered for the book"),
+                          DatasetCore("the book most associated with {s} is")],
+        .festivalFirst: [DatasetCore("{s} was first held in"), DatasetCore("the first edition of {s} was in"), DatasetCore("{s} began in")],
+        .festivalVisitors: [DatasetCore("{s} drew about", " visitors"), DatasetCore("attendance at {s} reached"),
+                            DatasetCore("{s} welcomes some", " visitors a year")],
+        .festivalFounder: [DatasetCore("{s} was founded by"), DatasetCore("the founder of {s} is"), DatasetCore("{s} owes its start to")],
+        .libraryAuthor: [DatasetCore("{s} was written by"), DatasetCore("the author of {s} is"), DatasetCore("{s} was created by")],
+        .libraryVersion: [DatasetCore("we pinned {s} at version"), DatasetCore("{s} is at version"), DatasetCore("the current release of {s} is")],
+        .libraryPort: [DatasetCore("{s} listens on port"), DatasetCore("the default port of {s} is"), DatasetCore("{s} serves on port")],
+        .serviceOwner: [DatasetCore("the on-call owner of {s} is"), DatasetCore("{s} belongs to the team of"),
+                        DatasetCore("the owner of record for {s} is")],
+        .serviceLatency: [DatasetCore("the p99 latency of {s} sits at", " milliseconds"),
+                          DatasetCore("{s} responds within", " milliseconds at the p99"), DatasetCore("tail latency for {s} is about", " milliseconds")],
+        .serviceLaunched: [DatasetCore("{s} went live in"), DatasetCore("{s} first served traffic in"), DatasetCore("the launch of {s} was in")],
+        .incidentMinutes: [DatasetCore("{s} lasted", " minutes"), DatasetCore("recovery from {s} took", " minutes"),
+                           DatasetCore("{s} kept users waiting for", " minutes")],
+        .incidentResponder: [DatasetCore("the first responder on {s} was"), DatasetCore("{s} was picked up by"),
+                             DatasetCore("the engineer paged for {s} was")],
+        .incidentFixVersion: [DatasetCore("{s} was fixed in version"), DatasetCore("the fix for {s} shipped in version"),
+                              DatasetCore("{s} was closed out by release")],
+        .artworkArtist: [DatasetCore("{s} is attributed to"), DatasetCore("{s} is the work of"), DatasetCore("the hand behind {s} is")],
+        .artworkYear: [DatasetCore("{s} is dated"), DatasetCore("{s} was completed in"), DatasetCore("the date of {s} is given as")],
+        .artworkWidth: [DatasetCore("the width of {s} is", " centimetres"), DatasetCore("the canvas of {s} measures", " centimetres across"),
+                        DatasetCore("{s} stretches", " centimetres from edge to edge")],
+        .artistBorn: [DatasetCore("{s} was born in"), DatasetCore("the birth of {s} is recorded in"), DatasetCore("the painter {s} was born in")],
+        .artistStudio: [DatasetCore("{s} kept a studio in"), DatasetCore("{s} painted for years in"), DatasetCore("the workshop of {s} was in")],
+        .artistTeacher: [DatasetCore("{s} trained under"), DatasetCore("{s} studied painting with"), DatasetCore("the master of {s} was")],
+        .collectionOpened: [DatasetCore("{s} opened to the public in"), DatasetCore("{s} has welcomed visitors since"),
+                            DatasetCore("the doors of {s} opened in")],
+        .collectionWorks: [DatasetCore("{s} holds", " works"), DatasetCore("the holdings of {s} number", " works"),
+                           DatasetCore("{s} counts", " objects in all")],
+        .collectionCurator: [DatasetCore("the curator of {s} is"), DatasetCore("{s} is curated by"), DatasetCore("the keeper of {s} is")],
+        // The subject worlds: writing.
+        .novelAuthor: [DatasetCore("{s} is a novel by"), DatasetCore("the novelist behind {s} is"), DatasetCore("{s} came from the pen of")],
+        .novelPublished: [DatasetCore("{s} was published in"), DatasetCore("the first edition of {s} appeared in"),
+                          DatasetCore("{s} first went to print in")],
+        .novelPages: [DatasetCore("{s} runs to", " pages"), DatasetCore("the page count of {s} is"), DatasetCore("{s} fills", " pages")],
+        .writerBorn: [DatasetCore("the novelist {s} was born in"), DatasetCore("{s} was born in the year"), DatasetCore("the birth of {s} came in")],
+        .writerDebut: [DatasetCore("the debut novel of {s} was"), DatasetCore("{s} first published the novel"),
+                       DatasetCore("the first book {s} brought out was")],
+        .writerAgent: [DatasetCore("{s} is represented by the agent"), DatasetCore("the literary agent of {s} is"),
+                       DatasetCore("{s} signed with the agent")],
+        .journalFounded: [DatasetCore("{s} printed its first issue in"), DatasetCore("the first number of {s} came out in"),
+                          DatasetCore("{s} has appeared since")],
+        .journalEditor: [DatasetCore("the editor of {s} is"), DatasetCore("{s} is edited by"), DatasetCore("the editorship of {s} belongs to")],
+        .journalCirculation: [DatasetCore("{s} has a circulation of about", " copies"), DatasetCore("the print run of {s} is", " copies"),
+                              DatasetCore("{s} prints some", " copies an issue")],
+        // Coding and mathematics.
+        .languageDesigner: [DatasetCore("{s} was designed by"), DatasetCore("the designer of {s} is"), DatasetCore("{s} owes its design to")],
+        .languageReleased: [DatasetCore("{s} was first released in"), DatasetCore("the first release of {s} came in"),
+                            DatasetCore("{s} shipped its first version in")],
+        .languageVersion: [DatasetCore("the latest version of {s} is"), DatasetCore("{s} currently ships as version"),
+                           DatasetCore("the newest release of {s} carries the number")],
+        .algorithmInventor: [DatasetCore("{s} was devised by"), DatasetCore("the inventor of {s} is"), DatasetCore("{s} was first worked out by")],
+        .algorithmYear: [DatasetCore("{s} was first published in"), DatasetCore("the paper introducing {s} appeared in"),
+                         DatasetCore("{s} dates from the year")],
+        .algorithmLines: [DatasetCore("the reference implementation of {s} runs to", " lines"),
+                          DatasetCore("{s} takes", " lines in its reference code"), DatasetCore("the canonical code for {s} is", " lines long")],
+        .theoremProver: [DatasetCore("{s} was proved by"), DatasetCore("the proof of {s} is due to"), DatasetCore("{s} was first established by")],
+        .theoremYear: [DatasetCore("{s} was proved in"), DatasetCore("the proof of {s} dates to"), DatasetCore("{s} was settled in the year")],
+        .theoremPages: [DatasetCore("the proof of {s} fills", " pages"), DatasetCore("{s} has a proof of", " pages"),
+                        DatasetCore("the published argument for {s} spans", " pages")],
+        // Biology.
+        .speciesDescribed: [DatasetCore("{s} was first described in"), DatasetCore("the formal description of {s} dates to"),
+                            DatasetCore("{s} entered the record in")],
+        .speciesNamer: [DatasetCore("{s} was named by"), DatasetCore("the naturalist who named {s} was"), DatasetCore("{s} owes its name to")],
+        .speciesWeight: [DatasetCore("adults of {s} weigh about", " grams"), DatasetCore("the body mass of {s} is around", " grams"),
+                         DatasetCore("{s} tips the scales at", " grams")],
+        .proteinResidues: [DatasetCore("{s} is a chain of", " residues"), DatasetCore("the sequence of {s} has", " residues"),
+                           DatasetCore("{s} folds from", " residues")],
+        .proteinDiscovered: [DatasetCore("{s} was isolated in"), DatasetCore("the isolation of {s} dates to"), DatasetCore("{s} was first purified in")],
+        .proteinGene: [DatasetCore("{s} is encoded by the gene"), DatasetCore("the gene for {s} is"), DatasetCore("{s} is the product of the gene")],
+        .stationEstablished: [DatasetCore("{s} was set up in"), DatasetCore("work at {s} began in"), DatasetCore("{s} has been running since")],
+        .stationDirector: [DatasetCore("the director of {s} is"), DatasetCore("{s} is run by its director,"),
+                           DatasetCore("the directorship of {s} is held by")],
+        .stationSpecimens: [DatasetCore("the collection at {s} numbers", " specimens"), DatasetCore("{s} catalogues", " specimens"),
+                            DatasetCore("the specimen drawers of {s} hold", " specimens")],
+    ]
+
+    /// What an entity of each type is, for a composed persona introducing another world's entity.
+    static let typeNouns: [DatasetEntityType: String] = [
+        .town: "a coastal town", .researcher: "a researcher", .festival: "a yearly festival",
+        .library: "a software library", .service: "a web service", .incident: "an outage",
+        .artwork: "a painting", .artist: "a painter", .collection: "a museum collection",
+        .novel: "a novel", .writer: "a novelist", .journal: "a literary journal",
+        .language: "a programming language", .algorithm: "an algorithm", .theorem: "a theorem",
+        .species: "a species", .protein: "a protein", .station: "a field station",
+    ]
+
+    /// Fillers any persona of a world may use, beside its own; six per persona, chosen by its place.
+    static let worldFillers: [DatasetWorld: [String]] = [
+        .reading: ["Someone asked a follow-up question about {s}.", "There was more to say about {s} than time allowed.",
+                   "A photograph of {s} was passed around.", "The notes on {s} were typed up the next day.",
+                   "Opinions about {s} were divided.", "A second source on {s} would help.", "Nobody had heard of {s} a year ago.",
+                   "The date beside {s} was checked twice.", "A friend sent an old clipping about {s}.",
+                   "The details of {s} are easy to mix up.", "Everyone agreed that {s} deserved a closer look.",
+                   "The story of {s} keeps getting retold."],
+        .software: ["The logs for {s} were attached to the thread.", "Someone asked who else depends on {s}.",
+                    "Metrics for {s} looked normal afterwards.", "The wiki page for {s} was out of date.",
+                    "A reviewer left two comments about {s}.", "The change touching {s} went out on a Tuesday.",
+                    "Nobody remembered why {s} was set up this way.", "The test for {s} runs in under a minute.",
+                    "Permissions for {s} were tightened.", "A follow-up about {s} is on the backlog.",
+                    "The configuration of {s} lives in one file.", "The history of {s} is in the commit log."],
+        .art: ["A photograph of {s} is kept in the file.", "The label for {s} was reprinted.", "Visitors often stop in front of {s}.",
+               "A loan request for {s} was received.", "The provenance of {s} is well documented.", "Scholars have written about {s}.",
+               "The record for {s} lists two previous owners.", "A reproduction of {s} hangs in the office.",
+               "The lighting near {s} was adjusted.", "A detail of {s} appears in the brochure.", "The registrar keeps a file on {s}.",
+               "The colours of {s} have faded slightly."],
+        .writing: ["The manuscript pages about {s} were numbered by hand.", "A long essay on {s} is expected next month.",
+                   "The index card for {s} is in the drawer.", "Someone had underlined every mention of {s}.",
+                   "The galley proofs mention {s} twice.", "A letter about {s} arrived from the publisher.",
+                   "The reading group spent an evening on {s}.", "Nobody at the launch could agree about {s}.",
+                   "The bookshop keeps a shelf for {s}.", "The piece on {s} needs one more draft.",
+                   "The archive holds the correspondence about {s}.", "A translation concerning {s} is under discussion."],
+        .coding: ["The notation used for {s} is defined in the appendix.", "A worked example of {s} was added to the docs.",
+                  "The continuous build exercises {s} nightly.", "Two reviewers signed off on the section about {s}.",
+                  "The lemma numbering around {s} was tidied.", "A regression involving {s} was caught before release.",
+                  "The whiteboard sketch of {s} was photographed.", "Someone asked for the complexity of {s} in the thread.",
+                  "The reference for {s} is in the bibliography.", "The section on {s} was reformatted for the printed manual.",
+                  "An intern re-derived {s} as an exercise.", "The entry on {s} links to the formal proof."],
+        .biology: ["The weather held for the work on {s}.", "A sketch of {s} is taped into the log.", "The count for {s} was done at low tide.",
+                   "A sample tube labelled for {s} went into the freezer.", "The boat was needed for the trip concerning {s}.",
+                   "Gulls interrupted the survey of {s}.", "The entry on {s} was read aloud at supper.",
+                   "A grant report mentions {s} in passing.", "The microscope was booked all day for {s}.",
+                   "The station cat sat on the notes about {s}.", "A visiting professor had questions about {s}.",
+                   "The ferry brought new equipment for the work on {s}."],
+    ]
+
+    static func compose(_ frame: DatasetFrame, _ core: DatasetCore) -> DatasetPhrasing {
+        DatasetPhrasing(prefix: frame.lead.isEmpty ? core.capitalised : frame.lead + " " + core.text, suffix: core.unit + frame.tail + ".")
+    }
+
+    /// Whether a core after a lead would contain one of the founding sentences of its kind ("Per
+    /// the minutes, Zed was written by 7." holds "Zed was written by 7."): such a core is only
+    /// composed with a tailed frame, so a composed sentence never contains a founding one.
+    static func bare(_ core: DatasetCore, _ kind: FactKind) -> Bool {
+        let refs = SubjectRefs(s: "Zed", S: "Zed")
+        let composed = "Lead, " + refs.fill(core.text) + " 7" + core.unit + "."
+        return (phrasings[kind] ?? [:]).values.joined().contains { composed.contains(refs.fill($0.prefix) + " 7" + $0.suffix) }
+    }
+
+    /// How a persona states a fact: its founding table, or its frames around the kind's cores.
+    /// Core 0, the end of the kind's stem, is weighted as half of what a persona writes.
+    static func phrasings(_ kind: FactKind, _ persona: DatasetPersona) -> [DatasetPhrasing] {
+        if let voice = persona.legacy { return phrasings[kind]![voice]! }
+        func composed(_ core: DatasetCore) -> [DatasetPhrasing] {
+            persona.frames.filter { !bare(core, kind) || !$0.tail.isEmpty }.map { compose($0, core) }
+        }
+        let all = cores[kind]!
+        let zero = composed(all[0])
+        let others = composed(all[1]) + composed(all[2])
+        return Array(repeating: zero, count: max(1, others.count / max(1, zero.count))).flatMap { $0 } + others
+    }
+
+    /// The document kinds a persona writes about an entity of `type`.
+    static func kinds(_ persona: DatasetPersona, _ type: DatasetEntityType) -> [DocumentKind] {
+        if let voice = persona.legacy { return kinds(voice, type) }
+        return persona.kinds
+    }
+
+    static func headers(_ persona: DatasetPersona, _ kind: DocumentKind) -> [String] {
+        persona.legacy == nil ? persona.headers[kind]! : headers[kind]!
+    }
+
+    static func intros(_ persona: DatasetPersona, _ type: DatasetEntityType) -> [String] {
+        if let voice = persona.legacy { return intros[voice]![type]! }
+        if let own = persona.intros[type] { return own }
+        return persona.foreignIntros.map { $0.replacingOccurrences(of: "{what}", with: typeNouns[type]!) }
+    }
+
+    static func fillers(_ persona: DatasetPersona, _ type: DatasetEntityType) -> [String] {
+        if let voice = persona.legacy { return fillers(voice, type) }
+        let shared = worldFillers[persona.world]!
+        let start = DatasetPersonas.ordinal(of: persona) % shared.count
+        return persona.fillers + (0..<6).map { shared[(start + $0) % shared.count] }
+    }
+
+    static func closings(_ persona: DatasetPersona) -> [String] {
+        persona.legacy.map { closings[$0]! } ?? persona.closings
+    }
+
+    static func excerptLeads(_ persona: DatasetPersona) -> [String] {
+        persona.legacy.map { excerptLeads[$0]! } ?? persona.excerptLeads
+    }
 }
