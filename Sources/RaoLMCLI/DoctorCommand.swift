@@ -13,7 +13,7 @@ import RaoLMWorkflows
 struct Doctor: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Check the toolchain, Metal library, tokenizer, Thread binary, models, ports and disk.")
 
-    @OptionGroup var global: GlobalOptions
+    @OptionGroup var global: DataRootOption
     @OptionGroup var thread: ThreadOptions
 
     @Option(help: "Path to the thread binary.")

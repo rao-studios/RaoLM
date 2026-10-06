@@ -3,7 +3,7 @@
 //  RaoLMCore
 //
 //  WHAT: Where RaoLM keeps everything it produces.
-//  IN:   --data-dir, then RAOLM_DATA_DIR, then ~/Documents/raolm-db.
+//  IN:   --data-dir, then RAOLM_DATA_DIR, then the T9 work area's db/ (WorkArea.dataRoot).
 //  OUT:  thread-db/ (the demo Thread's storage), corpora/<slug>/, snapshots/<hash12>/,
 //        runs/<run id>/, logs/.
 //  PIN:  Never ~/Documents/thread-db: that is the default of a real Thread node, and the
@@ -30,9 +30,7 @@ public struct DataRoot: Sendable, Equatable {
         if let value = environment[environmentKey], !value.isEmpty {
             return DataRoot(url: URL(fileURLWithPath: expandTilde(value), isDirectory: true))
         }
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
-        return DataRoot(url: documents.appendingPathComponent("raolm-db", isDirectory: true))
+        return DataRoot(url: WorkArea.dataRoot(environment: environment))
     }
 
     static func expandTilde(_ path: String) -> String {

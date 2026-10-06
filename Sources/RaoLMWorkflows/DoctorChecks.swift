@@ -8,7 +8,9 @@
 //
 
 import Foundation
+import FrigateBridge
 import RaoLM
+import RaoStack
 
 public struct DoctorCheck: Sendable, Equatable {
     public var name: String
@@ -58,11 +60,8 @@ public enum DoctorChecks {
         }
 
         let modelID = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
-        let hubRoots = [
-            ProcessInfo.processInfo.environment["HF_HOME"].map { URL(fileURLWithPath: $0).appendingPathComponent("snapshots") },
-            ProcessInfo.processInfo.environment["HF_HOME"].map { URL(fileURLWithPath: $0) },
-            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent("huggingface"),
-        ].compactMap { $0 }
+        // The demo's Thread keeps its embedding model in ~/.rao's models folder, as every Rao app's Thread.
+        let hubRoots = HubDownloader.snapshotRoots(home: RaoHome.resolved().huggingFaceHome)
         let found = hubRoots.map { $0.appendingPathComponent("models/\(modelID)") }
             .first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("config.json").path) }
         checks.append(DoctorCheck(
@@ -78,6 +77,15 @@ public enum DoctorChecks {
            let free = attributes[.systemFreeSize] as? Int64 {
             let gb = Double(free) / 1e9
             checks.append(DoctorCheck(name: "disk", ok: gb >= 2, detail: String(format: "%.1f GB free", gb)))
+        }
+        // Training, datasets and base models live on the T9 (WorkArea).
+        let workArea = WorkArea.url()
+        if WorkArea.isAvailable(),
+           let attributes = try? FileManager.default.attributesOfFileSystem(forPath: workArea.path),
+           let free = attributes[.systemFreeSize] as? Int64 {
+            checks.append(DoctorCheck(name: "work area", ok: true, detail: String(format: "%@ · %.0f GB free", workArea.path, Double(free) / 1e9)))
+        } else {
+            checks.append(DoctorCheck(name: "work area", ok: false, detail: "\(workArea.path) is not mounted — plug in the T9 or set \(WorkArea.environmentKey)"))
         }
         checks.append(DoctorCheck(name: "data root", ok: true, detail: root.url.path))
         return checks

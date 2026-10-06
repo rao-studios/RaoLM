@@ -126,6 +126,8 @@ let package = Package(
                 .product(name: "MLX", package: "Frigate"),
                 .product(name: "MLXNN", package: "Frigate"),
                 .product(name: "FrigateHub", package: "Frigate"),
+                // HubDownloader.hub(home:): base models download into the T9 work area.
+                .product(name: "FrigateBridge", package: "Frigate"),
             ],
             swiftSettings: v5
         ),
@@ -141,7 +143,11 @@ let package = Package(
         .target(name: "RaoLMTerminal"),
         .target(
             name: "RaoLMWorkflows",
-            dependencies: ["RaoLM", .product(name: "SinatraHarness", package: "SinatraHarness")],
+            dependencies: [
+                "RaoLM", .product(name: "SinatraHarness", package: "SinatraHarness"),
+                .product(name: "FrigateBridge", package: "Frigate"),
+                .product(name: "RaoStack", package: "Conduit"),
+            ],
             swiftSettings: v5
         ),
         .target(

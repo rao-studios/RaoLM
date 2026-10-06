@@ -44,7 +44,27 @@ struct RaoLMCommand: AsyncParsableCommand {
 // MARK: - Shared options
 
 struct GlobalOptions: ParsableArguments {
-    @Option(name: .long, help: "Data root (default: $RAOLM_DATA_DIR, else ~/Documents/raolm-db).")
+    @Option(name: .long, help: "Data root (default: $RAOLM_DATA_DIR, else the T9 work area's db/).")
+    var dataDir: String?
+
+    var root: DataRoot { DataRoot.resolve(argument: dataDir) }
+
+    /// Everything RaoLM keeps lives on the T9: with it unplugged and nothing naming another
+    /// place, stop here rather than write to the internal disk.
+    func validate() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard dataDir == nil, (environment[DataRoot.environmentKey] ?? "").isEmpty,
+              !WorkArea.isAvailable(environment: environment) else { return }
+        throw ValidationError(
+            "the T9 work area \(WorkArea.url(environment: environment).path) is not mounted — plug in the T9, "
+                + "or name another place with \(WorkArea.environmentKey), \(DataRoot.environmentKey) or --data-dir")
+    }
+}
+
+/// The data root without the T9 check: for `raolm doctor`, which reports an unplugged drive
+/// instead of refusing to run.
+struct DataRootOption: ParsableArguments {
+    @Option(name: .long, help: "Data root (default: $RAOLM_DATA_DIR, else the T9 work area's db/).")
     var dataDir: String?
 
     var root: DataRoot { DataRoot.resolve(argument: dataDir) }

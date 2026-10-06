@@ -4,23 +4,23 @@
 //
 //  WHAT: Which nodes a braid starts and what they are fed from, as `raolm braid`'s --nodes and
 //        --dataset and the studio's braid panel (d) both give it.
-//  IN:   Datasets live in the datasets root: $RAOLM_DATASETS_DIR, else the T9 work area's
-//        datasets/ (/Volumes/T9/rao/projects/raolm/datasets) when that drive is mounted. With
-//        neither, pass a path.
+//  IN:   Datasets live in the datasets root: $RAOLM_DATASETS_DIR, else the work area's
+//        datasets/ (WorkArea: /Volumes/T9/rao/projects/raolm/datasets) when that drive is
+//        mounted. With neither, pass a path.
 //
 
 import Foundation
 import RaoLM
 
 public enum DatasetsRoot {
-    public static let workArea = "/Volumes/T9/rao/projects/raolm"
+    public static var workArea: String { WorkArea.url().path }
     public static let environmentKey = "RAOLM_DATASETS_DIR"
 
     public static func root() throws -> URL {
         if let path = ProcessInfo.processInfo.environment[environmentKey], !path.isEmpty {
             return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
         }
-        guard FileManager.default.fileExists(atPath: workArea) else {
+        guard WorkArea.isAvailable() else {
             throw RaoLMFailure("the T9 work area \(workArea) is not mounted", hint: "plug in the T9, set \(environmentKey), or pass a path", code: 66)
         }
         return URL(fileURLWithPath: workArea, isDirectory: true).appendingPathComponent("datasets", isDirectory: true)
@@ -28,7 +28,7 @@ public enum DatasetsRoot {
 
     /// Where braids made with --data-dir live, each a data root of its own: the work area, when mounted.
     public static var braidAreas: [URL] {
-        FileManager.default.fileExists(atPath: workArea) ? [URL(fileURLWithPath: workArea, isDirectory: true)] : []
+        WorkArea.isAvailable() ? [WorkArea.url()] : []
     }
 
     /// A dataset by name (inside the root) or by path (anything with a slash).

@@ -15,6 +15,7 @@
 //
 
 import Foundation
+import FrigateBridge
 import Hub
 import MLX
 import RaoLMCore
@@ -159,11 +160,22 @@ public enum UmbrellaPacks {
     public static func build(
         source: PackSource, layout: BraidLayout, tokenizer: RaoTokenizer, progress: ((String) -> Void)? = nil
     ) throws -> UmbrellaPack {
-        progress?("downloading \(source.repo) at \(source.revision.prefix(8))…")
         let repo = source.repo
         let revision = source.revision
-        let folder = try Blocking.run {
-            try await HubApi().snapshot(from: repo, revision: revision, matching: ["config.json", "*.safetensors", "model.safetensors.index.json", "tokenizer.json"])
+        let patterns = ["config.json", "*.safetensors", "model.safetensors.index.json", "tokenizer.json"]
+        // A copy already on this Mac at that revision — in the work area or the Rao stack's
+        // folder — is used where it sits; only a missing one downloads, into the T9 work area.
+        let home = WorkArea.modelsHome()
+        let onDisk = HubDownloader.materializedSnapshot(
+            id: repo, revision: revision, matching: patterns, roots: HubDownloader.snapshotRoots(home: home))
+        if onDisk == nil, !WorkArea.isAvailable() {
+            throw UmbrellaPackError.missing(
+                "the T9 work area \(WorkArea.url().path) is not mounted, so \(repo) has nowhere to download — plug in the T9 or set \(WorkArea.environmentKey)")
+        }
+        if onDisk == nil { progress?("downloading \(repo) at \(revision.prefix(8))…") }
+        let folder = try onDisk ?? Blocking.run {
+            try await HubDownloader(home: home).download(
+                id: repo, revision: revision, matching: patterns, useLatest: false, progressHandler: { _ in })
         }
         let tokenizerSHA = try ContentHash.sha256Hex(fileAt: folder.appendingPathComponent("tokenizer.json"))
         // Sharded checkpoints are read through their index; Checkpoint.loadWeights merges the shards.

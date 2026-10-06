@@ -74,8 +74,9 @@ scripts/cli.sh demo                  # one model end to end: corpus, Thread, tra
 ```
 
 `scripts/cli.sh` builds `raolm` when a source is newer and installs MLX's Metal library the first
-time. With no arguments it opens the studio. Data lands under `~/Documents/raolm-db`
-(`--data-dir`, `RAOLM_DATA_DIR`).
+time. With no arguments it opens the studio. Data lands on the T9, under
+`/Volumes/T9/rao/projects/raolm/db` (`--data-dir`, `RAOLM_DATA_DIR`, `RAOLM_WORK_AREA`), and base models
+download into the work area's `models/huggingface`.
 
 ## How it works
 

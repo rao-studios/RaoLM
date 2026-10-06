@@ -89,7 +89,9 @@ struct DataRootTests {
     func resolution() {
         #expect(DataRoot.resolve(argument: "/tmp/a", environment: ["RAOLM_DATA_DIR": "/tmp/b"]).url.path == "/tmp/a")
         #expect(DataRoot.resolve(argument: nil, environment: ["RAOLM_DATA_DIR": "/tmp/b"]).url.path == "/tmp/b")
-        #expect(DataRoot.resolve(argument: nil, environment: [:]).url.path.hasSuffix("Documents/raolm-db"))
+        #expect(DataRoot.resolve(argument: nil, environment: [:]).url.path == "/Volumes/T9/rao/projects/raolm/db")
+        #expect(DataRoot.resolve(argument: nil, environment: ["RAOLM_WORK_AREA": "/tmp/w"]).url.path == "/tmp/w/db")
+        #expect(WorkArea.modelsHome(environment: ["RAOLM_WORK_AREA": "/tmp/w"]).path == "/tmp/w/models/huggingface")
         let root = DataRoot(url: URL(fileURLWithPath: "/tmp/r"))
         #expect(root.snapshot(hash: "0123456789abcdef").lastPathComponent == "0123456789ab")
         #expect(root.threadDB.lastPathComponent == "thread-db")
